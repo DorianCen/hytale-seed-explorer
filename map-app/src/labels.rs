@@ -103,3 +103,12 @@ pub const STATUS_EXPORT_PLACEHOLDER: &str = "PNG export arrives with T32";
 
 /// When a load worker vanishes without a result.
 pub const STATUS_WORKER_DIED: &str = "the load worker stopped without reporting";
+
+/// When the biome grid request for the view failed.
+pub const STATUS_GRID_FAILED: &str = "the biome grid request failed";
+
+/// The palette legend header in the left panel.
+pub const PALETTE: &str = "Palette";
+
+/// The central map's text while a grid is being generated.
+pub const MAP_PLACEHOLDER_RENDERING: &str = "rendering the biome map…";

@@ -22,10 +22,11 @@
 //! joins the generator worker pool.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use map_core::error::SourceResult;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
-use map_core::types::{Seed, SeedError};
+use map_core::types::{BiomeGrid, Rect, Seed, SeedError};
 
 use crate::labels;
 
@@ -129,8 +130,10 @@ impl LoadRequest {
 }
 
 /// The source lifecycle. `Ready` owns the heavy `WorldgenSource` (plus
-/// its worker pool); `Error` carries the user-readable failure of the
-/// last load so the banner can offer a retry.
+/// its worker pool) behind an [`Arc`] so background texture requests can
+/// hold it while the UI thread moves on; `Error` carries the
+/// user-readable failure of the last load so the banner can offer a
+/// retry.
 ///
 /// `Debug` is manual: the source (and its pool of `JoinHandle`s) has no
 /// cheap printable form, and state debugging cares about *which*
@@ -141,7 +144,7 @@ pub enum SourceState {
     /// A load for `generation` is running on a background thread.
     Loading { generation: u64 },
     /// A source loaded successfully and owns the current view's data.
-    Ready(Box<WorldgenSource>),
+    Ready(Arc<WorldgenSource>),
     /// The last load failed; the seed text is unchanged, so retry means
     /// re-issuing the same load.
     Error { message: String },
@@ -160,6 +163,92 @@ impl std::fmt::Debug for SourceState {
             }
         }
     }
+}
+
+/// The map texture lifecycle (T13). The egui `TextureHandle` lives in the
+/// app (`texture.rs`); this tracks the *data*: what region is being
+/// generated, what has arrived, and what the uploaded texture covers.
+///
+/// A request is issued for exactly one `(rect, step)`; results for
+/// anything else (a newer request, an invalidated source) are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapTexture {
+    /// Nothing to show: no source, a failed request, or an invalidated
+    /// view.
+    Empty,
+    /// A biome grid is being generated off the UI thread.
+    Pending { rect: Rect, step: u32 },
+    /// The grid arrived; the app must convert and upload it.
+    ToUpload {
+        grid: BiomeGrid,
+        rect: Rect,
+        step: u32,
+    },
+    /// Current: the uploaded texture covers exactly `rect` at `step`.
+    /// The grid stays for pixel lookups (hover, T18).
+    Current {
+        grid: BiomeGrid,
+        rect: Rect,
+        step: u32,
+    },
+}
+
+/// What a background texture request delivers back to the UI thread:
+/// `(rect, step, result)` — the request's identity travels with the
+/// grid so stale results are recognizable.
+pub type GridResult = (Rect, u32, SourceResult<BiomeGrid>);
+
+/// One texture covers the whole viewport until T14 tiles the map: cap
+/// the request at this many samples per axis. The plan's risk note —
+/// 640×400 samples is acceptable for a first texture, not for repeated
+/// panning.
+pub const MAX_TEXTURE_SAMPLES: u32 = 640;
+
+/// The world rect a map area of `screen` points covers at `center` /
+/// `scale`, sampled at `step`, capped to [`MAX_TEXTURE_SAMPLES`] per
+/// axis and aligned so the center stays centered.
+///
+/// [`None`] when the center or the covered blocks fall outside the `i32`
+/// block space (the app simply does not request such a view).
+#[must_use]
+pub fn view_texture_rect(
+    center: (f64, f64),
+    scale: f64,
+    step: u32,
+    screen: (f32, f32),
+) -> Option<Rect> {
+    // Samples per axis: ceil(points / (scale * step)), at least one,
+    // never above the cap.
+    let samples = |points: f32| -> u32 {
+        let raw = (f64::from(points) / (scale * f64::from(step))).ceil();
+        let clamped = raw.clamp(1.0, f64::from(MAX_TEXTURE_SAMPLES));
+        clamped as u32
+    };
+    let blocks_x = i64::from(samples(screen.0)) * i64::from(step);
+    let blocks_z = i64::from(samples(screen.1)) * i64::from(step);
+
+    // Centered: the rect spans exactly blocks_* per side, origin rounded
+    // so the view center stays the middle sample-wise.
+    let origin = |center: f64, blocks: i64| -> Option<i32> {
+        if !center.is_finite() {
+            return None;
+        }
+        let value = (center - blocks as f64 / 2.0).round();
+        if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+            return None;
+        }
+        // Bounds-checked above; the cast of an in-range integral f64 is exact.
+        Some(value as i32)
+    };
+    let min_x = origin(center.0, blocks_x)?;
+    let min_z = origin(center.1, blocks_z)?;
+    let max_x = i64::from(min_x)
+        .checked_add(blocks_x - 1)
+        .and_then(|value| i32::try_from(value).ok())?;
+    let max_z = i64::from(min_z)
+        .checked_add(blocks_z - 1)
+        .and_then(|value| i32::try_from(value).ok())?;
+    Some(Rect::new(min_x, min_z, max_x, max_z))
 }
 
 /// The state behind the egui shell.
@@ -212,8 +301,14 @@ pub struct AppState {
     show_go_to: bool,
     search_focused: bool,
 
-    /// Heavy sources waiting for a background drop.
-    retired: Vec<WorldgenSource>,
+    /// Heavy sources waiting for a background drop. [`Arc`] refs: a
+    /// background texture request may still hold one, in which case the
+    /// pool joins on *that* thread when the last ref drops — never the
+    /// UI thread.
+    retired: Vec<Arc<WorldgenSource>>,
+
+    /// The map texture lifecycle (T13).
+    map_texture: MapTexture,
 }
 
 impl Default for AppState {
@@ -237,6 +332,7 @@ impl Default for AppState {
             show_go_to: false,
             search_focused: false,
             retired: Vec::new(),
+            map_texture: MapTexture::Empty,
         }
     }
 }
@@ -375,10 +471,12 @@ impl AppState {
         generation: u64,
         result: SourceResult<WorldgenSource>,
     ) -> bool {
-        if !matches!(self.source, SourceState::Loading { generation: current } if current == generation)
-        {
+        if !matches!(
+            self.source,
+            SourceState::Loading { generation: current } if current == generation
+        ) {
             if let Ok(source) = result {
-                self.retired.push(source);
+                self.retired.push(Arc::new(source));
             }
             return false;
         }
@@ -386,7 +484,7 @@ impl AppState {
         match result {
             Ok(source) => {
                 self.status = format!("{} {}", labels::STATUS_SOURCE_READY, self.seed_text);
-                self.source = SourceState::Ready(Box::new(source));
+                self.source = SourceState::Ready(Arc::new(source));
             }
             Err(error) => {
                 self.source = SourceState::Error {
@@ -413,12 +511,15 @@ impl AppState {
     /// will be rejected as stale), and an error banner is cleared.
     ///
     /// The transient status line is cleared too: a "ready <seed>" message
-    /// must not outlive the source it announced.
+    /// must not outlive the source it announced. The map texture also
+    /// resets — an uploaded image of a dead seed must never stay on
+    /// screen.
     pub fn invalidate_source(&mut self) {
         self.retire_ready_source();
         self.source = SourceState::Idle;
         self.loaded_seed_input = None;
         self.status.clear();
+        self.map_texture = MapTexture::Empty;
     }
 
     /// True while a load is in flight (drives the Go button and spinner).
@@ -431,7 +532,19 @@ impl AppState {
     #[must_use]
     pub fn source(&self) -> Option<&WorldgenSource> {
         match &self.source {
-            SourceState::Ready(source) => Some(source),
+            SourceState::Ready(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// The loaded source as a shared handle, for background work: a
+    /// texture request thread holds it while the UI thread may replace
+    /// or drop the state's own reference. The pool joins wherever the
+    /// last reference drops — with this pattern, never the UI thread.
+    #[must_use]
+    pub fn source_arc(&self) -> Option<Arc<WorldgenSource>> {
+        match &self.source {
+            SourceState::Ready(source) => Some(Arc::clone(source)),
             _ => None,
         }
     }
@@ -459,7 +572,7 @@ impl AppState {
 
     /// Displaced sources, taken for a background drop. The app calls this
     /// every frame; an empty vec is the common case.
-    pub fn take_retired_sources(&mut self) -> Vec<WorldgenSource> {
+    pub fn take_retired_sources(&mut self) -> Vec<Arc<WorldgenSource>> {
         std::mem::take(&mut self.retired)
     }
 
@@ -467,7 +580,103 @@ impl AppState {
     /// leaves `Ready`).
     fn retire_ready_source(&mut self) {
         if let SourceState::Ready(source) = std::mem::replace(&mut self.source, SourceState::Idle) {
-            self.retired.push(*source);
+            self.retired.push(source);
+        }
+    }
+
+    // -- Map texture (T13) -----------------------------------------------------
+
+    /// The current texture lifecycle phase.
+    #[must_use]
+    pub fn map_texture(&self) -> &MapTexture {
+        &self.map_texture
+    }
+
+    /// True while a texture request is in flight.
+    #[must_use]
+    pub fn is_texture_pending(&self) -> bool {
+        matches!(self.map_texture, MapTexture::Pending { .. })
+    }
+
+    /// Issues a texture request for `(rect, step)` unless the same pair
+    /// is already pending, arrived or current. True means a new request
+    /// was issued and the caller should spawn the worker thread.
+    ///
+    /// A different rect/step replaces a pending or arrived request — the
+    /// newest view wins, exactly like the load-generation guard.
+    pub fn request_view_texture(&mut self, rect: Rect, step: u32) -> bool {
+        match &self.map_texture {
+            MapTexture::Pending { rect: r, step: s } if *r == rect && *s == step => return false,
+            MapTexture::ToUpload {
+                rect: r, step: s, ..
+            } if *r == rect && *s == step => {
+                return false;
+            }
+            MapTexture::Current {
+                rect: r, step: s, ..
+            } if *r == rect && *s == step => {
+                return false;
+            }
+            _ => {}
+        }
+        self.map_texture = MapTexture::Pending { rect, step };
+        true
+    }
+
+    /// Applies a background request's result; true when it was accepted.
+    ///
+    /// Only the still-pending `(rect, step)` applies; anything else — a
+    /// newer view, an invalidated source — drops the grid on the spot.
+    /// A failure resets the phase to [`MapTexture::Empty`] and reports
+    /// itself through the transient status line.
+    pub fn apply_grid_result(
+        &mut self,
+        rect: Rect,
+        step: u32,
+        result: SourceResult<BiomeGrid>,
+    ) -> bool {
+        if !matches!(
+            &self.map_texture,
+            MapTexture::Pending { rect: r, step: s } if *r == rect && *s == step
+        ) {
+            return false;
+        }
+        match result {
+            Ok(grid) => {
+                self.map_texture = MapTexture::ToUpload { grid, rect, step };
+            }
+            Err(error) => {
+                self.status = format!("{}: {error}", labels::STATUS_GRID_FAILED);
+                self.map_texture = MapTexture::Empty;
+            }
+        }
+        true
+    }
+
+    /// The arrived grid waiting for upload, when there is one.
+    #[must_use]
+    pub fn grid_to_upload(&self) -> Option<(&BiomeGrid, Rect, u32)> {
+        match &self.map_texture {
+            MapTexture::ToUpload { grid, rect, step } => Some((grid, *rect, *step)),
+            _ => None,
+        }
+    }
+
+    /// Marks the arrived grid as uploaded and current.
+    pub fn mark_uploaded(&mut self) {
+        if let MapTexture::ToUpload { grid, rect, step } =
+            std::mem::replace(&mut self.map_texture, MapTexture::Empty)
+        {
+            self.map_texture = MapTexture::Current { grid, rect, step };
+        }
+    }
+
+    /// The background request thread died without reporting: fail the
+    /// pending request so the spinner stops and the status says why.
+    pub fn grid_worker_died(&mut self) {
+        if self.is_texture_pending() {
+            self.status = labels::STATUS_WORKER_DIED.to_string();
+            self.map_texture = MapTexture::Empty;
         }
     }
 
@@ -672,6 +881,7 @@ mod tests {
 
     use map_core::error::SourceError;
     use map_core::source::WorldSource;
+    use map_core::types::BiomeId;
 
     fn state() -> AppState {
         AppState::new("/nonexistent/world")
@@ -828,6 +1038,135 @@ mod tests {
 
         state.export_placeholder();
         assert_eq!(state.status(), labels::STATUS_EXPORT_PLACEHOLDER);
+    }
+
+    #[test]
+    fn texture_lifecycle_request_upload_current() {
+        let mut state = state();
+        let rect = Rect::new(-10, -6, 9, 13);
+        let step = 2;
+
+        // Idle -> Pending, and the duplicate request is a no-op.
+        assert!(state.request_view_texture(rect, step));
+        assert!(state.is_texture_pending());
+        assert!(
+            !state.request_view_texture(rect, step),
+            "same request twice"
+        );
+        assert!(state.is_texture_pending());
+
+        // A different view replaces the pending request.
+        let other = Rect::new(0, 0, 19, 19);
+        assert!(state.request_view_texture(other, step));
+        assert!(state.is_texture_pending());
+
+        // A result for the replaced rect is stale and dropped.
+        let stale = BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(1); 4]);
+        assert!(!state.apply_grid_result(rect, step, Ok(stale)));
+        assert!(state.is_texture_pending(), "the pending view is untouched");
+
+        // The current view's result applies: ToUpload, then Current.
+        let grid = BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(7); 4]);
+        assert!(state.apply_grid_result(other, step, Ok(grid)));
+        assert_eq!(
+            state.map_texture(),
+            &MapTexture::ToUpload {
+                grid: BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(7); 4]),
+                rect: other,
+                step,
+            }
+        );
+        let (grid, uploaded_rect, uploaded_step) = state
+            .grid_to_upload()
+            .expect("the arrived grid waits for upload");
+        assert_eq!((grid.width, grid.height), (2, 2));
+        assert_eq!((uploaded_rect, uploaded_step), (other, step));
+
+        state.mark_uploaded();
+        assert!(matches!(state.map_texture(), MapTexture::Current { .. }));
+
+        // The current view does not re-request.
+        assert!(!state.request_view_texture(other, step));
+
+        // A new view starts the cycle again.
+        assert!(state.request_view_texture(rect, step));
+        assert!(state.is_texture_pending());
+    }
+
+    #[test]
+    fn texture_failure_resets_and_reports() {
+        let mut state = state();
+        let rect = Rect::new(0, 0, 63, 63);
+        assert!(state.request_view_texture(rect, 2));
+        assert!(state.apply_grid_result(rect, 2, Err(SourceError::Load(String::from("boom")))));
+        assert_eq!(state.map_texture(), &MapTexture::Empty);
+        assert_eq!(
+            state.status(),
+            format!("{}: load failed: boom", labels::STATUS_GRID_FAILED),
+        );
+    }
+
+    #[test]
+    fn grid_worker_death_fails_the_pending_request() {
+        let mut state = state();
+        assert!(state.request_view_texture(Rect::new(0, 0, 3, 3), 2));
+        state.grid_worker_died();
+        assert_eq!(state.map_texture(), &MapTexture::Empty);
+        assert_eq!(state.status(), labels::STATUS_WORKER_DIED);
+
+        // Without a pending request it changes nothing.
+        state.grid_worker_died();
+        assert_eq!(state.map_texture(), &MapTexture::Empty);
+    }
+
+    #[test]
+    fn invalidate_source_clears_the_texture() {
+        let mut state = state();
+        let rect = Rect::new(0, 0, 31, 31);
+        assert!(state.request_view_texture(rect, 2));
+        state.invalidate_source();
+        assert_eq!(
+            state.map_texture(),
+            &MapTexture::Empty,
+            "a dead seed's map dies with it"
+        );
+    }
+
+    #[test]
+    fn view_texture_rect_covers_the_screen_capped_and_centered() {
+        // The plan's example: a 1280x800 map area at scale 1, step 2 ->
+        // exactly 640x400 samples (1280x800 blocks), centered on (0, 0).
+        let rect =
+            view_texture_rect((0.0, 0.0), 1.0, 2, (1280.0, 800.0)).expect("a sane view resolves");
+        assert_eq!(rect, Rect::new(-640, -400, 639, 399));
+
+        // A negative, fractional center still centers the rect; origins
+        // round half away from zero, so -1843.5 -> -1844 and 55.25 -> 55.
+        let rect = view_texture_rect((-1203.5, 455.25), 1.0, 2, (1280.0, 800.0))
+            .expect("a sane view resolves");
+        assert_eq!(rect.min_x, -1844);
+        assert_eq!(rect.max_x, -1844 + 1279);
+        assert_eq!(rect.min_z, 55);
+        assert_eq!(rect.max_z, 55 + 799);
+
+        // The cap: a giant screen cannot exceed MAX_TEXTURE_SAMPLES.
+        let rect = view_texture_rect((0.0, 0.0), 1.0, 2, (100_000.0, 100_000.0))
+            .expect("the cap keeps the request bounded");
+        assert_eq!(rect.width(), MAX_TEXTURE_SAMPLES * 2);
+        assert_eq!(rect.height(), MAX_TEXTURE_SAMPLES * 2);
+
+        // A tiny area still covers at least one sample per axis; at
+        // scale 0.5, 10 points span 20 blocks = 10 samples at step 2.
+        let rect =
+            view_texture_rect((0.0, 0.0), 0.5, 2, (10.0, 10.0)).expect("a tiny view resolves");
+        assert_eq!(rect.width(), 20);
+        assert_eq!(rect.height(), 20);
+
+        // Absurd centers refuse instead of overflowing.
+        assert!(
+            view_texture_rect((f64::from(i32::MAX) * 2.0, 0.0), 1.0, 2, (10.0, 10.0)).is_none()
+        );
+        assert!(view_texture_rect((f64::NAN, 0.0), 1.0, 2, (10.0, 10.0)).is_none());
     }
 
     #[test]

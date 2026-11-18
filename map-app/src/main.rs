@@ -14,6 +14,7 @@
 mod app;
 mod labels;
 mod state;
+mod texture;
 
 use eframe::egui;
 

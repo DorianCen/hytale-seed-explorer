@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use map_core::render::{Layer, encode_png, render_biome};
+use map_core::render::{Layer, encode_png, render_biome_rgba};
 use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig, default_world_path};
 use map_core::types::Rect;
@@ -184,7 +184,7 @@ fn render(args: RenderArgs) -> Result<(), String> {
                 .biome_region(rect, args.step)
                 .map_err(|error| error.to_string())?;
             let sampled = started.elapsed();
-            let image = render_biome(&grid, source.biome_catalog());
+            let image = render_biome_rgba(&grid, source.biome_catalog());
             let bytes = encode_png(&image).map_err(|error| error.to_string())?;
 
             write_png(&args.out, &bytes)?;

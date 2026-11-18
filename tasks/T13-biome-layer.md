@@ -1,6 +1,19 @@
 # T13 — Biome layer and palette
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/render/biome.rs` —
+`render_biome_rgba` (the T11 renderer, moved + renamed, byte-identical
+per the shared golden), `biome_pixel`, once-per-id unknown logging,
+and the optional `render_biome_shaded` hillshade hook (off by default,
+T17 wires it) — plus `map-app/src/texture.rs` (`to_color_image`
+NEAREST upload + `texture_screen_rect`), the `MapTexture` state machine
+(`request_view_texture`/`apply_grid_result`/`mark_uploaded`, capped at
+640×400 samples per the risk note) with `Box`→`Arc` sources for
+background queries, the palette legend panel, and
+`tests/biome_render.rs` (3) + `tests/common/mod.rs` (shared golden
+hashes with `render_golden`); map-app now has 20 tests including a
+full headless pipeline run against the real generator. Live-window
+verification of the painted map is pending one manual check — synthetic
+input injection broke in this session's compositor; see the follow-ups)
 **Milestone:** 2 — Static viewer
 **Depends on:** T08, T10, T11
 **Blocks:** T16, T19

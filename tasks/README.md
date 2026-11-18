@@ -22,7 +22,7 @@ it owns, and the acceptance gate.
 | [T10](T10-coordinate-zoom-math.md) | Coordinate, zoom and tile math | 1 | T06, T07 | done |
 | [T11](T11-headless-png-render.md) | Headless 512×512 PNG render | 1 | T05, T08, T09, T10 | done |
 | [T12](T12-egui-app-shell.md) | egui shell, seed input and app state | 2 | T06, T07, T08, T10 | done |
-| [T13](T13-biome-layer.md) | Biome layer and palette | 2 | T08, T10, T11 | proposed |
+| [T13](T13-biome-layer.md) | Biome layer and palette | 2 | T08, T10, T11 | done |
 | [T14](T14-tile-cache.md) | Tile keys, cache and eviction | 3 | T07, T10 | proposed |
 | [T15](T15-tile-scheduler.md) | Tile scheduler, workers and cancellation | 3 | T09, T10, T14 | proposed |
 | [T16](T16-pan-zoom-viewport.md) | Pan, zoom and viewport rendering | 3 | T12, T13, T14, T15 | proposed |
