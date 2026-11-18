@@ -1,6 +1,7 @@
 # T01 — Worldgen API audit and gap matrix
 
-**Status:** proposed
+**Status:** done (deliverable: [`docs/worldgen-api-audit.md`](../docs/worldgen-api-audit.md);
+probe preserved at [`tools/query_bench.rs`](../tools/query_bench.rs))
 **Milestone:** 0 — API audit
 **Depends on:** —
 **Blocks:** T05, T06, T22
