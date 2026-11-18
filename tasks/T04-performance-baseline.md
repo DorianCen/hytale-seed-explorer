@@ -1,6 +1,9 @@
 # T04 — Performance baseline harness
 
-**Status:** proposed
+**Status:** done (deliverable: [`docs/benchmarks.md`](../docs/benchmarks.md);
+runner: [`tools/bench-worldgen.sh`](../tools/bench-worldgen.sh); probe
+committed as `worldgen-cli`'s `query_bench` binary, worldgen repo commit
+`9b03190`)
 **Milestone:** 0 — API audit
 **Depends on:** —
 **Blocks:** T33
