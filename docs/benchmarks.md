@@ -188,6 +188,15 @@ Substitute measurement recorded now so T24 can size ring search:
   | Biome region 256×256 @ step 2 (65,536 samples) | **0.120 s** | **0.036 s** | 2.332 s |
   | Height region 64×64 @ step 1 (4,096 samples, biome-warm caches) | 0.031 s | 0.013 s | ~4 s est. at 1 ms/sample |
   | Cancellation health (next request after `cancel_pending`) | completes | completes | — |
+
+  **Chunk-path queries through the pool (T09, same probe):** a 256×256
+  surface region at step 1 (64 chunk generations, cold) costs **24.1 s** at
+  2 workers; a 64×64 slice at y=64 (4 generations) **1.8 s**; and the
+  decisive number — a **cached** surface region (summaries warm, biome
+  batch + assembly only) at step 2 costs **0.21 s**. The summary cache is
+  what makes the plan's full-block mode viable: each chunk is paid once
+  (~0.45 s) and every later layer, step and slice over that area is
+  sub-second.
 - The world is `testdata/Default`, not a live pack-derived world; absolute
   numbers may shift with real content, ratios should hold.
 
@@ -210,3 +219,6 @@ Only release runs on the environment above (or note the change).
 | 2026-11-18 | criterion suite | medians in § criterion table | `cargo bench -p worldgen-hytale` | T04 |
 | 2026-11-18 | biome region 65,536 via pool, 2 / 8 workers | 0.120 s / 0.036 s | `cargo run --release -p map-core --example pool_bench -- <world> 12345 <workers>` | T08 |
 | 2026-11-18 | height region 4,096 via pool (biome-warm), 2 / 8 workers | 0.031 s / 0.013 s | `pool_bench` as above | T08 |
+| 2026-11-18 | surface region 65,536 @ step 1 (64 chunks, cold), 2 workers | 24.11 s | `pool_bench` as above | T09 |
+| 2026-11-18 | slice region 4,096 @ y=64 (4 chunks, cold), 2 workers | 1.80 s | `pool_bench` as above | T09 |
+| 2026-11-18 | surface region @ step 2, summaries cached | 0.21 s | `pool_bench` as above | T09 |

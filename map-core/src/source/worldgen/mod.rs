@@ -13,22 +13,30 @@
 
 mod pool;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use worldgen_hytale::chunk::chunk_generator::ChunkGenerator;
+use worldgen_hytale::chunk::chunk_generator_resource::ChunkGeneratorResource;
 use worldgen_hytale::loader::chunk_generator_json_loader::ChunkGeneratorJsonLoader;
+use worldgen_hytale::world_gen::{WorldGenError, WorldGenRequest, generate_chunk};
 use worldgen_hytale::world_gen_config::WorldGenConfig;
 use worldgen_hytale::world_gen_provider::{HytaleWorldGenProvider, Semver};
 
 use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCatalog, ZoneInfo};
 use crate::error::{SourceError, SourceResult};
 use crate::source::WorldSource;
+use crate::source::chunks::{
+    self, ChunkKey, ChunkSlice, ChunkSummary, DEFAULT_SLICE_CACHE_ENTRIES,
+    DEFAULT_SUMMARY_BUDGET_BYTES, SliceCache, SliceKey, SummaryCache, SummaryColumn, chunk_of,
+    column_index, local_of,
+};
 use crate::types::{
-    BiomeGrid, BiomeId, BlockId, FluidId, GeneratorIdentity, HeightGrid, Rect, Seed, SpawnPoint,
-    ZoneId,
+    BiomeGrid, BiomeId, BlockId, FluidId, GeneratorIdentity, HeightGrid, Rect, Seed, SliceGrid,
+    SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
 };
 
 pub(crate) use pool::LoadSpec;
@@ -60,6 +68,10 @@ pub struct WorldgenSourceConfig {
     pub registries_path: Option<PathBuf>,
     /// Worker pool size; `None` = [`DEFAULT_WORKERS`]. Must be >= 1.
     pub workers: Option<usize>,
+    /// Byte budget for the chunk-summary cache; `None` = 256 MiB.
+    pub summary_budget_bytes: Option<u64>,
+    /// How many `(chunk, y)` slices to keep; `None` = 64.
+    pub slice_cache_entries: Option<u64>,
     /// The seed exactly as the user typed it (T02 semantics).
     pub seed_input: String,
 }
@@ -74,6 +86,8 @@ impl WorldgenSourceConfig {
             assets_root: None,
             registries_path: None,
             workers: None,
+            summary_budget_bytes: None,
+            slice_cache_entries: None,
             seed_input: seed_input.into(),
         }
     }
@@ -102,6 +116,10 @@ pub struct WorldgenSource {
     /// the whole source is a T08 compromise: T15's scheduler will carry
     /// per-request tokens through the same pool plumbing.
     cancel: CancelToken,
+    /// Compact per-chunk surface data (T09), byte-weighed.
+    summary_cache: SummaryCache,
+    /// The last few `(chunk, y)` horizontal slices (T09).
+    slice_cache: SliceCache,
 }
 
 impl WorldgenSource {
@@ -169,6 +187,16 @@ impl WorldgenSource {
             min_chunk,
             max_chunk,
             cancel: cancel_token(),
+            summary_cache: chunks::summary_cache(
+                config
+                    .summary_budget_bytes
+                    .unwrap_or(DEFAULT_SUMMARY_BUDGET_BYTES),
+            ),
+            slice_cache: chunks::slice_cache(
+                config
+                    .slice_cache_entries
+                    .unwrap_or(DEFAULT_SLICE_CACHE_ENTRIES),
+            ),
         })
     }
 
@@ -195,6 +223,113 @@ impl WorldgenSource {
     fn fresh_cancel(&self) -> CancelToken {
         self.cancel.store(false, Ordering::Relaxed);
         Arc::clone(&self.cancel)
+    }
+
+    /// The chunks a rect covers, bounds-checked, ordered nearest to the
+    /// rect's center first (the visible middle of a tile fills in first).
+    /// A rect reaching outside the generatable area is a typed error for
+    /// the whole request — documented: the UI clamps its requests (T16).
+    fn ordered_covering_chunks(&self, rect: Rect) -> SourceResult<Vec<(i32, i32)>> {
+        let min_cx = chunk_of(rect.min_x);
+        let max_cx = chunk_of(rect.max_x);
+        let min_cz = chunk_of(rect.min_z);
+        let max_cz = chunk_of(rect.max_z);
+        let mut chunks =
+            Vec::with_capacity(((max_cx - min_cx + 1) * (max_cz - min_cz + 1)) as usize);
+        for cz in min_cz..=max_cz {
+            for cx in min_cx..=max_cx {
+                if cx < self.min_chunk
+                    || cx > self.max_chunk
+                    || cz < self.min_chunk
+                    || cz > self.max_chunk
+                {
+                    return Err(SourceError::OutOfBounds {
+                        x: rect.min_x,
+                        z: rect.min_z,
+                    });
+                }
+                chunks.push((cx, cz));
+            }
+        }
+        let center_cx = chunk_of((rect.min_x + rect.max_x) / 2);
+        let center_cz = chunk_of((rect.min_z + rect.max_z) / 2);
+        chunks.sort_by_key(|(cx, cz)| (cx - center_cx).abs() + (cz - center_cz).abs());
+        Ok(chunks)
+    }
+
+    /// The summary for one chunk: bounds-checked, cached, deduplicated
+    /// across concurrent callers by the cache's in-flight coalescing
+    /// (`try_get_with`), never caching failures.
+    fn summary_for(&self, cx: i32, cz: i32) -> SourceResult<Arc<ChunkSummary>> {
+        if cx < self.min_chunk || cx > self.max_chunk || cz < self.min_chunk || cz > self.max_chunk
+        {
+            // The chunk's origin is the representative coordinate.
+            return Err(SourceError::OutOfBounds {
+                x: cx << 5,
+                z: cz << 5,
+            });
+        }
+        let key = ChunkKey {
+            identity: self.identity.stable_hash(),
+            generator_seed: self.seed.generator(),
+            cx,
+            cz,
+        };
+        self.summary_cache
+            .try_get_with(key, || self.pool.generate_summary(cx, cz))
+            .map_err(|error: Arc<SourceError>| (*error).clone())
+    }
+
+    /// The `(chunk, y)` slice for one chunk: cached in the small last-few
+    /// cache, deduplicated like summaries. A slice miss pays one chunk
+    /// generation, and the same chunk also warms the summary cache (both
+    /// products are extracted from the single generation).
+    fn slice_for(&self, cx: i32, cz: i32, y: i32) -> SourceResult<ChunkSlice> {
+        let key = SliceKey {
+            chunk: ChunkKey {
+                identity: self.identity.stable_hash(),
+                generator_seed: self.seed.generator(),
+                cx,
+                cz,
+            },
+            y,
+        };
+        self.slice_cache
+            .try_get_with(key, || {
+                let (slice, summary) = self.pool.generate_slice(cx, cz, y)?;
+                // The generation was paid; keep both products.
+                self.summary_cache.insert(
+                    ChunkKey {
+                        identity: self.identity.stable_hash(),
+                        generator_seed: self.seed.generator(),
+                        cx,
+                        cz,
+                    },
+                    summary,
+                );
+                Ok(slice)
+            })
+            .map_err(|error: Arc<SourceError>| (*error).clone())
+    }
+
+    /// Combines one summary column with its biome into the public sample.
+    fn surface_sample(
+        &self,
+        x: i32,
+        z: i32,
+        biome: BiomeId,
+        column: &SummaryColumn,
+    ) -> SurfaceSample {
+        SurfaceSample {
+            x,
+            z,
+            biome,
+            height: i32::from(column.height),
+            block: column.block,
+            fluid: (column.fluid.0 != 0).then_some(column.fluid),
+            fluid_depth: column.fluid_depth,
+            tint: column.tint,
+        }
     }
 }
 
@@ -241,26 +376,90 @@ impl WorldSource for WorldgenSource {
         ))
     }
 
-    fn surface_at(&self, _x: i32, _z: i32) -> SourceResult<crate::types::SurfaceSample> {
-        Err(SourceError::Unsupported(
-            "surface queries arrive with T09 (chunk summaries)",
+    fn surface_at(&self, x: i32, z: i32) -> SourceResult<SurfaceSample> {
+        let (cx, cz) = (chunk_of(x), chunk_of(z));
+        let summary = self.summary_for(cx, cz)?;
+        let column = summary
+            .column(local_of(x), local_of(z))
+            .expect("local coordinates are in range by construction");
+        let biome = self.biome_at(x, z)?;
+        Ok(self.surface_sample(x, z, biome, &column))
+    }
+
+    fn surface_region(&self, rect: Rect, step: u32) -> SourceResult<SurfaceGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let cancel = self.fresh_cancel();
+
+        // 1) The chunks this rect needs; a rect reaching outside the
+        //    generatable area is a typed error for the whole request
+        //    (documented: the UI clamps its requests, T16).
+        let ordered = self.ordered_covering_chunks(rect)?;
+
+        // 2) Summaries, nearest to the rect's center first, one pool
+        //    command per missing chunk, cancelled between chunks.
+        let mut summaries: HashMap<(i32, i32), Arc<ChunkSummary>> = HashMap::new();
+        for (cx, cz) in ordered {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(SourceError::Cancelled);
+            }
+            let summary = self.summary_for(cx, cz)?;
+            summaries.insert((cx, cz), summary);
+        }
+
+        // 3) The biome of every sample in one cheap batch (same token, no
+        //    re-arming): a tile must never pay one column query per pixel.
+        let biomes = self.pool.biome_region(rect, step, Arc::clone(&cancel))?;
+
+        // 4) Assemble row-major.
+        let mut samples = Vec::with_capacity((width * height) as usize);
+        for z in 0..height {
+            let world_z = rect.min_z + z as i32 * step as i32;
+            for x in 0..width {
+                let world_x = rect.min_x + x as i32 * step as i32;
+                let index = (z * width + x) as usize;
+                let biome = biomes.values[index];
+                let summary = &summaries[&(chunk_of(world_x), chunk_of(world_z))];
+                let column = summary
+                    .column(local_of(world_x), local_of(world_z))
+                    .expect("local coordinates are in range by construction");
+                samples.push(self.surface_sample(world_x, world_z, biome, &column));
+            }
+        }
+        Ok(SurfaceGrid::new(
+            rect.min_x, rect.min_z, step, width, height, samples,
         ))
     }
 
-    fn surface_region(&self, _rect: Rect, _step: u32) -> SourceResult<crate::types::SurfaceGrid> {
-        Err(SourceError::Unsupported(
-            "surface queries arrive with T09 (chunk summaries)",
-        ))
-    }
+    fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let cancel = self.fresh_cancel();
+        let ordered = self.ordered_covering_chunks(rect)?;
 
-    fn slice_region(
-        &self,
-        _rect: Rect,
-        _step: u32,
-        _y: i32,
-    ) -> SourceResult<crate::types::SliceGrid> {
-        Err(SourceError::Unsupported(
-            "slice queries arrive with T09 (chunk summaries)",
+        // One (chunk, y) slice per needed chunk, nearest first; each miss
+        // is a chunk generation, so cancellation is checked between chunks.
+        let mut slices: HashMap<(i32, i32), ChunkSlice> = HashMap::new();
+        for (cx, cz) in ordered {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(SourceError::Cancelled);
+            }
+            let slice = self.slice_for(cx, cz, y)?;
+            slices.insert((cx, cz), slice);
+        }
+
+        let mut cells = Vec::with_capacity((width * height) as usize);
+        for z in 0..height {
+            let world_z = rect.min_z + z as i32 * step as i32;
+            for x in 0..width {
+                let world_x = rect.min_x + x as i32 * step as i32;
+                let slice = &slices[&(chunk_of(world_x), chunk_of(world_z))];
+                // A sample between slice pixels takes the pixel at the
+                // sample origin (nearest, never interpolated).
+                let index = column_index(local_of(world_x), local_of(world_z));
+                cells.push(slice[index]);
+            }
+        }
+        Ok(SliceGrid::new(
+            rect.min_x, rect.min_z, step, width, height, y, cells,
         ))
     }
 
@@ -520,4 +719,109 @@ pub(crate) fn zone_at(
         .get_zone_result()
         .and_then(|zone_result| zone_result.get_zone())
         .map(|zone| ZoneId(zone.id)))
+}
+
+// ---------------------------------------------------------------------------
+// Chunk generation (T09): summaries and slices. Runs on the worker thread
+// with that thread's generator + resource; the GeneratedChunk is dropped
+// when the extraction finishes.
+// ---------------------------------------------------------------------------
+
+/// The per-worker chunk-generation state: the generator's registry snapshot
+/// (shared with the generator, never re-loaded) plus the reusable scratch
+/// resource. One per worker thread — the resource is `Rc`-based inside.
+pub(crate) struct GenState {
+    registry: Rc<worldgen_model::registry::Registries>,
+    resource: ChunkGeneratorResource,
+}
+
+/// Builds the chunk-generation state after the generator loaded. The
+/// registry snapshot comes from the generator itself (the loader always
+/// attaches one); the `Registries::load()` fallback is a safety net that
+/// never triggers for loader-built generators.
+pub(crate) fn init_gen_state(generator: &Rc<ChunkGenerator>) -> SourceResult<GenState> {
+    catch_load_panics(|| {
+        let registry = match generator.get_registries() {
+            Some(registry) => Rc::clone(registry),
+            None => Rc::new(worldgen_model::registry::Registries::load()),
+        };
+        Ok(GenState {
+            registry,
+            resource: ChunkGeneratorResource::new(),
+        })
+    })
+}
+
+/// Maps the worldgen service's error onto the source vocabulary.
+fn map_world_gen_error(error: WorldGenError) -> SourceError {
+    match error {
+        WorldGenError::Cancelled => SourceError::Cancelled,
+        WorldGenError::Panic(message) => SourceError::Generation(message),
+        WorldGenError::Load(message) => SourceError::Load(message),
+        WorldGenError::Shutdown => {
+            SourceError::Internal("the generator pool is shutting down".to_string())
+        }
+    }
+}
+
+/// Generates one chunk and extracts its compact summary (worker thread).
+/// The `GeneratedChunk` is dropped when this returns; only the ~22 KB
+/// summary crosses the thread boundary. Panics inside the pipeline are
+/// caught and mapped to [`SourceError::Generation`] — the same per-job
+/// boundary the worldgen service uses (world_gen.rs:650-658) — so a
+/// hostile coordinate degrades to an error instead of killing the worker.
+pub(crate) fn generate_summary(
+    generator: &Rc<ChunkGenerator>,
+    state: &mut GenState,
+    seed: i32,
+    cx: i32,
+    cz: i32,
+) -> SourceResult<Arc<ChunkSummary>> {
+    catch_query_panics(|| {
+        let request = WorldGenRequest::new(seed, cx, cz);
+        let result = generate_chunk(
+            generator,
+            Rc::clone(&state.registry),
+            &mut state.resource,
+            &request,
+        )
+        .map_err(map_world_gen_error)?;
+        Ok(Arc::new(chunks::extract_summary(&result.chunk, cx, cz)))
+    })
+}
+
+/// Generates one chunk and extracts both the horizontal slice at `y` and
+/// the compact summary — two products from one generation (worker thread).
+pub(crate) fn generate_slice(
+    generator: &Rc<ChunkGenerator>,
+    state: &mut GenState,
+    seed: i32,
+    cx: i32,
+    cz: i32,
+    y: i32,
+) -> SourceResult<(ChunkSlice, Arc<ChunkSummary>)> {
+    catch_query_panics(|| {
+        let request = WorldGenRequest::new(seed, cx, cz);
+        let result = generate_chunk(
+            generator,
+            Rc::clone(&state.registry),
+            &mut state.resource,
+            &request,
+        )
+        .map_err(map_world_gen_error)?;
+        let slice = chunks::extract_slice(&result.chunk, y);
+        let summary = Arc::new(chunks::extract_summary(&result.chunk, cx, cz));
+        Ok((slice, summary))
+    })
+}
+
+/// Runs one worker-side query, converting a pipeline panic into
+/// [`SourceError::Generation`] so the worker thread survives. See the
+/// deviation note on [`load_generator`]; this mirrors the worldgen
+/// service's per-job `catch_unwind` (world_gen.rs:650-658).
+fn catch_query_panics<T>(work: impl FnOnce() -> SourceResult<T>) -> SourceResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(payload) => Err(SourceError::Generation(panic_message(payload))),
+    }
 }

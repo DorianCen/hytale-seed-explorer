@@ -18,7 +18,7 @@ it owns, and the acceptance gate.
 | [T06](T06-workspace-scaffold.md) | Workspace scaffold and CI | 1 | T01, T02 | done |
 | [T07](T07-core-types-and-traits.md) | Core domain types and source traits | 1 | T06 | done |
 | [T08](T08-generator-worker-pool.md) | Generator worker pool and cheap queries | 1 | T06, T07 | done |
-| [T09](T09-chunk-surface-slice.md) | Chunk cache, surface and slice queries | 1 | T07, T08 | proposed |
+| [T09](T09-chunk-surface-slice.md) | Chunk cache, surface and slice queries | 1 | T07, T08 | done |
 | [T10](T10-coordinate-zoom-math.md) | Coordinate, zoom and tile math | 1 | T06, T07 | proposed |
 | [T11](T11-headless-png-render.md) | Headless 512×512 PNG render | 1 | T05, T08, T09, T10 | proposed |
 | [T12](T12-egui-app-shell.md) | egui shell, seed input and app state | 2 | T06, T07, T08, T10 | proposed |

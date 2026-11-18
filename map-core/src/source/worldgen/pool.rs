@@ -83,6 +83,25 @@ pub(crate) enum Command {
         z: i32,
         reply: Reply<Option<ZoneId>>,
     },
+    /// Generate one chunk and extract its compact summary (T09). The caller
+    /// caches; the worker never retains the `GeneratedChunk`.
+    GenerateSummary {
+        cx: i32,
+        cz: i32,
+        reply: Reply<Arc<crate::source::chunks::ChunkSummary>>,
+    },
+    /// Generate one chunk and extract one horizontal slice (T09). The reply
+    /// carries both products of the single generation: the slice and the
+    /// compact summary.
+    GenerateSlice {
+        cx: i32,
+        cz: i32,
+        y: i32,
+        reply: Reply<(
+            crate::source::chunks::ChunkSlice,
+            Arc<crate::source::chunks::ChunkSummary>,
+        )>,
+    },
     Shutdown,
 }
 
@@ -397,6 +416,42 @@ impl GeneratorPool {
             .map_err(|_| SourceError::Internal("the zone reply channel closed".to_string()))?
     }
 
+    /// Requests one chunk summary: generation + extraction on a worker. The
+    /// caller caches the result; the worker never retains the chunk.
+    pub fn generate_summary(
+        &self,
+        cx: i32,
+        cz: i32,
+    ) -> SourceResult<Arc<crate::source::chunks::ChunkSummary>> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Command::GenerateSummary { cx, cz, reply: tx })?;
+        rx.recv()
+            .map_err(|_| SourceError::Internal("the summary reply channel closed".to_string()))?
+    }
+
+    /// Requests one horizontal slice: generation + extraction on a worker.
+    /// The reply carries the slice and the summary (one generation, two
+    /// products); the caller decides what to cache.
+    pub fn generate_slice(
+        &self,
+        cx: i32,
+        cz: i32,
+        y: i32,
+    ) -> SourceResult<(
+        crate::source::chunks::ChunkSlice,
+        Arc<crate::source::chunks::ChunkSummary>,
+    )> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Command::GenerateSlice {
+            cx,
+            cz,
+            y,
+            reply: tx,
+        })?;
+        rx.recv()
+            .map_err(|_| SourceError::Internal("the slice reply channel closed".to_string()))?
+    }
+
     /// Idempotent: sends one `Shutdown` per worker and joins every handle.
     pub fn shutdown(&mut self) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
@@ -461,6 +516,17 @@ fn worker_main(
             max_chunk: generator.get_max_chunk_coord(),
         }
     };
+    // The chunk-generation state (registries + reusable resource) every
+    // worker needs for T09's summary/slice commands. Built before the ready
+    // report so a failure tears the pool down uniformly.
+    let mut gen_state = match crate::source::worldgen::init_gen_state(&generator) {
+        Ok(gen_state) => gen_state,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+
     if ready_tx.send(Ok(ready)).is_err() {
         // The pool gave up on startup; nothing left to do.
         return;
@@ -495,6 +561,27 @@ fn worker_main(
             }
             Command::ZoneAt { x, z, reply } => {
                 let result = crate::source::worldgen::zone_at(&generator, seed, x, z);
+                let _ = send_reply(reply, result);
+            }
+            Command::GenerateSummary { cx, cz, reply } => {
+                let result = crate::source::worldgen::generate_summary(
+                    &generator,
+                    &mut gen_state,
+                    seed,
+                    cx,
+                    cz,
+                );
+                let _ = send_reply(reply, result);
+            }
+            Command::GenerateSlice { cx, cz, y, reply } => {
+                let result = crate::source::worldgen::generate_slice(
+                    &generator,
+                    &mut gen_state,
+                    seed,
+                    cx,
+                    cz,
+                    y,
+                );
                 let _ = send_reply(reply, result);
             }
             Command::Shutdown => return,

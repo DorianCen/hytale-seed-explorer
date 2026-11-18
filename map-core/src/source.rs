@@ -27,6 +27,7 @@ use crate::types::{
 /// Implementors must be deterministic for a given seed and generator identity:
 /// tiles are keyed by coordinates plus [`WorldSource::identity`], and the same
 /// tile may be regenerated in a different worker.
+pub mod chunks;
 pub mod worldgen;
 
 pub trait WorldSource: Send + Sync {
