@@ -299,10 +299,11 @@ fn a_large_height_region_can_be_cancelled() {
     );
 }
 
-/// Proves the T08 acceptance bullet: the chunk-dependent queries still report
-/// [`SourceError::Unsupported`] until T22/T09 add chunk summaries.
+/// Smoke-checks the chunk-dependent queries after T09 landed them (the deep
+/// fidelity tests live in `tests/surface_slice.rs` and the cache behavior in
+/// `tests/chunk_cache.rs`).
 #[test]
-fn surface_and_slice_queries_report_t22_t09_as_pending() {
+fn surface_and_slice_queries_are_implemented_by_t09() {
     let Some(_world) = world_dir() else {
         return;
     };
@@ -310,21 +311,19 @@ fn surface_and_slice_queries_report_t22_t09_as_pending() {
     let source = source();
     let rect = Rect::from_dims(0, 0, 4, 4);
 
-    let surface = source.surface_at(0, 0);
+    let surface = source.surface_at(0, 0).expect("T09 serves surface_at");
     assert!(
-        matches!(surface, Err(SourceError::Unsupported(_))),
-        "surface_at is pending T09, got {surface:?}"
+        (-1..320).contains(&surface.height),
+        "the surface height must be a world y, got {surface:?}"
     );
-    let region = source.surface_region(rect, 1);
-    assert!(
-        matches!(region, Err(SourceError::Unsupported(_))),
-        "surface_region is pending T09, got {region:?}"
-    );
-    let slice = source.slice_region(rect, 1, 64);
-    assert!(
-        matches!(slice, Err(SourceError::Unsupported(_))),
-        "slice_region is pending T09, got {slice:?}"
-    );
+    let region = source
+        .surface_region(rect, 1)
+        .expect("T09 serves surface_region");
+    assert_eq!((region.width, region.height), (4, 4));
+    let slice = source
+        .slice_region(rect, 1, 64)
+        .expect("T09 serves slice_region");
+    assert_eq!(slice.y, 64);
 }
 
 /// Proves the T08 acceptance bullet: spawn points and zone lookups are served

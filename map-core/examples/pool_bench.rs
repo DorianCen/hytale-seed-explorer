@@ -69,6 +69,35 @@ fn main() {
         grid.height
     );
 
+    // T09: the chunk path — surface region + slice through the summary caches.
+    let surface_rect = Rect::from_dims(0, 0, 256, 256);
+    let started = Instant::now();
+    let grid = source
+        .surface_region(surface_rect, 1)
+        .expect("the surface region succeeds");
+    println!(
+        "surface_65536_pool_seconds {:.6} ({}x{} samples)",
+        started.elapsed().as_secs_f64(),
+        grid.width,
+        grid.height
+    );
+    let started = Instant::now();
+    let slice = source
+        .slice_region(Rect::from_dims(0, 0, 64, 64), 1, 64)
+        .expect("the slice succeeds");
+    println!(
+        "slice_4096_pool_seconds {:.6} ({}x{} cells at y={})",
+        started.elapsed().as_secs_f64(),
+        slice.width,
+        slice.height,
+        slice.y
+    );
+    let started = Instant::now();
+    let _ = source.surface_region(surface_rect, 2).expect("cached");
+    println!(
+        "surface_16384_cached_step2_seconds {:.6}",
+        started.elapsed().as_secs_f64()
+    );
     // Cancellation round-trip, to prove the pool stays healthy after one.
     source.cancel_pending();
     match source.biome_region(biome_rect, 2) {

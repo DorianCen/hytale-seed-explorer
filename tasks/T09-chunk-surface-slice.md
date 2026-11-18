@@ -1,6 +1,9 @@
 # T09 — Chunk cache, surface and slice queries
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/source/chunks.rs` + the
+`WorldgenSource` surface/slice implementation + `tests/surface_slice.rs`
+(6) + `tests/chunk_cache.rs` (6); pool numbers appended to
+[`docs/benchmarks.md`](../docs/benchmarks.md))
 **Milestone:** 1 — Scaffold
 **Depends on:** T07, T08
 **Blocks:** T11, T15, T17, T18, T20, T28
