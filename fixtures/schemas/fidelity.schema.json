@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/DorianCen/hytale-seed-explorer/fixtures/schemas/fidelity.schema.json",
+  "title": "Hytale seed explorer fidelity fixture (v1)",
+  "description": "Small, versioned (seed, coordinate) -> world-facts cases. Provenance is mandatory on every case; a case without an honest source is worse than no case.",
+  "type": "object",
+  "required": ["schema", "generator_version", "world_assets", "cases", "features"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1 },
+    "generator_version": { "type": "integer", "minimum": 1 },
+    "world_assets": { "type": "string", "description": "World folder + provider version and/or pack hash the cases were produced with, e.g. 'Default@testdata/Default@0.0.0'." },
+    "cases": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["seed", "world_seed", "generator_seed", "x", "z", "source"],
+        "additionalProperties": false,
+        "properties": {
+          "seed": { "type": "string", "description": "Exact seed input text, kept verbatim." },
+          "world_seed": { "type": "integer", "format": "int64" },
+          "generator_seed": { "type": "integer", "format": "int32" },
+          "x": { "type": "integer" },
+          "z": { "type": "integer" },
+          "y": { "type": "integer", "description": "Optional slice height for cases that pin a specific Y." },
+          "biome": { "type": ["string", "null"], "description": "Biome name as the generator reports it; null = not recorded (authoritative pending)." },
+          "height": { "type": ["integer", "null"], "description": "Surface height as the game shows it; null = not recorded." },
+          "surface_block": { "type": ["string", "null"], "description": "Registry block name at the surface; null = not recorded." },
+          "surface_fluid": { "type": ["string", "null"] },
+          "notes": { "type": "string" },
+          "source": {
+            "type": "string",
+            "enum": ["golden-chunks", "live-server", "worldgen-test", "pending-live"],
+            "description": "golden-chunks: Java dumper output (game-authoritative blocks/fluids). worldgen-test: Rust generator output (self-consistency only). live-server: recorded in the real game. pending-live: value still unverified, do not trust."
+          }
+        }
+      }
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["seed", "kind", "name", "x", "y", "z", "source"],
+        "additionalProperties": false,
+        "properties": {
+          "seed": { "type": "string" },
+          "kind": { "type": "string", "enum": ["unique-prefab", "spawn-point", "biome-prefab", "cave-entrance"] },
+          "name": { "type": "string" },
+          "category": { "type": ["string", "null"] },
+          "x": { "type": "integer" },
+          "y": { "type": "integer" },
+          "z": { "type": "integer" },
+          "show_on_map": { "type": ["boolean", "null"] },
+          "source": {
+            "type": "string",
+            "enum": ["golden-chunks", "live-server", "worldgen-test", "pending-live"]
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    }
+  }
+}

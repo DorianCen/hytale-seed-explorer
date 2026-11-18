@@ -1,6 +1,9 @@
 # T05 — Fidelity fixture suite and test harness
 
-**Status:** proposed
+**Status:** done (deliverable: [`fixtures/`](../fixtures/README.md) —
+`fidelity-v1.json` (10 cases, 3 seeds, negative coords, fluid columns; 9
+features) + schema + README; probe committed as `worldgen-cli`'s
+`fidelity_check` binary, worldgen repo commit `8060235`)
 **Milestone:** 0–1 — audit and scaffold
 **Depends on:** T01
 **Blocks:** T11, T22
