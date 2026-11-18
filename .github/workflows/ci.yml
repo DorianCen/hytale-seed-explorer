@@ -1,0 +1,74 @@
+# CI for the explorer workspace.
+#
+# Assumptions this file makes explicit (see README "Build and run"):
+# - The worldgen workspace is a SEPARATE private repository
+#   (DorianCen/hytale-server-rust) and is checked out NEXT TO this one,
+#   because the crates are path dependencies (../hytale-server-rust/...).
+#   Cross-repo checkout needs a PAT with read access, stored as the
+#   WORLDGEN_REPO_TOKEN secret. If either repo becomes public, the token
+#   line can be dropped.
+# - `cargo build -p map-app` links eframe against X11/Wayland; the apt step
+#   installs the required dev libraries. No window is ever launched in CI:
+#   the GUI gate is a build, not a run.
+# - No test needs the multi-gigabyte asset pack: map-core/map-cli tests run
+#   against the committed golden world data or pure code only.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the external worldgen workspace
+        uses: actions/checkout@v4
+        with:
+          repository: DorianCen/hytale-server-rust
+          path: hytale-server-rust
+          token: ${{ secrets.WORLDGEN_REPO_TOKEN }}
+
+      - name: Install eframe build dependencies (X11/Wayland dev libs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace metadata resolves (path deps included)
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (headless crates, warnings are errors)
+        run: cargo clippy -p map-core -p map-cli --all-targets -- -D warnings
+
+      - name: Tests (headless)
+        run: cargo test -p map-core -p map-cli
+
+      - name: Build the GUI crate (no window is launched)
+        run: cargo build -p map-app
+
+      - name: CLI smoke test
+        run: cargo run -p map-cli -- info
+
+      - name: map-core stays GUI-free
+        run: |
+          ! cargo tree -p map-core -e normal | grep -E "eframe|egui|arboard|winit|wgpu"

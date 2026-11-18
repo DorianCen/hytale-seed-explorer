@@ -1,0 +1,16 @@
+[package]
+name = "map-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless CLI of the Hytale seed explorer: render, search, fidelity."
+
+[dependencies]
+map-core = { workspace = true }
+
+clap = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+png = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
