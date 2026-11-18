@@ -14,7 +14,7 @@
 mod pool;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -91,6 +91,19 @@ impl WorldgenSourceConfig {
             seed_input: seed_input.into(),
         }
     }
+}
+
+/// The default world-gen folder for the explorer's frontends (CLI `render`,
+/// the egui shell): the extracted pack when the user has one (cwd-relative,
+/// like `worldgen-cli`'s probe), else the golden world copy of the sibling
+/// worldgen checkout (compile-time manifest-relative, so it works from any
+/// working directory). Frontends should still offer an override.
+pub fn default_world_path() -> PathBuf {
+    let extracted = PathBuf::from("Assets/extracted/Server/World/Default");
+    if extracted.is_dir() {
+        return extracted;
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hytale-server-rust/testdata/Default")
 }
 
 /// The catalogs one loaded generator yields; owned by the main thread after

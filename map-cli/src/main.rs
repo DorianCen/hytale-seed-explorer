@@ -10,24 +10,8 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use map_core::render::{Layer, encode_png, render_biome};
 use map_core::source::WorldSource;
-use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
+use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig, default_world_path};
 use map_core::types::Rect;
-
-/// Where the sibling worldgen checkout's golden world lives. Compile-time
-/// (not cwd-relative) so the CLI works from any working directory, with
-/// the same `--world` override semantics as `worldgen-cli`.
-const DEFAULT_WORLD: &str = "../../hytale-server-rust/testdata/Default";
-
-/// The default world-gen folder, resolved the way `worldgen-cli`'s
-/// `default_world_path` does: the extracted pack first (when the user has
-/// one, cwd-relative), then the sibling checkout's golden world copy.
-fn default_world_path() -> PathBuf {
-    let extracted = PathBuf::from("Assets/extracted/Server/World/Default");
-    if extracted.is_dir() {
-        return extracted;
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_WORLD)
-}
 
 #[derive(Parser)]
 #[command(

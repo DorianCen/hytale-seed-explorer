@@ -1,6 +1,15 @@
 # T12 — egui shell, seed input and app state
 
-**Status:** proposed
+**Status:** done (deliverable: `map-app/src/state.rs` — the headless state
+machine (seed parsing, `SourceState`, generation counter, stale-result
+rejection, retired-source list, view/layer/overlay placeholders,
+`format_status`) with 10 unit tests — plus `app.rs` (top bar, left panel,
+`MapView` placeholder reserved for T16, status bar, error banner +
+retry, background load thread, `G`/`F`/`Ctrl+S` shortcuts),
+`labels.rs` (every UI string in one place) and the new 1280×800
+`main.rs`; `default_world_path` shared into `map-core` so CLI and app
+resolve the same world; README documents the launch command and
+world-path assumptions)
 **Milestone:** 2 — Static viewer
 **Depends on:** T06, T07, T08, T10
 **Blocks:** T16, T18, T31

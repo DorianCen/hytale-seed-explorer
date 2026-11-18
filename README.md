@@ -47,6 +47,28 @@ testable end to end outside the GUI; `map-app` is a thin shell. CI runs the
 same battery plus a `cargo build -p map-app` link gate and a
 `cargo tree` check that `map-core` never grows GUI dependencies.
 
+**Running the desktop shell**
+
+`cargo run -p map-app` opens a 1280×800 window with the top bar (seed input,
+Go, generator version, resolution selector), the left panel (layers,
+overlays, search) and the central map placeholder; the bottom status bar
+formats cursor/zoom/layer state even before a world is loaded. Type a
+numeric seed and press **Go** (or **Enter**): the world loads on a
+background thread — the UI never blocks on generation — and the status bar
+flips `loading` → `ready` (or shows an error banner with **Retry** on a bad
+seed/path). Editing the seed text while a load runs cancels its effect: the
+stale result is dropped, not applied. Keyboard: **G** go-to dialog (T29),
+**F** search focus (T24), **Ctrl+S** PNG export (T32).
+
+World path resolution: the app loads the first of
+`Assets/extracted/Server/World/Default` (cwd-relative, as the game tools
+resolve an extracted pack) or the sibling checkout's golden world copy
+`../hytale-server-rust/testdata/Default`. A missing pack is not an error —
+the golden world is enough for the biome layer (the same resolution
+`map-cli render` uses; a `--world`-style override arrives with the settings
+panel, T31). Invalid seeds are reported inline: seeds are numeric (T02
+semantics; `docs/seed-semantics.md`), never hashed as a fallback.
+
 ## Hytale assets: you must supply your own
 
 This tool does **not** distribute any Hytale game assets — no textures, no

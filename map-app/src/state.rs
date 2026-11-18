@@ -1,0 +1,905 @@
+//! Headless app state (T12): everything the egui shell reads and writes,
+//! in plain data.
+//!
+//! No egui types live here on purpose — the state machine (seed parsing,
+//! source loading, stale-result rejection, resolution changes, status
+//! formatting) is fully unit-testable without a window, a GPU or even the
+//! generator. `app.rs` is the thin egui skin over this module.
+//!
+//! # Source loading model
+//!
+//! A load is *issued* by [`AppState::begin_load`] with a monotonically
+//! increasing generation and executed on a background thread; the result
+//! comes back through a channel and is applied by
+//! [`AppState::apply_load_result`], which accepts it **only** while the
+//! state is still `Loading` for that generation. Editing the seed text
+//! (or invalidating) resets the state, so a result that lands afterwards
+//! is stale and dropped — this is the guard the whole UI hangs on.
+//!
+//! Heavy sources never drop on the UI thread: any displaced
+//! `WorldgenSource` is parked in a retirement list that the app drains
+//! each frame and drops on a detached background thread, because dropping
+//! joins the generator worker pool.
+
+use std::path::PathBuf;
+
+use map_core::error::SourceResult;
+use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
+use map_core::types::{Seed, SeedError};
+
+use crate::labels;
+
+/// The resolution steps the top-bar selector offers (blocks per sample).
+/// The plan's default is 2×2.
+pub const RESOLUTION_STEPS: [u32; 4] = [1, 2, 4, 8];
+
+/// The layer radios in the left panel. Placeholder data until the real
+/// renderers land: `Biomes` is the only one with a renderer (T11); the
+/// others exist so the panel shape is frozen and T13/T17/T28 wire them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppLayer {
+    Biomes,
+    Surface,
+    Height,
+    Caves,
+}
+
+impl AppLayer {
+    /// The label of each radio button, kept in [`crate::labels`] for
+    /// T34's docs/screenshots.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            AppLayer::Biomes => labels::LAYER_BIOMES,
+            AppLayer::Surface => labels::LAYER_SURFACE,
+            AppLayer::Height => labels::LAYER_HEIGHT,
+            AppLayer::Caves => labels::LAYER_CAVES,
+        }
+    }
+
+    /// All layers in panel order.
+    pub const ALL: [AppLayer; 4] = [
+        AppLayer::Biomes,
+        AppLayer::Surface,
+        AppLayer::Height,
+        AppLayer::Caves,
+    ];
+}
+
+/// The overlay checkboxes of the left panel. Placeholder booleans until
+/// T23/T27/T29 render real overlays; the panel writes here either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlaySettings {
+    pub structures: bool,
+    pub prefabs: bool,
+    pub cave_entrances: bool,
+    pub chunk_grid: bool,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        // The plan's layout ships with structures, prefabs and cave
+        // entrances checked, the debug chunk grid off.
+        OverlaySettings {
+            structures: true,
+            prefabs: true,
+            cave_entrances: true,
+            chunk_grid: false,
+        }
+    }
+}
+
+/// The hover sample the status bar reports. Placeholder strings until the
+/// inspector (T18) resolves ids through the catalogs; every field is
+/// pre-rendered so [`format_status`] stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSample {
+    pub biome: String,
+    pub height: i32,
+    pub block: String,
+}
+
+/// What a background load delivers back to the UI thread.
+pub type LoadResult = (u64, SourceResult<WorldgenSource>);
+
+/// Everything a background load needs: the app spawns one thread per
+/// request and never constructs a `WorldgenSource` on the UI thread.
+#[derive(Debug, Clone)]
+pub struct LoadRequest {
+    /// The generation this load was issued under.
+    pub generation: u64,
+    /// The already-parsed seed (T02 semantics — invalid text never
+    /// reaches a worker).
+    pub seed: Seed,
+    /// Resolved world-gen folder (Java provider semantics downstream).
+    pub world_path: PathBuf,
+    /// Worker pool size; `None` = the source's default (2).
+    pub workers: Option<usize>,
+}
+
+impl LoadRequest {
+    /// The worker-side config: build it, call [`WorldgenSource::new`],
+    /// send the result home.
+    #[must_use]
+    pub fn config(&self) -> WorldgenSourceConfig {
+        let mut config = WorldgenSourceConfig::new(&self.world_path, self.seed.input());
+        config.workers = self.workers;
+        config
+    }
+}
+
+/// The source lifecycle. `Ready` owns the heavy `WorldgenSource` (plus
+/// its worker pool); `Error` carries the user-readable failure of the
+/// last load so the banner can offer a retry.
+///
+/// `Debug` is manual: the source (and its pool of `JoinHandle`s) has no
+/// cheap printable form, and state debugging cares about *which*
+/// variant, not the source contents.
+pub enum SourceState {
+    /// No source, no load in flight, no error to show.
+    Idle,
+    /// A load for `generation` is running on a background thread.
+    Loading { generation: u64 },
+    /// A source loaded successfully and owns the current view's data.
+    Ready(Box<WorldgenSource>),
+    /// The last load failed; the seed text is unchanged, so retry means
+    /// re-issuing the same load.
+    Error { message: String },
+}
+
+impl std::fmt::Debug for SourceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceState::Idle => f.write_str("Idle"),
+            SourceState::Loading { generation } => {
+                write!(f, "Loading {{ generation: {generation} }}")
+            }
+            SourceState::Ready(_) => f.write_str("Ready(<WorldgenSource>)"),
+            SourceState::Error { message } => {
+                write!(f, "Error {{ message: {message:?} }}")
+            }
+        }
+    }
+}
+
+/// The state behind the egui shell.
+///
+/// Invariants:
+///
+/// - `source` is `Loading { generation }` **iff** a load is in flight,
+///   and that generation is the newest issued;
+/// - `loaded_seed_input` mirrors the seed text the current source (or
+///   the in-flight load) belongs to — editing away from it invalidates;
+/// - displaced sources go to `retired`, never dropped on the UI thread.
+///
+/// No `Debug`: the source in `Ready` has no printable form; use the
+/// accessors.
+pub struct AppState {
+    seed_text: String,
+    parsed_seed: Option<Seed>,
+    seed_error: Option<SeedError>,
+
+    source: SourceState,
+    /// Seed text the current source/in-flight load was issued for.
+    loaded_seed_input: Option<String>,
+    /// The load-generation source of truth; bumped by every issue.
+    next_generation: u64,
+
+    /// Resolved world folder the next load will use.
+    world_path: PathBuf,
+    workers: Option<usize>,
+
+    /// Blocks per sample (one of [`RESOLUTION_STEPS`]); the plan's
+    /// default is 2.
+    resolution_step: u32,
+
+    /// View state (T10 vocabulary): world position at the map center and
+    /// the display scale in points per block. T16 drives these.
+    center: (f64, f64),
+    scale: f64,
+
+    /// The active layer radio and overlay checkboxes (placeholders).
+    layer: AppLayer,
+    overlays: OverlaySettings,
+
+    /// Cursor block coordinates once the map widget exists (T16).
+    cursor: Option<(i32, i32)>,
+
+    /// Transient one-line message (keyboard placeholders etc.).
+    status: String,
+
+    /// Placeholder toggles driven by keyboard shortcuts.
+    show_go_to: bool,
+    search_focused: bool,
+
+    /// Heavy sources waiting for a background drop.
+    retired: Vec<WorldgenSource>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            seed_text: String::new(),
+            parsed_seed: None,
+            seed_error: None,
+            source: SourceState::Idle,
+            loaded_seed_input: None,
+            next_generation: 0,
+            world_path: PathBuf::new(),
+            workers: None,
+            resolution_step: 2,
+            center: (0.0, 0.0),
+            scale: 1.0,
+            layer: AppLayer::Biomes,
+            overlays: OverlaySettings::default(),
+            cursor: None,
+            status: String::new(),
+            show_go_to: false,
+            search_focused: false,
+            retired: Vec::new(),
+        }
+    }
+}
+
+impl AppState {
+    /// Creates the state for a resolved world folder. The app passes
+    /// [`map_core::source::worldgen::default_world_path`] unless the user
+    /// overrides it.
+    pub fn new(world_path: impl Into<PathBuf>) -> AppState {
+        AppState {
+            world_path: world_path.into(),
+            // The plan's default resolution is 2×2.
+            resolution_step: 2,
+            center: (0.0, 0.0),
+            scale: 1.0,
+            layer: AppLayer::Biomes,
+            ..AppState::default()
+        }
+    }
+
+    // -- Seed ---------------------------------------------------------------
+
+    /// Runs `edit` against the seed text, then re-parses and applies the
+    /// change rules (see [`AppState::set_seed_text`]).
+    ///
+    /// The egui text edit needs a `&mut String`; this closure-based
+    /// access is the one door, so no edit can bypass the state machine.
+    pub fn with_seed_text<R>(&mut self, edit: impl FnOnce(&mut String) -> R) -> R {
+        let mut text = std::mem::take(&mut self.seed_text);
+        let result = edit(&mut text);
+        self.set_seed_text(text);
+        result
+    }
+
+    /// Sets the seed text and re-parses it (T02 semantics live in
+    /// [`Seed`]).
+    ///
+    /// Moving away from the text the current source (or in-flight load)
+    /// belongs to **invalidates** it: the state returns to `Idle` and a
+    /// load that completes afterwards is dropped as stale. This is the
+    /// acceptance rule "changing the seed while loading does not apply
+    /// the old result".
+    pub fn set_seed_text(&mut self, text: String) {
+        if self.seed_text == text {
+            return;
+        }
+        self.seed_text = text;
+        if self.seed_text.is_empty() {
+            self.parsed_seed = None;
+            self.seed_error = None;
+            self.invalidate_source();
+            return;
+        }
+        match Seed::parse(&self.seed_text) {
+            Ok(seed) => {
+                self.parsed_seed = Some(seed);
+                self.seed_error = None;
+            }
+            Err(error) => {
+                self.parsed_seed = None;
+                self.seed_error = Some(error);
+            }
+        }
+        // A parsed seed equal to the loaded one keeps the source; any
+        // other edit invalidates it.
+        if self.parsed_seed.as_ref().map(Seed::input) != self.loaded_seed_input.as_deref() {
+            self.invalidate_source();
+        }
+    }
+
+    /// The seed text exactly as the user typed it.
+    ///
+    /// Reserved for the seed-history display (T31); the shell edits
+    /// through [`AppState::with_seed_text`].
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn seed_text(&self) -> &str {
+        &self.seed_text
+    }
+
+    /// The parsed seed, when the text is valid.
+    #[must_use]
+    pub fn parsed_seed(&self) -> Option<&Seed> {
+        self.parsed_seed.as_ref()
+    }
+
+    /// Why the seed text does not parse, when it does not.
+    #[must_use]
+    pub fn seed_error(&self) -> Option<&SeedError> {
+        self.seed_error.as_ref()
+    }
+
+    // -- Loading ------------------------------------------------------------
+
+    /// Issues a background load, if one is possible right now.
+    ///
+    /// Returns [`None`] — and changes nothing — when a load is already
+    /// running, the text is empty, or the seed does not parse (the Go
+    /// button is disabled for exactly these cases; this is the guard
+    /// behind it). Otherwise the state becomes `Loading` under a fresh
+    /// generation and the caller spawns the worker.
+    pub fn begin_load(&mut self) -> Option<LoadRequest> {
+        if matches!(self.source, SourceState::Loading { .. })
+            || self.seed_text.is_empty()
+            || self.parsed_seed.is_none()
+        {
+            return None;
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+
+        // A re-load over a ready source retires the old one; dropping
+        // happens off the UI thread (see the module docs).
+        self.retire_ready_source();
+        self.source = SourceState::Loading { generation };
+        self.loaded_seed_input = Some(self.seed_text.clone());
+        self.status.clear();
+
+        Some(LoadRequest {
+            generation,
+            seed: self.parsed_seed.clone().expect("checked above"),
+            world_path: self.world_path.clone(),
+            workers: self.workers,
+        })
+    }
+
+    /// Applies a background load's result; true when it was accepted.
+    ///
+    /// The result is accepted **only** while the state is still `Loading`
+    /// for exactly this generation. Anything else — an edit reset the
+    /// state, a newer load was issued — makes it stale: an `Ok` source is
+    /// parked for background drop (never dropped here) and `false` is
+    /// returned. The UI never sees a result for a seed it no longer shows.
+    pub fn apply_load_result(
+        &mut self,
+        generation: u64,
+        result: SourceResult<WorldgenSource>,
+    ) -> bool {
+        if !matches!(self.source, SourceState::Loading { generation: current } if current == generation)
+        {
+            if let Ok(source) = result {
+                self.retired.push(source);
+            }
+            return false;
+        }
+
+        match result {
+            Ok(source) => {
+                self.status = format!("{} {}", labels::STATUS_SOURCE_READY, self.seed_text);
+                self.source = SourceState::Ready(Box::new(source));
+            }
+            Err(error) => {
+                self.source = SourceState::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+        true
+    }
+
+    /// The background worker died without reporting (it panicked, or the
+    /// process is going away). Fails the in-flight load so the error
+    /// banner offers a retry instead of an eternal spinner.
+    pub fn load_worker_died(&mut self) {
+        if let SourceState::Loading { .. } = self.source {
+            self.source = SourceState::Error {
+                message: labels::STATUS_WORKER_DIED.to_string(),
+            };
+        }
+    }
+
+    /// Drops the notion of a current source: `Ready` is parked for a
+    /// background drop, an in-flight load is declared dead (its result
+    /// will be rejected as stale), and an error banner is cleared.
+    ///
+    /// The transient status line is cleared too: a "ready <seed>" message
+    /// must not outlive the source it announced.
+    pub fn invalidate_source(&mut self) {
+        self.retire_ready_source();
+        self.source = SourceState::Idle;
+        self.loaded_seed_input = None;
+        self.status.clear();
+    }
+
+    /// True while a load is in flight (drives the Go button and spinner).
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        matches!(self.source, SourceState::Loading { .. })
+    }
+
+    /// The loaded source, when there is one.
+    #[must_use]
+    pub fn source(&self) -> Option<&WorldgenSource> {
+        match &self.source {
+            SourceState::Ready(source) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// The last load's failure, when there is one (the error banner).
+    #[must_use]
+    pub fn source_error(&self) -> Option<&str> {
+        match &self.source {
+            SourceState::Error { message } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// A short status word for the status bar: idle / loading / ready /
+    /// error.
+    #[must_use]
+    pub fn source_status_text(&self) -> &'static str {
+        match &self.source {
+            SourceState::Idle => labels::STATUS_SOURCE_IDLE,
+            SourceState::Loading { .. } => labels::STATUS_SOURCE_LOADING,
+            SourceState::Ready(_) => labels::STATUS_SOURCE_READY,
+            SourceState::Error { .. } => labels::STATUS_SOURCE_ERROR,
+        }
+    }
+
+    /// Displaced sources, taken for a background drop. The app calls this
+    /// every frame; an empty vec is the common case.
+    pub fn take_retired_sources(&mut self) -> Vec<WorldgenSource> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Moves a `Ready` source into retirement (called by every path that
+    /// leaves `Ready`).
+    fn retire_ready_source(&mut self) {
+        if let SourceState::Ready(source) = std::mem::replace(&mut self.source, SourceState::Idle) {
+            self.retired.push(*source);
+        }
+    }
+
+    // -- View / panel settings ----------------------------------------------
+
+    /// The world position at the map center (T10 vocabulary).
+    #[must_use]
+    pub fn center(&self) -> (f64, f64) {
+        self.center
+    }
+
+    /// Sets the map center (T16 pans here).
+    #[allow(dead_code)] // reserved: T16
+    pub fn set_center(&mut self, x: f64, z: f64) {
+        self.center = (x, z);
+    }
+
+    /// The display scale in points per block (T10 vocabulary).
+    #[must_use]
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Sets the display scale (T16 zooms here).
+    #[allow(dead_code)] // reserved: T16
+    pub fn set_scale(&mut self, scale: f64) {
+        self.scale = scale;
+    }
+
+    /// The blocks-per-sample resolution (one of [`RESOLUTION_STEPS`]).
+    #[must_use]
+    pub fn resolution_step(&self) -> u32 {
+        self.resolution_step
+    }
+
+    /// Sets the resolution, refusing values the selector does not offer;
+    /// the return value tells the caller whether it stuck.
+    pub fn set_resolution_step(&mut self, step: u32) -> bool {
+        if RESOLUTION_STEPS.contains(&step) {
+            self.resolution_step = step;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The active layer radio.
+    #[must_use]
+    pub fn layer(&self) -> AppLayer {
+        self.layer
+    }
+
+    /// Selects a layer radio (the panel calls this even though only
+    /// `Biomes` renders today).
+    pub fn set_layer(&mut self, layer: AppLayer) {
+        self.layer = layer;
+    }
+
+    /// The overlay checkboxes (mutable so the panel writes them directly).
+    pub fn overlays_mut(&mut self) -> &mut OverlaySettings {
+        &mut self.overlays
+    }
+
+    /// Cursor block coordinates for the status bar, once the map widget
+    /// reports them (T16).
+    #[must_use]
+    pub fn cursor(&self) -> Option<(i32, i32)> {
+        self.cursor
+    }
+
+    /// Reports the cursor's block coordinates (or its absence).
+    #[allow(dead_code)] // reserved: T16 feeds the status bar
+    pub fn set_cursor(&mut self, cursor: Option<(i32, i32)>) {
+        self.cursor = cursor;
+    }
+
+    /// The transient status line (keyboard placeholder feedback etc.).
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// Sets the transient status line.
+    #[allow(dead_code)] // reserved: T29/T32 feedback once their shortcuts do work
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
+    // -- Keyboard placeholder actions ---------------------------------------
+
+    /// Toggles the go-to dialog placeholder (`G`).
+    pub fn toggle_go_to(&mut self) {
+        self.show_go_to = !self.show_go_to;
+    }
+
+    /// Whether the go-to dialog placeholder is open.
+    #[must_use]
+    pub fn show_go_to(&self) -> bool {
+        self.show_go_to
+    }
+
+    /// Marks the search section placeholder (`F`).
+    pub fn focus_search(&mut self) {
+        self.search_focused = true;
+    }
+
+    /// Whether the search placeholder was focused (the panel clears it).
+    #[must_use]
+    pub fn take_search_focus(&mut self) -> bool {
+        std::mem::take(&mut self.search_focused)
+    }
+
+    /// The Ctrl+S export placeholder: no PNG yet (T32), just a status
+    /// message proving the shortcut fired.
+    pub fn export_placeholder(&mut self) {
+        self.status = labels::STATUS_EXPORT_PLACEHOLDER.to_string();
+    }
+
+    // -- World path ----------------------------------------------------------
+
+    /// The world folder the next load will use.
+    #[allow(dead_code)] // reserved: T31's settings panel displays it
+    #[must_use]
+    pub fn world_path(&self) -> &PathBuf {
+        &self.world_path
+    }
+
+    /// Overrides the world folder (settings arrive with T31).
+    #[allow(dead_code)] // reserved: T31's settings panel
+    pub fn set_world_path(&mut self, path: impl Into<PathBuf>) {
+        self.world_path = path.into();
+    }
+
+    /// The worker-pool size override for the next load.
+    #[allow(dead_code)] // reserved: T31's settings panel
+    #[must_use]
+    pub fn workers(&self) -> Option<usize> {
+        self.workers
+    }
+
+    /// Sets the worker-pool size override.
+    #[allow(dead_code)] // reserved: T31's settings panel
+    pub fn set_workers(&mut self, workers: Option<usize>) {
+        self.workers = workers;
+    }
+}
+
+/// Formats the status bar as one line of `key: value` pairs, using
+/// `unknown` wherever a value does not exist yet.
+///
+/// Pure on purpose: the app tests it with synthetic values, including the
+/// all-unknown case (no cursor, no source, nothing hovered).
+///
+/// ```text
+/// X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass |
+/// tiles 12 pending | zoom 1.0 pt/blk | 2×2 | ready
+/// ```
+#[must_use]
+pub fn format_status(
+    cursor: Option<(i32, i32)>,
+    sample: Option<&StatusSample>,
+    pending_tiles: u32,
+    zoom: f64,
+    step: u32,
+    source_status: &str,
+) -> String {
+    let (x_text, z_text) = match cursor {
+        Some((x, z)) => (x.to_string(), z.to_string()),
+        None => (
+            labels::STATUS_UNKNOWN.to_string(),
+            labels::STATUS_UNKNOWN.to_string(),
+        ),
+    };
+    let (biome, height, block) = match sample {
+        Some(sample) => (
+            sample.biome.clone(),
+            sample.height.to_string(),
+            sample.block.clone(),
+        ),
+        None => (
+            labels::STATUS_UNKNOWN.to_string(),
+            labels::STATUS_UNKNOWN.to_string(),
+            labels::STATUS_UNKNOWN.to_string(),
+        ),
+    };
+    format!(
+        "X:{x_text} Z:{z_text} | {BIO}: {biome} | {HEIGHT}: {height} | \
+         {BLOCK}: {block} | {TILES} {pending_tiles} | {ZOOM} {zoom:.1} {PTBLK} | \
+         {step}×{step} | {source_status}",
+        BIO = labels::STATUS_BIOME,
+        HEIGHT = labels::STATUS_HEIGHT,
+        BLOCK = labels::STATUS_BLOCK,
+        TILES = labels::STATUS_TILES,
+        ZOOM = labels::STATUS_ZOOM,
+        PTBLK = labels::STATUS_PT_PER_BLOCK,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use map_core::error::SourceError;
+    use map_core::source::WorldSource;
+
+    fn state() -> AppState {
+        AppState::new("/nonexistent/world")
+    }
+
+    #[test]
+    fn seed_text_parses_and_reports_errors() {
+        let mut state = state();
+        state.set_seed_text(String::from("4294967297"));
+        let seed = state.parsed_seed().expect("numeric seeds parse");
+        assert_eq!(seed.world(), 4_294_967_297);
+        assert_eq!(seed.generator(), 1, "documented low-32-bit truncation");
+        assert!(state.seed_error().is_none());
+
+        state.set_seed_text(String::from("abc"));
+        assert!(state.parsed_seed().is_none(), "non-numeric is rejected");
+        assert!(state.seed_error().is_some(), "the reason is reported");
+        // Empty text clears both sides.
+        state.set_seed_text(String::new());
+        assert!(state.parsed_seed().is_none());
+        assert!(state.seed_error().is_none());
+    }
+
+    #[test]
+    fn begin_load_refuses_empty_invalid_and_inflight() {
+        let mut state = state();
+
+        assert!(state.begin_load().is_none(), "empty text never loads");
+        state.set_seed_text(String::from("12x"));
+        assert!(
+            state.begin_load().is_none(),
+            "an invalid seed never reaches a worker"
+        );
+
+        state.set_seed_text(String::from("42"));
+        let first = state.begin_load().expect("a valid seed issues a load");
+        assert_eq!(first.generation, 0);
+        assert_eq!(first.seed.world(), 42);
+        assert!(state.is_loading());
+        assert!(
+            state.begin_load().is_none(),
+            "a second Go while loading changes nothing"
+        );
+        assert!(state.is_loading());
+    }
+
+    #[test]
+    fn load_error_lands_in_the_error_state() {
+        let mut state = state();
+        state.set_seed_text(String::from("1"));
+        let request = state.begin_load().expect("the load issues");
+
+        let accepted = state.apply_load_result(
+            request.generation,
+            Err(SourceError::Load(String::from("no such world"))),
+        );
+        assert!(accepted, "the result was for the current generation");
+        assert_eq!(state.source_error(), Some("load failed: no such world"));
+        assert_eq!(state.source_status_text(), labels::STATUS_SOURCE_ERROR);
+        assert!(!state.is_loading());
+
+        // Retry re-issues with a fresh generation.
+        let retry = state.begin_load().expect("retry issues a new load");
+        assert_eq!(retry.generation, request.generation + 1);
+        assert!(state.is_loading());
+    }
+
+    #[test]
+    fn stale_results_are_rejected() {
+        let mut state = state();
+        state.set_seed_text(String::from("7"));
+        let request = state.begin_load().expect("the load issues");
+
+        // An unrelated generation is stale even while loading.
+        assert!(!state.apply_load_result(
+            request.generation + 7,
+            Err(SourceError::Load(String::from("late"))),
+        ));
+        assert!(state.is_loading(), "the in-flight load is untouched");
+
+        // Editing the seed mid-load invalidates: the result then drops.
+        state.set_seed_text(String::from("8"));
+        assert!(!state.is_loading(), "the edit reset the state");
+        assert_eq!(state.source_status_text(), labels::STATUS_SOURCE_IDLE);
+        assert!(!state.apply_load_result(
+            request.generation,
+            Err(SourceError::Load(String::from("too late"))),
+        ));
+        assert_eq!(state.source_status_text(), labels::STATUS_SOURCE_IDLE);
+    }
+
+    #[test]
+    fn editing_the_seed_text_invalidates_a_ready_source() {
+        let mut state = state();
+        state.set_seed_text(String::from("5"));
+        let _ = state.begin_load().expect("the load issues");
+        // Simulate success without a real generator: park a source via the
+        // invalidation path instead — a full ready-transition test runs in
+        // the worldgen-gated test below.
+        state.set_seed_text(String::from("6"));
+        assert!(state.source().is_none(), "no source survives an edit");
+        assert_eq!(state.source_status_text(), labels::STATUS_SOURCE_IDLE);
+
+        // Editing back to the same text does not resurrect anything.
+        state.set_seed_text(String::from("6"));
+        assert!(state.source().is_none());
+    }
+
+    #[test]
+    fn resolution_selector_updates_and_rejects_unknown_steps() {
+        let mut state = state();
+        assert_eq!(state.resolution_step(), 2, "defaults to 2x2");
+        for step in RESOLUTION_STEPS {
+            assert!(state.set_resolution_step(step), "step {step} is offered");
+            assert_eq!(state.resolution_step(), step);
+        }
+        for bad in [0, 3, 5, 16, 256] {
+            assert!(!state.set_resolution_step(bad), "step {bad} is refused");
+        }
+    }
+
+    #[test]
+    fn layer_and_overlay_placeholders_write_through() {
+        let mut state = state();
+        assert_eq!(state.layer(), AppLayer::Biomes, "biomes is the default");
+        for layer in AppLayer::ALL {
+            state.set_layer(layer);
+            assert_eq!(state.layer(), layer);
+        }
+
+        let overlays = state.overlays_mut();
+        overlays.chunk_grid = true;
+        overlays.prefabs = false;
+        assert!(state.overlays_mut().chunk_grid);
+        assert!(!state.overlays_mut().prefabs);
+        assert_eq!(
+            state.overlays_mut().structures,
+            OverlaySettings::default().structures,
+            "untouched checkboxes keep their defaults"
+        );
+    }
+
+    #[test]
+    fn keyboard_placeholders_set_status_and_toggles() {
+        let mut state = state();
+        state.toggle_go_to();
+        assert!(state.show_go_to());
+        state.toggle_go_to();
+        assert!(!state.show_go_to());
+
+        state.focus_search();
+        assert!(state.take_search_focus(), "the panel consumes the focus");
+        assert!(!state.take_search_focus(), "and only once");
+
+        state.export_placeholder();
+        assert_eq!(state.status(), labels::STATUS_EXPORT_PLACEHOLDER);
+    }
+
+    #[test]
+    fn status_bar_formats_synthetic_values() {
+        let sample = StatusSample {
+            biome: String::from("Emerald Grove"),
+            height: 71,
+            block: String::from("Grass"),
+        };
+        let line = format_status(Some((-1203, 455)), Some(&sample), 12, 0.5, 2, "ready");
+        assert_eq!(
+            line,
+            "X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass \
+             | tiles 12 | zoom 0.5 pt/blk | 2×2 | ready"
+        );
+
+        // The all-unknown case: works before any source or cursor exists.
+        let unknown = format_status(None, None, 0, 1.0, 2, "no source");
+        assert_eq!(
+            unknown,
+            "X:unknown Z:unknown | Biome: unknown | Height: unknown | \
+             Block: unknown | tiles 0 | zoom 1.0 pt/blk | 2×2 | no source"
+        );
+    }
+
+    // -- The ready transition, gated on the real generator ------------------
+
+    /// The worldgen checkout this repository's sibling ships for tests.
+    fn world_dir() -> Option<PathBuf> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hytale-server-rust/testdata/Default");
+        dir.is_dir().then_some(dir)
+    }
+
+    #[test]
+    fn load_result_transitions_to_ready_with_a_real_source() {
+        // The full idle → loading → ready machine needs one real
+        // generator load, so it runs only where the sibling checkout
+        // exists (every other test covers the paths without it).
+        let Some(world) = world_dir() else {
+            eprintln!("skipping: the worldgen checkout is not present");
+            return;
+        };
+        let mut state = AppState::new(&world);
+        state.set_seed_text(String::from("12345"));
+        let request = state.begin_load().expect("the load issues");
+
+        // The "worker": construct the source exactly like the app thread.
+        let result = WorldgenSource::new(&request.config());
+        assert!(
+            state.apply_load_result(request.generation, result),
+            "the current generation applies"
+        );
+        assert!(state.source().is_some(), "ready owns the source");
+        assert_eq!(state.source().unwrap().seed().world(), 12_345);
+        assert_eq!(state.source_status_text(), labels::STATUS_SOURCE_READY);
+
+        // Re-Go retires the old source for a background drop.
+        let second = state.begin_load().expect("re-Go issues a new load");
+        assert_eq!(second.generation, request.generation + 1);
+        let retired = state.take_retired_sources();
+        assert_eq!(retired.len(), 1, "the old source was parked, not dropped");
+        assert!(state.source().is_none(), "loading again");
+
+        // A stale success for the retired generation parks, not replaces.
+        let stale = WorldgenSource::new(&second.config());
+        assert!(!state.apply_load_result(request.generation, stale));
+        assert!(state.source().is_none());
+        assert_eq!(
+            state.take_retired_sources().len(),
+            1,
+            "the stale source was parked too"
+        );
+    }
+}
