@@ -53,10 +53,16 @@ pub struct BiomeCatalog {
 impl BiomeCatalog {
     /// Adds one biome.
     ///
-    /// Returns [`SourceError::Internal`] on a duplicate id or a duplicate
-    /// name. The T08 adapter must resolve collisions before inserting: the
-    /// default world's biome ids are globally unique, but modded worlds may
-    /// reuse names or ids, and map-core will not silently pick a winner.
+    /// Returns [`SourceError::Internal`] only on a duplicate **id** (ids are
+    /// the generator's global identity — a collision is a real invariant
+    /// break). Duplicate **names are legal game data**: the Default world
+    /// reuses a display name across the tile biome and the custom biome of
+    /// the same zone (30 such pairs, e.g. `Cold_Kelp` ids 1 and 14), so the
+    /// catalog keys by id and the reverse name index is first-wins —
+    /// [`Self::get_by_name`] resolves the first inserted id with that name,
+    /// while every id stays resolvable through [`Self::get`]. (Contract
+    /// refined by T08 after the real world proved name reuse; the T07
+    /// strict-name rule was unimplementable against real data.)
     pub fn insert(&mut self, info: BiomeInfo) -> SourceResult<()> {
         if self.by_id.contains_key(&info.id) {
             return Err(SourceError::Internal(format!(
@@ -64,13 +70,8 @@ impl BiomeCatalog {
                 info.id.0, info.name
             )));
         }
-        if self.by_name.contains_key(&info.name) {
-            return Err(SourceError::Internal(format!(
-                "duplicate biome name {:?} (id {})",
-                info.name, info.id.0
-            )));
-        }
-        self.by_name.insert(info.name.clone(), info.id);
+        // First-wins name index: keep the earliest id for a reused name.
+        self.by_name.entry(info.name.clone()).or_insert(info.id);
         self.by_id.insert(info.id, info);
         Ok(())
     }
@@ -366,18 +367,25 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_biome_inserts_are_errors() {
+    fn duplicate_biome_ids_error_and_names_are_first_wins() {
         let mut catalog = BiomeCatalog::default();
         catalog.insert(biome(1, "One")).expect("unique");
+        // A duplicate ID is a real invariant break (ids are the identity).
         assert!(matches!(
             catalog.insert(biome(1, "Other")),
             Err(SourceError::Internal(_))
         ));
-        assert!(matches!(
-            catalog.insert(biome(2, "One")),
-            Err(SourceError::Internal(_))
-        ));
-        assert_eq!(catalog.len(), 1);
+        // A reused NAME is legal game data (tile/custom variants share
+        // names): the id is admitted and the name index stays first-wins.
+        catalog
+            .insert(biome(14, "One"))
+            .expect("reused names are legal");
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.get_by_name("One"), Some(BiomeId(1)));
+        assert_eq!(
+            catalog.get(BiomeId(14)).expect("id 14 admitted").name,
+            "One"
+        );
     }
 
     #[test]
