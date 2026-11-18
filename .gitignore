@@ -1,1 +1,10 @@
 /target
+
+# Hytale asset pack (user-supplied, proprietary — never commit; see
+# docs/assets-and-palette.md §2).
+/Assets/
+/.hytale-source/
+
+# Palettes generated from the user's pack (user-cache data — never commit).
+*.palette.json
+

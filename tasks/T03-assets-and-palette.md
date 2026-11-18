@@ -1,6 +1,7 @@
 # T03 — Asset, palette and licensing decision
 
-**Status:** proposed
+**Status:** done (deliverable: [`docs/assets-and-palette.md`](../docs/assets-and-palette.md);
+probe: [`tools/block_color_probe.py`](../tools/block_color_probe.py))
 **Milestone:** 0 — API audit
 **Depends on:** —
 **Blocks:** T20

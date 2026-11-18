@@ -12,7 +12,7 @@ it owns, and the acceptance gate.
 |---|---|---|---|---|
 | [T01](T01-worldgen-api-audit.md) | Worldgen API audit and gap matrix | 0 | — | done |
 | [T02](T02-seed-semantics.md) | Seed semantics and generator identity | 0 | — | done |
-| [T03](T03-assets-and-palette.md) | Asset, palette and licensing decision | 0 | — | proposed |
+| [T03](T03-assets-and-palette.md) | Asset, palette and licensing decision | 0 | — | done |
 | [T04](T04-performance-baseline.md) | Performance baseline harness | 0 | — | proposed |
 | [T05](T05-fidelity-fixtures.md) | Fidelity fixture suite and test harness | 0–1 | T01 | proposed |
 | [T06](T06-workspace-scaffold.md) | Workspace scaffold and CI | 1 | T01, T02 | proposed |
