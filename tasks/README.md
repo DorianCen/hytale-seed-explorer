@@ -11,7 +11,7 @@ it owns, and the acceptance gate.
 | Task | Title | Milestone | Depends on | Status |
 |---|---|---|---|---|
 | [T01](T01-worldgen-api-audit.md) | Worldgen API audit and gap matrix | 0 | — | done |
-| [T02](T02-seed-semantics.md) | Seed semantics and generator identity | 0 | — | proposed |
+| [T02](T02-seed-semantics.md) | Seed semantics and generator identity | 0 | — | done |
 | [T03](T03-assets-and-palette.md) | Asset, palette and licensing decision | 0 | — | proposed |
 | [T04](T04-performance-baseline.md) | Performance baseline harness | 0 | — | proposed |
 | [T05](T05-fidelity-fixtures.md) | Fidelity fixture suite and test harness | 0–1 | T01 | proposed |
