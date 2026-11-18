@@ -11,7 +11,8 @@
 //!
 //! - [`source`] — the `WorldSource`/`FeatureSource` traits and the adapter
 //!   to the external worldgen workspace (T07, T08, T09).
-//! - [`tiles`] — tile keys, scheduling, cache (T10, T14, T15).
+//! - [`coords`] — the canonical coordinate, zoom and tile math (T10).
+//! - [`tiles`] — tile keys, scheduling, cache (T14, T15).
 //! - [`render`] — layer renderers: biome, height, relief, blocks, caves
 //!   (T13, T17, T19–T21, T28).
 //! - [`features`] — the feature catalog, icon ids, categories (T23).
@@ -20,6 +21,7 @@
 //! - [`export`] — PNG export (T32).
 
 pub mod catalog;
+pub mod coords;
 pub mod error;
 pub mod export;
 pub mod features;

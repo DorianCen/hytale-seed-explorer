@@ -1,6 +1,10 @@
 # T10 — Coordinate, zoom and tile math
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/coords.rs` — floor division,
+`ZoomLevel`/`effective_step`, block ↔ tile conversions, `Viewport`
+screen ↔ world math with `zoom_at_cursor` — plus 25 unit tests including
+the fixed table at center `(-1203, 455)` and the proptest suite
+`tests/coords_property.rs` (5); `proptest` added as a dev-dependency)
 **Milestone:** 1 — Scaffold (used by milestone 3)
 **Depends on:** T06, T07
 **Blocks:** T11, T12, T13, T14, T15
