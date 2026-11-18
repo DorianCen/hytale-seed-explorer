@@ -1,6 +1,46 @@
-[package]
-name = "hytale-seed-explorer"
+# Hytale Seed Explorer workspace.
+#
+# The generator stays an external path dependency (T06 contract): this repo
+# never copies generator code. The paths below assume the worldgen checkout
+# lives next to this repository (../hytale-server-rust); if it moves, only
+# this table changes.
+
+[workspace]
+resolver = "2"
+members = ["map-core", "map-app", "map-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+map-core = { path = "map-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rayon = "1"
+crossbeam-channel = "0.5"
+moka = { version = "0.12", features = ["sync"] }
+image = "0.25"
+png = "0.17"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
+egui = "0.31"
+directories = "6"
+bytemuck = "1"
+
+# External generator crates. The generator workspace uses edition 2021 and
+# workspace inheritance; both resolve fine from here (verified by the T06
+# acceptance gate). Do not fork or vendor them (T34 may add a release option).
+worldgen-hytale = { path = "../hytale-server-rust/crates/worldgen-hytale" }
+worldgen-model = { path = "../hytale-server-rust/crates/worldgen-model" }
+hytale-math = { path = "../hytale-server-rust/crates/hytale-math" }
+procedural = { path = "../hytale-server-rust/crates/procedural" }
+
+[profile.release]
+# Keep release builds debuggable enough for profiling (T33).
+debug = "line-tables-only"

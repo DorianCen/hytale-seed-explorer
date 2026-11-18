@@ -17,6 +17,36 @@ completed milestone-0 audits in [`docs/`](docs):
 - [`docs/assets-and-palette.md`](docs/assets-and-palette.md) — where every map
   color comes from, and the licensing rules (T03).
 
+## Build and run
+
+**Prerequisites**
+
+- Rust (stable, edition 2024 capable).
+- A checkout of the worldgen workspace
+  [`hytale-server-rust`](https://github.com/DorianCen/hytale-server-rust)
+  **next to this repository** (`../hytale-server-rust`) — the generator is an
+  external path dependency and is never copied or vendored here. Its own
+  prerequisites (the committed `testdata/Default` world is enough for the
+  headless paths; the asset pack is optional) are documented in that repo.
+- Linux GUI builds additionally need the X11/Wayland dev libraries (see
+  `.github/workflows/ci.yml` for the exact apt list).
+
+**Commands**
+
+```sh
+cargo run -p map-app              # the desktop shell (eframe)
+cargo run -p map-cli -- --help    # the headless CLI
+cargo run -p map-cli -- info       # prints the resolved generator identity
+cargo test -p map-core -p map-cli  # headless tests
+cargo fmt --all && cargo clippy -p map-core -p map-cli --all-targets -- -D warnings
+```
+
+The application logic is headless by design: `map-core` (sources, tiles,
+renderers, search) and `map-cli` run without a GPU or display, so the app is
+testable end to end outside the GUI; `map-app` is a thin shell. CI runs the
+same battery plus a `cargo build -p map-app` link gate and a
+`cargo tree` check that `map-core` never grows GUI dependencies.
+
 ## Hytale assets: you must supply your own
 
 This tool does **not** distribute any Hytale game assets — no textures, no

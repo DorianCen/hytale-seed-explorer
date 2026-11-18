@@ -1,6 +1,8 @@
 # T06 — Workspace scaffold and CI
 
-**Status:** proposed
+**Status:** done (deliverable: virtual workspace with `map-core`/`map-app`/
+`map-cli`, external generator path dependencies, `.github/workflows/ci.yml`,
+README build section; acceptance gate output in the task report)
 **Milestone:** 1 — Scaffold
 **Depends on:** T01, T02
 **Blocks:** T07, T08, T10, T12

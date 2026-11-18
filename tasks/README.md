@@ -15,7 +15,7 @@ it owns, and the acceptance gate.
 | [T03](T03-assets-and-palette.md) | Asset, palette and licensing decision | 0 | — | done |
 | [T04](T04-performance-baseline.md) | Performance baseline harness | 0 | — | done |
 | [T05](T05-fidelity-fixtures.md) | Fidelity fixture suite and test harness | 0–1 | T01 | done |
-| [T06](T06-workspace-scaffold.md) | Workspace scaffold and CI | 1 | T01, T02 | proposed |
+| [T06](T06-workspace-scaffold.md) | Workspace scaffold and CI | 1 | T01, T02 | done |
 | [T07](T07-core-types-and-traits.md) | Core domain types and source traits | 1 | T06 | proposed |
 | [T08](T08-generator-worker-pool.md) | Generator worker pool and cheap queries | 1 | T06, T07 | proposed |
 | [T09](T09-chunk-surface-slice.md) | Chunk cache, surface and slice queries | 1 | T07, T08 | proposed |

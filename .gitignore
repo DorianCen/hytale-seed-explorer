@@ -8,3 +8,6 @@
 # Palettes generated from the user's pack (user-cache data — never commit).
 *.palette.json
 
+
+# Local fixture dumps (never commit; see fixtures/README.md)
+fixtures/*.local.json
