@@ -14,7 +14,7 @@
 //! - [`coords`] — the canonical coordinate, zoom and tile math (T10).
 //! - [`tiles`] — tile keys, scheduling, cache (T14, T15).
 //! - [`render`] — layer renderers: biome, height, relief, blocks, caves
-//!   (T13, T17, T19–T21, T28).
+//!   (T11, T13, T17, T19–T21, T28).
 //! - [`features`] — the feature catalog, icon ids, categories (T23).
 //! - [`search`] — feature/biome search engines (T24, T25).
 //! - [`project`] — waypoints, saved state, share strings (T30, T31).

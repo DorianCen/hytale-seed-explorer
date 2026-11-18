@@ -35,6 +35,8 @@ bytemuck = "1"
 
 # Property-test framework for coordinate math (T10) and search (T24/T25).
 proptest = "1"
+# Golden-image hashing for the headless render tests (T11).
+sha2 = "0.10"
 
 # External generator crates. The generator workspace uses edition 2021 and
 # workspace inheritance; both resolve fine from here (verified by the T06

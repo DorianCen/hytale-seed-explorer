@@ -222,3 +222,23 @@ Only release runs on the environment above (or note the change).
 | 2026-11-18 | surface region 65,536 @ step 1 (64 chunks, cold), 2 workers | 24.11 s | `pool_bench` as above | T09 |
 | 2026-11-18 | slice region 4,096 @ y=64 (4 chunks, cold), 2 workers | 1.80 s | `pool_bench` as above | T09 |
 | 2026-11-18 | surface region @ step 2, summaries cached | 0.21 s | `pool_bench` as above | T09 |
+| 2026-11-18 | biome 512×512 PNG end to end (map-cli render, 2 workers, cold caches) | 1.08 s load + 3.47 s sample+encode | `cargo run --release -p map-cli -- render --seed 0 --center 0,0 --size 512 --step 2 --layer biome --out target/region-512.png` | T11 |
+
+T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
+PNG bytes):
+
+- center `(0, 0)`:
+  `a71236edde2ac1db70fac1613e882359a75e607412612b7744136dd86d17a41e`
+- center `(-1203, 455)`:
+  `b0dda0aa704f2334a1e9fb75f189b9a08eca195de5558aba090b01c105df3e0b`
+
+The 512×512 acceptance render (command above) hashes to
+`ae0db8c3101f2a1aefbf6c33ab0d88b916f86fb424470e1372b1248377f365b` —
+byte-identical across repeat runs, debug and release profiles alike. The
+sample cost is a cold-cache number: the pool's first query pays worker
+warm-up; the steady-state reference for the same 65,536-sample region is
+T08's 0.120 s. Negative-center render
+(`--center -1203,455`, same size/step):
+`1232715b5ecf6bbdcd7403e8ab36139dd219bd41185955dcdbb2d050a8ce5be2`
+(113 distinct biome colors; the origin render shows 68 — the acceptance
+check "not uniformly one color" holds for both).

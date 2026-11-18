@@ -1,6 +1,16 @@
 # T11 — Headless 512×512 PNG render
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/render/` — `image.rs`
+(`RgbaImage` + deterministic `png`-crate encoder) and `mod.rs`
+(`Layer` enum, minimal `LayerRenderer` trait, `BiomeRenderer`/
+`render_biome`, magenta unknown-biome fallback) — plus the
+`map-cli render` command (seed via T02 `Seed`, negative centers,
+`--world/--assets/--registries/--workers` overrides, stderr progress)
+and the golden suite `tests/render_golden.rs` (3: seed-0 origin +
+negative-center SHA-256 goldens, one-pixel sensitivity) and
+`map-cli/tests/cli.rs` (4: help/seed/layer/center argument errors);
+512×512 acceptance hash + cold/release times appended to
+[`docs/benchmarks.md`](../docs/benchmarks.md))
 **Milestone:** 1 — Scaffold
 **Depends on:** T05, T08, T09, T10
 **Blocks:** T13

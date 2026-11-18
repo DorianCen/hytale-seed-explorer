@@ -20,7 +20,7 @@ it owns, and the acceptance gate.
 | [T08](T08-generator-worker-pool.md) | Generator worker pool and cheap queries | 1 | T06, T07 | done |
 | [T09](T09-chunk-surface-slice.md) | Chunk cache, surface and slice queries | 1 | T07, T08 | done |
 | [T10](T10-coordinate-zoom-math.md) | Coordinate, zoom and tile math | 1 | T06, T07 | done |
-| [T11](T11-headless-png-render.md) | Headless 512×512 PNG render | 1 | T05, T08, T09, T10 | proposed |
+| [T11](T11-headless-png-render.md) | Headless 512×512 PNG render | 1 | T05, T08, T09, T10 | done |
 | [T12](T12-egui-app-shell.md) | egui shell, seed input and app state | 2 | T06, T07, T08, T10 | proposed |
 | [T13](T13-biome-layer.md) | Biome layer and palette | 2 | T08, T10, T11 | proposed |
 | [T14](T14-tile-cache.md) | Tile keys, cache and eviction | 3 | T07, T10 | proposed |
