@@ -267,15 +267,14 @@ cargo run -p worldgen-cli -- bench --world testdata/Default --seed 0 --chunks 14
 cargo build --release -p worldgen-cli -p worldgen-hytale
 ./target/release/worldgen-cli bench --world testdata/Default --seed 0 --start 0,0 --chunks 64
 
-# column-query probe (temporary example, see note below)
-cargo run --release -p worldgen-cli --example query_bench -- testdata/Default 0
+# column-query probe (now the committed T04 harness)
+cargo run --release -p worldgen-cli --bin query_bench -- testdata/Default 0
 ```
 
-The probe source is preserved in the explorer repo at
-[`tools/query_bench.rs`](../tools/query_bench.rs) (a separate binary, **not** an
-explorer dependency, per T01's rules). It was run as a temporary
-`worldgen-cli/examples/query_bench.rs` in the worldgen workspace and **removed after
-the run** — the worldgen working tree is clean; T04 recreates the committed harness.
+The original T01 probe ran as a temporary `worldgen-cli/examples/query_bench.rs`
+and was removed after the measurements (leaving that working tree clean); T04
+committed the upgraded form as `crates/worldgen-cli/src/bin/query_bench.rs`,
+which reproduces and supersedes the numbers below.
 
 ### Probe results (single worker, release)
 
