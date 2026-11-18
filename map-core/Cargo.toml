@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Headless core of the Hytale seed explorer: sources, tiles, renderers, search."
 
+[features]
+# In-memory fake sources for UI/renderer development without a world (T07).
+test-support = []
+
 [dependencies]
 # The external generator (path-only; see the root workspace manifest).
 worldgen-hytale = { workspace = true }

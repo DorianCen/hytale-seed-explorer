@@ -60,8 +60,10 @@ jobs:
       - name: Clippy (headless crates, warnings are errors)
         run: cargo clippy -p map-core -p map-cli --all-targets -- -D warnings
 
-      - name: Tests (headless)
-        run: cargo test -p map-core -p map-cli
+      - name: Tests (headless, including the fake-source feature)
+        run: |
+          cargo test -p map-core -p map-cli
+          cargo test -p map-core --features test-support
 
       - name: Build the GUI crate (no window is launched)
         run: cargo build -p map-app
