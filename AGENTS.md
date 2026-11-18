@@ -6,6 +6,19 @@ Condensed from the Google Rust Style Guide, keeping only rules that apply to a s
 
 **Library vs. application code:** API-design rules below are binding for code meant to be reused by other crates. In code used by a single binary, treat them as strong recommendations and favor simplicity over generality. Don't generalize prematurely.
 
+## Subagent model selection
+
+Use subagents for small, independent work packets when parallel work helps. The smallest task should go to a free model whenever one is available.
+
+- Before spawning a subagent, check the current chat-model catalog for zero-cost entries (for example `opencode.models` with query `free`). Availability changes, so prefer the current catalog over a hard-coded list.
+- Preferred free defaults:
+  - `opencode/deepseek-v4.1-flash-free` — DeepSeek V4.1 Flash Free.
+  - GLM 5.3 Flash Free, when the catalog lists a zero-cost variant. `opencode/glm-5.3-flash` is paid in the current catalog, so do not count it as the free option unless it is actually zero-cost.
+  - Other zero-cost models such as `opencode/hy4-flash-free`, `opencode/iceman-free`, `opencode/inkling-2-small-free`, `opencode/longcat-2.5-free`, `opencode/flint-40b-free`, `opencode/beam-free`, `opencode/mimo-v2.6-flash-free`, and `openrouter/*:free` models.
+- When no free model is available, or the free model cannot handle the task, use `opencode-go/deepseek-v4.1-flash` (DeepSeek V4.1 Flash 1017) as the subagent.
+- Do not force a free model onto a large or high-risk task; keep that work in the main session or use a stronger model. Free models are for the smallest, well-scoped work.
+- Record the subagent model in the task report when it matters.
+
 ## Ownership and borrowing
 - Prefer unique ownership and borrows over `Rc`/`Arc`. Use them only when the borrow structure would be unreasonably complex. Be especially wary when porting Java: don't translate every object reference into a shared pointer; redesign the ownership graph (e.g. IDs or indices into a central store).
 - Don't use `.clone()` just to silence the borrow checker. Clone when a deep copy is genuinely needed, or when borrowing relationships get excessively complex. Cloning an `Rc`/`Arc` is fine.
