@@ -19,6 +19,8 @@
 //! - [`project`] — waypoints, saved state, share strings (T30, T31).
 //! - [`export`] — PNG export (T32).
 
+pub mod catalog;
+pub mod error;
 pub mod export;
 pub mod features;
 pub mod project;
@@ -26,6 +28,12 @@ pub mod render;
 pub mod search;
 pub mod source;
 pub mod tiles;
+pub mod types;
+
+/// In-memory fake sources for renderer/UI development without a world
+/// (feature `test-support`).
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 /// The generator identity this build is pinned to (T02). The external
 /// workspace must resolve for this constant to exist.
