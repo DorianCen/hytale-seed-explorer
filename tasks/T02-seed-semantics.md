@@ -1,6 +1,7 @@
 # T02 — Seed semantics and generator identity
 
-**Status:** proposed
+**Status:** done (deliverable: [`docs/seed-semantics.md`](../docs/seed-semantics.md);
+`GENERATOR_VERSION` added in the worldgen repo, commit `08dd461`)
 **Milestone:** 0 — API audit
 **Depends on:** —
 **Blocks:** T06

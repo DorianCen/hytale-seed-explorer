@@ -21,7 +21,7 @@ Assumptions to verify early are marked **[verify]**; [T02](tasks/T02-seed-semant
 **Tasks:** [T02](tasks/T02-seed-semantics.md), [T12](tasks/T12-egui-app-shell.md), [T13](tasks/T13-biome-layer.md), [T16](tasks/T16-pan-zoom-viewport.md), [T18](tasks/T18-inspector-resolution.md), [T20](tasks/T20-surface-block-palette.md), [T23](tasks/T23-feature-catalog-overlay.md), [T24](tasks/T24-feature-search.md), [T25](tasks/T25-biome-search.md), [T27](tasks/T27-cave-entrances.md), [T29](tasks/T29-map-tools.md), [T30](tasks/T30-waypoints.md), [T31](tasks/T31-share-settings-history.md), [T32](tasks/T32-png-export.md)
 
 ### Chunkbase-equivalent features
-- Seed input (number or string, hashed the way Hytale does it) **[verify]**
+- Seed input (numeric only — resolved by [T02](tasks/T02-seed-semantics.md): a world seed is an `i64` number in `config.json` (`"Seed"`); no string-seed path exists in the game server; world generation sees the low 32 bits. Details: [docs/seed-semantics.md](docs/seed-semantics.md))
 - Pan (drag) and zoom (scroll wheel, centered on the cursor)
 - Biome map as the default layer
 - Cursor readout: block X/Z, biome, height, surface block
@@ -316,7 +316,7 @@ Rough total for a solid v1: 4 to 5 weeks of part-time work, dominated by how muc
 1. **Placement not separable from generation.** If prefabs and structures cannot be enumerated without generating terrain, search becomes slow. Fix this in `worldgen` first. → [T22](tasks/T22-feature-placement-query.md)
 2. **Full block mode cost.** The per-column surface lookup may force whole-chunk generation. Measure in milestone 0 and decide between chunk caching and a dedicated surface function. → [T04](tasks/T04-performance-baseline.md), [T09](tasks/T09-chunk-surface-slice.md), [T21](tasks/T21-full-block-mode.md)
 3. **Cave representation.** The cave views depend on whether worldgen exposes solidity per (x, y, z) or a per-column profile. → [T09](tasks/T09-chunk-surface-slice.md), [T27](tasks/T27-cave-entrances.md), [T28](tasks/T28-cave-slices-density.md)
-4. **Seed semantics.** Confirm how Hytale converts seed input into the internal value, including string seeds **[verify]**. → [T02](tasks/T02-seed-semantics.md)
+4. **Seed semantics — resolved by [T02](tasks/T02-seed-semantics.md).** The world seed is an `i64` (`config.json` `"Seed"`) truncated to its low 32 bits at every worldgen boundary (`(int)` in Java, `as i32` in Rust); string seeds are not a server feature (client-side unverifiable from the available source, so the explorer rejects them). → [docs/seed-semantics.md](docs/seed-semantics.md)
 5. **Generator version drift.** Hytale updates may change generation. Tag cache keys and exports with a generator version and show it in the UI. → [T02](tasks/T02-seed-semantics.md), [T14](tasks/T14-tile-cache.md), [T31](tasks/T31-share-settings-history.md)
 6. **Chunkbase parity details.** The 2×2 default and the exact feature set Chunkbase shows are assumptions. Confirm against the site and adjust the defaults. → [T03](tasks/T03-assets-and-palette.md), [T18](tasks/T18-inspector-resolution.md), [T23](tasks/T23-feature-catalog-overlay.md)
 7. **Block color table.** Surface block colors need either texture-derived averages (requires the game assets) or hand-picked values. Decide the source and the licensing implications. → [T03](tasks/T03-assets-and-palette.md), [T20](tasks/T20-surface-block-palette.md)
