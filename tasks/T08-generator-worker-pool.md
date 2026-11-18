@@ -1,6 +1,9 @@
 # T08 — Generator worker pool and cheap queries
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/source/worldgen/{mod,pool}.rs`
++ `tests/worldgen_source.rs` (11 integration tests, real generator) +
+`examples/pool_bench.rs`; pool numbers appended to
+[`docs/benchmarks.md`](../docs/benchmarks.md))
 **Milestone:** 1 — Scaffold
 **Depends on:** T06, T07
 **Blocks:** T09, T11, T12, T13, T22, T25

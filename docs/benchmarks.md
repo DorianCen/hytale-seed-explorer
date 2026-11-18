@@ -144,8 +144,9 @@ Substitute measurement recorded now so T24 can size ring search:
    pool should start 1-2 workers and scale lazily; 12 is the sensible cap on
    this machine (SMT beyond physical cores adds nothing here).
 2. **Tile budgets (single-worker math from the medians):**
-   - Biome tile 256×256 @ step 2: ~2.3 s of column queries → ~0.6 s with
-     banded 4-worker requests. The plan's first-visible-tile ~100 ms /
+   - Biome tile 256×256 @ step 2: **0.12 s through the 2-worker pool
+     (T08's measured number — 0.036 s at 8 workers)**, because each band
+     fits under the generator's column cache. The plan's first-visible-tile ~100 ms /
      coarse-fill ~1 s targets are reachable **for the biome layer only**.
    - Height/relief layers: never per-column at tile scale (~70 s/tile).
      Derive heights from chunk summaries (T09/T17): the same 64-chunk region
@@ -175,8 +176,18 @@ Substitute measurement recorded now so T24 can size ring search:
 - **Full-block render cost end to end: blocked on T09/T21** (the probe
   measures generation + extraction; palette lookup and texture upload are not
   yet implemented — T21 appends).
-- **Parallel banded column queries: blocked on T08** (the probe is
-  single-worker by design; T08 appends a banded 4-worker biome-tile number).
+- **Parallel banded column queries: measured (T08).** The `GeneratorPool`
+  band-splits region requests across workers, and bands fit under the
+  generator's per-instance 50,000-entry column cache (the T01 §4 thrash
+  finding disappears). Through `WorldSource` (`map-core/examples/pool_bench`,
+  release, seed 12345):
+
+  | Metric | 2 workers | 8 workers | T04 single-worker reference |
+  |---|---:|---:|---:|
+  | Pool startup (N generator loads) | 1.02 s | 1.17 s | 0.90 s (one) |
+  | Biome region 256×256 @ step 2 (65,536 samples) | **0.120 s** | **0.036 s** | 2.332 s |
+  | Height region 64×64 @ step 1 (4,096 samples, biome-warm caches) | 0.031 s | 0.013 s | ~4 s est. at 1 ms/sample |
+  | Cancellation health (next request after `cancel_pending`) | completes | completes | — |
 - The world is `testdata/Default`, not a live pack-derived world; absolute
   numbers may shift with real content, ratios should hold.
 
@@ -197,3 +208,5 @@ Only release runs on the environment above (or note the change).
 | 2026-11-18 | 576-chunk grid, 1 worker | 284.91 s wall, 2.02 chunks/s | `bench ... --chunks 576 --workers 1` | T04 |
 | 2026-11-18 | 144-chunk acceptance grid (12 workers) | 24.60 s wall, 5.85 chunks/s | `bench --world testdata/Default --seed 0 --chunks 144` | T04 |
 | 2026-11-18 | criterion suite | medians in § criterion table | `cargo bench -p worldgen-hytale` | T04 |
+| 2026-11-18 | biome region 65,536 via pool, 2 / 8 workers | 0.120 s / 0.036 s | `cargo run --release -p map-core --example pool_bench -- <world> 12345 <workers>` | T08 |
+| 2026-11-18 | height region 4,096 via pool (biome-warm), 2 / 8 workers | 0.031 s / 0.013 s | `pool_bench` as above | T08 |
