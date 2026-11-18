@@ -1,6 +1,8 @@
 # T07 — Core domain types and source traits
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core` `types.rs`/`error.rs`/`source.rs`/
+`catalog.rs` + feature-gated `test_support.rs` and the fake-region
+integration test; gate output in the task report)
 **Milestone:** 1 — Scaffold
 **Depends on:** T06
 **Blocks:** T08, T09, T10, T12, T14
