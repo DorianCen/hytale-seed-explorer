@@ -48,7 +48,8 @@ pub(crate) struct LoadSpec {
 }
 
 /// A shared cancellation token; region callers create one per in-flight
-/// request (T15 will cancel tiles that scroll away).
+/// request, and the tile scheduler (T15) passes its own tokens straight
+/// through to cancel tiles that scroll away.
 pub(crate) type CancelToken = Arc<AtomicBool>;
 
 pub(crate) fn cancel_token() -> CancelToken {

@@ -31,3 +31,21 @@ pub enum SourceError {
 
 /// The crate convention: every fallible source operation returns this alias.
 pub type SourceResult<T> = Result<T, SourceError>;
+
+/// Extracts a readable message from a panic payload.
+///
+/// The shared conversion for every boundary that must *survive* a panic
+/// in code it calls: the scheduler's renderer boundary (T15) and the
+/// worldgen loader/query boundaries (T08/T09). Those call sites wrap the
+/// call in `catch_unwind` — a documented style-guide deviation, argued
+/// per site — and map the payload onto [`SourceError::Generation`] or
+/// [`SourceError::Load`] with this message.
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    "<non-string panic>".to_string()
+}

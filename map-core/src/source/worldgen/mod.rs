@@ -27,7 +27,7 @@ use worldgen_hytale::world_gen_config::WorldGenConfig;
 use worldgen_hytale::world_gen_provider::{HytaleWorldGenProvider, Semver};
 
 use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCatalog, ZoneInfo};
-use crate::error::{SourceError, SourceResult};
+use crate::error::{SourceError, SourceResult, panic_message};
 use crate::source::WorldSource;
 use crate::source::chunks::{
     self, ChunkKey, ChunkSlice, ChunkSummary, DEFAULT_SLICE_CACHE_ENTRIES,
@@ -544,18 +544,6 @@ fn catch_load_panics<T>(work: impl FnOnce() -> SourceResult<T>) -> SourceResult<
         Ok(result) => result,
         Err(payload) => Err(SourceError::Load(panic_message(payload))),
     }
-}
-
-/// Extracts a readable message from a panic payload (the same extraction
-/// the worldgen repo's loader uses, loader/mod.rs:35-45).
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        return (*message).to_string();
-    }
-    "<non-string panic>".to_string()
 }
 
 /// Extracts the catalogs from a loaded generator (worker 0 only). The biome

@@ -98,6 +98,7 @@ pub struct TileKey {
 /// row 0 — the same orientation contract as
 /// [`RgbaImage`](crate::render::RgbaImage). The scheduler's tiles are
 /// [`TILE_SIZE`](crate::coords::TILE_SIZE)-square.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tile {
     pub key: TileKey,
     /// Pixel width.

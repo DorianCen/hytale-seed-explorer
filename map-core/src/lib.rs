@@ -13,6 +13,8 @@
 //!   to the external worldgen workspace (T07, T08, T09).
 //! - [`coords`] — the canonical coordinate, zoom and tile math (T10).
 //! - [`tiles`] — tile keys, scheduling, cache (T14, T15).
+//! - [`scheduler`] — the background tile pipeline: priority queue,
+//!   worker threads, cancellation, result events (T15).
 //! - [`render`] — layer renderers: biome, height, relief, blocks, caves
 //!   (T11, T13, T17, T19–T21, T28).
 //! - [`features`] — the feature catalog, icon ids, categories (T23).
@@ -27,6 +29,7 @@ pub mod export;
 pub mod features;
 pub mod project;
 pub mod render;
+pub mod scheduler;
 pub mod search;
 pub mod source;
 pub mod tiles;

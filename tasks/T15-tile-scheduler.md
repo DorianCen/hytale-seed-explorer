@@ -1,6 +1,20 @@
 # T15 — Tile scheduler, workers and cancellation
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/scheduler.rs` — `CancelToken`
+(structurally the worldgen pool's, so renderers pass tokens through),
+`TileSubject` (the request's non-position key fields), the
+`TileRenderer` trait, `TileEvent::{Started, Ready, Failed, Cancelled}`
+carrying request generations, and `TileScheduler`: a priority queue of
+plain worker threads (no rayon, per the task's risk note) with panic
+containment, exact dedup against the tile cache, aggressive
+`cancel_outside`, worker-side cache insertion (no re-render window),
+`is_pending`/`SchedulerStats` for T16 placeholders and T33 tuning —
+plus `map-core/tests/scheduler.rs` (9: nearest-first order, dedup,
+cached skip, view-exit cancellation, stale-generation marking, panic
+containment, clean shutdown, the 100-tile / 20 ms cancel row, the
+30-view panning stress) and 3 unit tests; supporting changes:
+`panic_message` moved to `error.rs`, `Tile` now derives
+`Debug`/`Clone`/`PartialEq`)
 **Milestone:** 3 — Tiling and navigation
 **Depends on:** T09, T10, T14
 **Blocks:** T16, T17
