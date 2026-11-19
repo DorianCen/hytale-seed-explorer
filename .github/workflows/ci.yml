@@ -4,18 +4,17 @@
 # - The worldgen workspace is a SEPARATE repository
 #   (DorianCen/hytale-server-rust), checked out as a SIBLING of this
 #   workspace because its crates are path dependencies
-#   (../hytale-server-rust/...). GitHub Actions can only check out under
-#   $GITHUB_WORKSPACE, so the repo lands in worldgen/hytale-server-rust
-#   and a symlink places it at the sibling path Cargo and the tests
-#   resolve. Tests skip gracefully when the checkout is absent; this job
-#   requires it.
-# - Cross-repo checkout uses the WORLDGEN_REPO_TOKEN secret (a PAT with
-#   read access) when it is configured, and falls back to the automatic
-#   github.token otherwise — so a public generator repo needs no secret,
-#   and a missing secret never produces the opaque actions/checkout
-#   "Input required and not supplied: token" error. A private repo
-#   without the secret fails with the repository-not-found permission
-#   error, which is actionable.
+#   (../hytale-server-rust/...). Both repositories are public, so the
+#   checkout needs no secret: actions/checkout's default github.token
+#   reads public repositories. (If the generator ever becomes private,
+#   add a PAT as WORLDGEN_REPO_TOKEN and pass
+#   `token: ${{ secrets.WORLDGEN_REPO_TOKEN || github.token }}` — never
+#   an empty-string token, which overrides the default and fails the
+#   step with "Input required and not supplied: token".)
+# - GitHub Actions can only check out under $GITHUB_WORKSPACE, so the
+#   repo lands in worldgen/hytale-server-rust and a symlink places it at
+#   the sibling path Cargo and the tests resolve. Tests skip gracefully
+#   when the checkout is absent; this job requires it.
 # - `cargo build -p map-app` links eframe against X11/Wayland; the apt step
 #   installs the required dev libraries. No window is ever launched in CI:
 #   the GUI gate is a build, not a run.
@@ -38,15 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Both repositories are public, so no token input is needed:
+      # actions/checkout's default github.token reads the sibling fine.
       - name: Check out the external worldgen workspace
         uses: actions/checkout@v4
         with:
           repository: DorianCen/hytale-server-rust
           path: worldgen/hytale-server-rust
-          # A PAT when the secret exists; the automatic token otherwise.
-          # Never pass an empty string: that is what overrides
-          # actions/checkout's token default and fails the step.
-          token: ${{ secrets.WORLDGEN_REPO_TOKEN || github.token }}
 
       - name: Place the worldgen checkout at the sibling path Cargo expects
         run: ln -s "$GITHUB_WORKSPACE/worldgen/hytale-server-rust" "$GITHUB_WORKSPACE/../hytale-server-rust"
