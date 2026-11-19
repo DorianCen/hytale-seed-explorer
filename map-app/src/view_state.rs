@@ -61,6 +61,17 @@ impl MapViewState {
         self.center
     }
 
+    /// Centers the view on a world position, keeping the zoom (go-to,
+    /// T18). Asserts finiteness — a center the UI cannot produce is a
+    /// bug, not an input.
+    pub fn set_center(&mut self, x: f64, z: f64) {
+        assert!(
+            x.is_finite() && z.is_finite(),
+            "view center must be finite, got ({x}, {z})",
+        );
+        self.center = WorldPos::new(x, z);
+    }
+
     /// The continuous zoom in level units (see the module docs).
     #[allow(dead_code)] // reserved: T31 share strings encode the view
     #[must_use]
@@ -302,6 +313,25 @@ mod tests {
         assert_eq!(view.scale(), 0.5);
         view.pan_by_screen((10.0, -20.0));
         assert_eq!(view.center(), WorldPos::new(-95.0, 10.0));
+    }
+
+    // -- set center (go-to) ---------------------------------------------------
+
+    #[test]
+    fn view_state_set_center_moves_the_view_without_touching_the_zoom() {
+        let mut view = view_at((0.0, 0.0), 1024.0, 768.0);
+        view.zoom_at_center(1.5);
+
+        view.set_center(-1203.0, 455.0);
+        assert_eq!(view.center(), WorldPos::new(-1203.0, 455.0));
+        assert_eq!(view.smooth_zoom(), 1.5, "the zoom survives the jump");
+    }
+
+    #[test]
+    #[should_panic(expected = "view center must be finite")]
+    fn view_state_set_center_rejects_a_nan_coordinate() {
+        let mut view = view_at((0.0, 0.0), 1024.0, 768.0);
+        view.set_center(f64::NAN, 0.0);
     }
 
     // -- zoom at cursor -----------------------------------------------------

@@ -27,7 +27,7 @@ it owns, and the acceptance gate.
 | [T15](T15-tile-scheduler.md) | Tile scheduler, workers and cancellation | 3 | T09, T10, T14 | done |
 | [T16](T16-pan-zoom-viewport.md) | Pan, zoom and viewport rendering | 3 | T12, T13, T14, T15 | done |
 | [T17](T17-height-relief-fluid-layers.md) | Height, relief and fluid layers | 4 | T09, T15 | done |
-| [T18](T18-inspector-resolution.md) | Inspector readout and resolution selector | 4 | T09, T12, T16 | proposed |
+| [T18](T18-inspector-resolution.md) | Inspector readout and resolution selector | 4 | T09, T12, T16 | done |
 | [T19](T19-layer-compositing-debug.md) | Layer compositing and debug layers | 4 | T13, T17, T18 | proposed |
 | [T20](T20-surface-block-palette.md) | Surface block palette data | 5 | T03, T09 | proposed |
 | [T21](T21-full-block-mode.md) | Full block mode and progressive refinement | 5 | T17, T19, T20 | proposed |

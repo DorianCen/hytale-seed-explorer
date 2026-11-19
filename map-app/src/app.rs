@@ -16,7 +16,7 @@
 //! each frame and drops on detached background threads.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Vec2};
@@ -24,6 +24,7 @@ use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, Tex
 use map_core::source::WorldSource;
 use map_core::source::worldgen::default_world_path;
 
+use crate::inspector::{self, HoverKnowledge, HoverReply, Readout};
 use crate::labels;
 use crate::map_view::MapView;
 use crate::state::{self, AppLayer, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS};
@@ -31,11 +32,19 @@ use crate::state::{self, AppLayer, AppState, LoadRequest, LoadResult, RESOLUTION
 /// How often to wake the UI while a background load is in flight.
 const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How often to wake the UI while a hover sample is in flight, so its
+/// reply lands on the very next frame instead of at the next input.
+const HOVER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 /// The egui app: headless state plus the UI wiring.
 pub struct SeedExplorerApp {
     state: AppState,
     /// Result channel of the single in-flight load, when there is one.
     load_rx: Option<Receiver<LoadResult>>,
+    /// Reply channel of the single in-flight hover sample, when there is
+    /// one (T18). Replacing it detaches the previous worker — its send
+    /// fails and its reply dies with the old channel.
+    hover_rx: Option<Receiver<HoverReply>>,
     /// The central map widget (T16): input, tile pipeline, painting.
     map: MapView,
 }
@@ -54,6 +63,7 @@ impl SeedExplorerApp {
         SeedExplorerApp {
             state,
             load_rx: None,
+            hover_rx: None,
             map: MapView::new(),
         }
     }
@@ -62,8 +72,10 @@ impl SeedExplorerApp {
     fn update_inner(&mut self, ctx: &Context) {
         // Order matters: the status bar and top bar claim their strips
         // first, the left panel its column, and the central panel fills
-        // the remainder.
+        // the remainder. Hover replies drain before anything reads the
+        // inspector's knowledge.
         self.poll_load_channel(ctx);
+        self.poll_hover_replies();
         self.keyboard_shortcuts(ctx);
 
         self.status_bar(ctx);
@@ -77,7 +89,11 @@ impl SeedExplorerApp {
                 self.map.ui(ui, &mut self.state);
             });
 
-        if self.state.show_go_to() {
+        // The map widget just refreshed the cursor: this is where the
+        // frame's hover decision runs (T18).
+        self.drive_hover_sampling(ctx);
+
+        if self.state.go_to().is_some() {
             self.go_to_dialog(ctx);
         }
 
@@ -137,6 +153,109 @@ impl SeedExplorerApp {
         }
     }
 
+    // -- Hover sampling (T18) -------------------------------------------------
+
+    /// Drains hover replies without blocking. The worker owns the send
+    /// half and drops it with its reply, so `Disconnected` means the
+    /// request is finished — whether or not a reply came with it — and
+    /// the inspector frees its in-flight slot either way.
+    fn poll_hover_replies(&mut self) {
+        let Some(receiver) = self.hover_rx.take() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(reply) => self.state.inspector_mut().apply_reply(
+                    reply.generation,
+                    reply.x,
+                    reply.z,
+                    reply.result,
+                ),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            // Either the reply arrived (in-flight already cleared) or the
+            // worker vanished; both mean: no request is pending anymore.
+            self.state.inspector_mut().cancel_in_flight();
+        } else {
+            self.hover_rx = Some(receiver);
+        }
+    }
+
+    /// One frame of the hover pipeline: after the map widget refreshed
+    /// the cursor, decide whether the debounced background sample is due
+    /// and spawn it. The UI thread never queries the source itself —
+    /// `surface_at` can generate a chunk.
+    fn drive_hover_sampling(&mut self, ctx: &Context) {
+        // No source (yet): cancel any notion of an in-flight sample; the
+        // inspector's knowledge was already reset by the state machine.
+        let Some(source) = self.state.source_arc() else {
+            self.hover_rx = None;
+            self.state.inspector_mut().cancel_in_flight();
+            return;
+        };
+        let now = Instant::now();
+        let cursor = self.state.cursor();
+        let Some((generation, x, z)) = self.state.inspector_mut().poll_due(now, cursor) else {
+            // Nothing due; while a request is in flight keep frames
+            // coming so the reply lands immediately.
+            if self.state.inspector().in_flight().is_some() {
+                ctx.request_repaint_after(HOVER_POLL_INTERVAL);
+            }
+            return;
+        };
+        // One worker per request, at most one alive: replacing the
+        // receiver detaches any previous worker (its send fails, its
+        // thread ends) — the generation guard inside the inspector is
+        // the second line of defence.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.hover_rx = Some(receiver);
+        std::thread::spawn(move || {
+            // `surface_at` already carries the biome in its sample, so a
+            // separate `biome_at` would be a second query for data the
+            // reply holds.
+            let result = source.surface_at(x, z);
+            // A send failure means a newer request replaced this one: the
+            // reply dies with the old channel, exactly as intended.
+            let _ = sender.send(HoverReply {
+                generation,
+                x,
+                z,
+                result,
+            });
+        });
+        ctx.request_repaint_after(HOVER_POLL_INTERVAL);
+    }
+
+    /// The inspector's knowledge rendered for the status bar: sample ids
+    /// resolved through the loaded source's catalogs, everything else
+    /// passed through.
+    fn current_readout(&self) -> Readout {
+        match self.state.inspector().knowledge() {
+            HoverKnowledge::Nothing => Readout::Nothing,
+            HoverKnowledge::Pending => Readout::Pending,
+            HoverKnowledge::OutOfWorld => Readout::OutOfWorld,
+            HoverKnowledge::Sample(sample) => match self.state.source() {
+                Some(source) => Readout::Sample(inspector::resolve_sample(
+                    sample,
+                    source.biome_catalog(),
+                    source.block_catalog(),
+                    source.fluid_catalog(),
+                )),
+                // A sample without its source cannot happen (the state
+                // resets the inspector on invalidation); degrade to
+                // unknown instead of ever panicking on the UI thread.
+                None => Readout::Nothing,
+            },
+        }
+    }
+
     // -- Keyboard -------------------------------------------------------------
 
     /// Global shortcuts, none of which may steal keys from a focused text
@@ -145,10 +264,15 @@ impl SeedExplorerApp {
     /// press anchored on the viewport center (the wheel owns the cursor
     /// anchor).
     ///
-    /// `consume_shortcut` both checks and consumes the press, so the same
-    /// key never leaks into the frame's other handling; `COMMAND` is the
-    /// cross-platform Ctrl/Cmd spelling.
+    /// `Esc` closes the go-to dialog even while a field has focus: egui's
+    /// text edits never consume Escape. `consume_shortcut` both checks
+    /// and consumes the press, so the same key never leaks into the
+    /// frame's other handling; `COMMAND` is the cross-platform Ctrl/Cmd
+    /// spelling.
     fn keyboard_shortcuts(&mut self, ctx: &Context) {
+        if self.state.go_to().is_some() && ctx.input_mut(|input| input.key_pressed(Key::Escape)) {
+            self.state.close_go_to();
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -272,11 +396,22 @@ impl SeedExplorerApp {
     }
 
     /// The plan's left panel: layer radios, overlay checkboxes, search
-    /// placeholder. Widget order is stable across frames so egui keeps
-    /// its state; every control writes into [`AppState`].
+    /// placeholder, the inspector (T18) and the palette diagnostics.
+    /// Widget order is stable across frames so egui keeps its state;
+    /// every control writes into [`AppState`].
     fn left_panel(&mut self, ctx: &Context) {
         // Consumed here so the F shortcut highlights the section once.
         let flash_search = self.state.take_search_focus();
+
+        // The inspector's rendering inputs, prepared up front so the
+        // panel's closures read locals instead of borrowing the app.
+        let readout = self.current_readout();
+        let hovered = self.state.cursor();
+        let inspector_error = self.state.inspector().error().map(String::from);
+        let scale = self.state.view().scale();
+        let step = self.state.resolution_step();
+        let effective = self.state.view().tile_step(step);
+        let mut copied = false;
 
         egui::SidePanel::left(Id::new("left-panel"))
             .default_width(190.0)
@@ -315,6 +450,95 @@ impl SeedExplorerApp {
                 ui.label(search_heading);
                 ui.label(labels::SEARCH_PLACEHOLDER);
 
+                // The inspector (T18): the same data the status bar reads,
+                // with names *and* ids, the tint and the copy button.
+                ui.add_space(8.0);
+                ui.separator();
+                egui::CollapsingHeader::new(labels::INSPECTOR)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let coords = match hovered {
+                            Some((x, z)) => format!("X:{x} Z:{z}"),
+                            None => {
+                                format!("X:{} Z:{}", labels::STATUS_MISSING, labels::STATUS_MISSING)
+                            }
+                        };
+                        ui.label(format!("{}: {coords}", labels::INSPECTOR_COORDINATES));
+                        match &readout {
+                            Readout::Sample(sample) => {
+                                ui.label(format!(
+                                    "{}: {} (#{})",
+                                    labels::STATUS_BIOME,
+                                    sample.biome,
+                                    sample.biome_id.0,
+                                ));
+                                ui.label(format!("{}: {}", labels::STATUS_HEIGHT, sample.height));
+                                ui.label(format!(
+                                    "{}: {} (#{})",
+                                    labels::STATUS_BLOCK,
+                                    sample.block,
+                                    sample.block_id.0,
+                                ));
+                                match &sample.fluid {
+                                    Some(fluid) => {
+                                        ui.label(format!(
+                                            "{}: {fluid} (#{})",
+                                            labels::STATUS_FLUID,
+                                            sample.fluid_id.map_or_else(
+                                                || labels::STATUS_MISSING.to_string(),
+                                                |id| id.0.to_string()
+                                            ),
+                                        ));
+                                        ui.label(format!(
+                                            "{}: {}",
+                                            labels::INSPECTOR_DEPTH,
+                                            sample.fluid_depth
+                                        ));
+                                    }
+                                    None => {
+                                        ui.label(format!(
+                                            "{}: {}",
+                                            labels::STATUS_FLUID,
+                                            labels::STATUS_NONE
+                                        ));
+                                    }
+                                }
+                                ui.label(format!(
+                                    "{}: #{:06x}",
+                                    labels::INSPECTOR_TINT,
+                                    sample.tint & 0xFF_FF_FF,
+                                ));
+                            }
+                            Readout::OutOfWorld => {
+                                ui.label(labels::STATUS_OUT_OF_WORLD);
+                            }
+                            Readout::Pending => {
+                                ui.label(labels::STATUS_PENDING);
+                            }
+                            Readout::Nothing => {
+                                ui.label(labels::STATUS_MISSING);
+                            }
+                        }
+                        if let Some(error) = &inspector_error {
+                            ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+                        }
+                        ui.label(format!(
+                            "{}: {scale:.1} {}",
+                            labels::STATUS_ZOOM,
+                            labels::STATUS_PT_PER_BLOCK
+                        ));
+                        ui.label(state::format_resolution(step, effective));
+                        if ui
+                            .add_enabled(
+                                hovered.is_some(),
+                                egui::Button::new(labels::COPY_COORDINATES),
+                            )
+                            .clicked()
+                        {
+                            copied = true;
+                        }
+                    });
+
                 // Palette diagnostics (T13): every biome the loaded world
                 // defines, name and map color, so a palette bug is visible
                 // without running a render.
@@ -346,21 +570,79 @@ impl SeedExplorerApp {
                         });
                 }
             });
+        // The copy button only sets a flag inside the panel: the
+        // clipboard write and the status feedback happen here, where
+        // the state is mutable again.
+        if copied && let Some((x, z)) = hovered {
+            ctx.copy_text(format!("X:{x} Z:{z}"));
+            self.state
+                .set_status(format!("{} X:{x} Z:{z}", labels::STATUS_COPIED));
+        }
     }
 
-    /// The go-to dialog placeholder (`G`).
+    /// The go-to dialog (`G`, T18): two monospace fields, an inline error
+    /// under them, Enter or the Go button to submit, `Esc`/Close to
+    /// dismiss. Works on a local copy of the dialog; the state gets the
+    /// edits back and then validates through the state machine, so a
+    /// failed submit keeps the dialog open with its error set.
     fn go_to_dialog(&mut self, ctx: &Context) {
+        let mut dialog = std::mem::take(
+            self.state
+                .go_to_mut()
+                .expect("the caller checked the dialog is open"),
+        );
+        let mut close = false;
+        let mut submitted = false;
         egui::Window::new(labels::GO_TO_TITLE)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(labels::GO_TO_PLACEHOLDER);
+                ui.label(labels::GO_TO_HINT);
+                let mut enter_pressed = false;
+                ui.horizontal(|ui| {
+                    ui.label(labels::GO_TO_X);
+                    let x = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.x_text)
+                            .font(TextStyle::Monospace)
+                            .desired_width(90.0),
+                    );
+                    ui.label(labels::GO_TO_Z);
+                    let z = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.z_text)
+                            .font(TextStyle::Monospace)
+                            .desired_width(90.0),
+                    );
+                    // A singleline edit loses focus on Enter, so either
+                    // field's loss-of-focus plus the Enter press submits.
+                    enter_pressed = (x.lost_focus() || z.lost_focus())
+                        && ui.input(|input| input.key_pressed(Key::Enter));
+                });
+                if let Some(error) = &dialog.error {
+                    ui.label(RichText::new(error.as_str()).color(ui.visuals().error_fg_color));
+                }
+                if ui.button(labels::GO_TO_GO).clicked() || enter_pressed {
+                    submitted = true;
+                }
                 if ui.button(labels::CLOSE).clicked() {
-                    self.state.toggle_go_to();
+                    close = true;
                 }
             });
+        // Hand the edits back before deciding the dialog's fate: a
+        // failed submit sets the inline error on exactly these fields,
+        // a successful one closes and centers the view.
+        *self
+            .state
+            .go_to_mut()
+            .expect("the dialog stays open until a flag says otherwise") = dialog;
+        if close {
+            self.state.close_go_to();
+        } else if submitted {
+            let world = self.map.world_bounds();
+            self.state.submit_go_to(world);
+        }
     }
 
-    /// The plan's bottom bar; pure formatting lives in
+    /// The plan's bottom bar: the hover readout (T18's
+    /// [`inspector::format_readout`]) followed by the tail of
     /// [`state::format_status`].
     fn status_bar(&mut self, ctx: &Context) {
         // The pending count is the last frame's: panels draw before the
@@ -368,15 +650,19 @@ impl SeedExplorerApp {
         // tiles are pending anyway, so the count is at worst one frame
         // behind and never stuck.
         let pending = u32::try_from(self.map.pending_tiles()).unwrap_or(u32::MAX);
-        let mut line = state::format_status(
-            self.state.cursor(),
-            None,
+        let readout = self.current_readout();
+        let mut line = inspector::format_readout(self.state.cursor(), &readout);
+        line.push_str(" | ");
+        line.push_str(&state::format_status(
             pending,
             self.state.view().scale(),
             self.state.resolution_step(),
+            // The step the renderer actually samples at — the zoom may
+            // force coarser than the selector's minimum.
+            self.state.view().tile_step(self.state.resolution_step()),
             self.state.layer().label(),
             self.state.source_status_text(),
-        );
+        ));
         if !self.state.status().is_empty() {
             line.push_str(" | ");
             line.push_str(self.state.status());
@@ -417,7 +703,11 @@ impl Drop for SeedExplorerApp {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use map_core::source::worldgen::WorldgenSource;
 
     /// The smoke test the task asks for: the shell constructs its
     /// headless parts without a window or a `CreationContext`.
@@ -427,6 +717,7 @@ mod tests {
 
         assert!(!app.state.is_loading(), "starts idle");
         assert!(app.load_rx.is_none(), "no load was spawned");
+        assert!(app.hover_rx.is_none(), "no hover request was spawned");
         assert_eq!(app.state.resolution_step(), 2, "the 2x2 default");
         assert_eq!(app.state.layer(), AppLayer::Biomes);
         assert_eq!(app.map.pending_tiles(), 0, "no tiles pending");
@@ -440,18 +731,31 @@ mod tests {
             app.version_text(),
             format!("{} {}", labels::VERSION, map_core::GENERATOR_VERSION),
         );
-        // Status formatting is available before anything is loaded.
+        // Status formatting is available before anything is loaded; the
+        // tail carries the plan's default resolution.
         assert!(
             state::format_status(
-                app.state.cursor(),
-                None,
                 0,
                 app.state.view().scale(),
                 app.state.resolution_step(),
+                app.state.view().tile_step(app.state.resolution_step()),
                 app.state.layer().label(),
                 app.state.source_status_text(),
             )
             .contains("2×2")
+        );
+        // And so does the readout, all-unknown until the cursor exists.
+        assert_eq!(
+            inspector::format_readout(app.state.cursor(), &app.current_readout()),
+            format!(
+                "X:{Q} Z:{Q} | {BIO}: {Q} | {HEIGHT}: {Q} | {BLOCK}: {Q} | {FLUID}: {NONE}",
+                Q = labels::STATUS_MISSING,
+                NONE = labels::STATUS_NONE,
+                BIO = labels::STATUS_BIOME,
+                HEIGHT = labels::STATUS_HEIGHT,
+                BLOCK = labels::STATUS_BLOCK,
+                FLUID = labels::STATUS_FLUID,
+            )
         );
     }
 
@@ -470,8 +774,68 @@ mod tests {
         // The worker's result (here: a synthetic failure, since the world
         // path is nonsense) is applied through the same channel the UI
         // polls, and lands in the error state with a retry available.
-        let result = map_core::source::worldgen::WorldgenSource::new(&config);
+        let result = WorldgenSource::new(&config);
         assert!(app.state.apply_load_result(generation, result));
         assert!(app.state.source_error().is_some(), "the bad path failed");
+    }
+
+    // -- The hover pipeline over a real source (gated like every
+    // generator-backed test) -----------------------------------------------
+
+    /// The worldgen checkout this repository's sibling ships for tests.
+    fn world_dir() -> Option<PathBuf> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hytale-server-rust/testdata/Default");
+        // The committed world's prefab references need the user-supplied
+        // asset pack; without it the generator cannot load (CI has none).
+        let assets = dir.join("../../Assets/extracted");
+        (dir.is_dir() && assets.is_dir()).then_some(dir)
+    }
+
+    #[test]
+    fn inspector_hover_pipeline_serves_a_real_sample_through_the_channel() {
+        // End to end over the real generator: a parked cursor issues one
+        // debounced background request, the reply lands through the
+        // channel the UI polls, and the readout resolves through the
+        // source's own catalogs. The values themselves are the fixture
+        // comparison's business (see inspector's tests).
+        let Some(world) = world_dir() else {
+            eprintln!("skipping: the worldgen checkout is not present");
+            return;
+        };
+        let mut app = SeedExplorerApp::with_state(AppState::new(&world));
+        app.state.set_seed_text(String::from("0"));
+        let request = app.state.begin_load().expect("the load issues");
+        let result = WorldgenSource::new(&request.config());
+        assert!(app.state.apply_load_result(request.generation, result));
+
+        let ctx = egui::Context::default();
+        app.state.set_cursor(Some((0, 0)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.drive_hover_sampling(&ctx);
+            app.poll_hover_replies();
+            if matches!(app.state.inspector().knowledge(), HoverKnowledge::Sample(_)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the hover sample did not arrive in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The readout resolved names through the real catalogs; the
+        // sample itself carries the golden chunk's column.
+        let line = inspector::format_readout(app.state.cursor(), &app.current_readout());
+        assert!(
+            line.contains("X:0 Z:0"),
+            "the readout names the column: {line}"
+        );
+        assert!(line.contains(labels::STATUS_BIOME), "{line}");
+        let HoverKnowledge::Sample(sample) = app.state.inspector().knowledge() else {
+            unreachable!("the loop only exits on a sample");
+        };
+        assert_eq!(sample.height, 107, "the fixture height at seed 0 (0, 0)");
     }
 }

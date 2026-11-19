@@ -1,6 +1,22 @@
 # T18 — Inspector readout and resolution selector
 
-**Status:** proposed
+**Status:** done (deliverable: `map-app/src/inspector.rs` — the hover
+sampling state machine (50 ms debounce, one in-flight request,
+generation-tagged stale guards, a 16-entry sample LRU), the pure
+`resolve_sample`/`format_readout` readout formatters with
+`biome#N`-style catalog fallbacks, the `GoToDialog` state and
+`parse_go_to` (both fields, `x,z`, and `/tp x y z` pastes) — plus the
+wiring: `state.rs` (`InspectorState` integration with source resets,
+`submit_go_to` with world-range rejection, `format_status` as the tail
+with the `2×2 (effective 4×4)` step readout), `app.rs` (single-worker
+hover channel, the status bar's readout+tail composition, the
+collapsible inspector panel with names/ids/tint and a copy button, the
+real go-to dialog with inline errors, `Esc` handling),
+`view_state.rs` (`set_center`), `map_view.rs` (`world_bounds`), and the
+acceptance filters `inspector` (14 tests, incl. the gated
+fidelity-fixture readout and the end-to-end hover pipeline over the
+real generator) and `resolution` (3 tests) green.)
+
 **Milestone:** 4 — Layers and inspector
 **Depends on:** T09, T12, T16
 **Blocks:** T19, T26

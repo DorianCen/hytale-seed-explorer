@@ -307,6 +307,15 @@ impl MapView {
         self.pending
     }
 
+    /// The generatable world rect of the current source (blocks), for
+    /// validators that need the generator's bounds (the go-to dialog
+    /// rejects coordinates outside it). [`None`] before a source loads
+    /// or when the bounds exceed the block space.
+    #[must_use]
+    pub fn world_bounds(&self) -> Option<Rect> {
+        self.pipeline.as_ref().and_then(|pipeline| pipeline.world)
+    }
+
     /// One frame of the map.
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         let rect = ui.max_rect();
@@ -955,6 +964,45 @@ mod tests {
         assert!(map.textures.texture_id(&height_key).is_some());
         // And the biome tile is still cached for the switch back.
         assert!(pipeline.cache.contains(&biome_key));
+    }
+
+    #[test]
+    fn resolution_change_rekeys_the_frame_request() {
+        // The selector sets the user's minimum step; the frame request
+        // samples at the effective one, so switching 2x2 -> 1x1 rekeys
+        // every visible tile: the fine keys are uncached until they
+        // render, while the coarse tiles stay cached underneath (the
+        // parent-placeholder crop of T16).
+        let ctx = egui::Context::default();
+        let mut map = MapView::new();
+        let mut pipeline = fake_pipeline();
+
+        // The 2x2 default at one point per block: effective step 2.
+        let coarse_view = view(0.0, 600.0, 400.0);
+        let coarse = request_for(
+            &pipeline,
+            &coarse_view,
+            ZoomLevel::new(1).expect("in range"),
+            Layer::Biome,
+        );
+        settle(&mut map, &ctx, &mut pipeline, &coarse);
+        let coarse_key = coarse.subject.key_at(0, 0);
+        assert!(pipeline.cache.contains(&coarse_key));
+
+        // Selecting 1x1 in the top bar maps the frame to the full-block
+        // level: different subject zoom, different keys.
+        let fine = request_for(&pipeline, &coarse_view, ZoomLevel::MIN, Layer::Biome);
+        assert_ne!(fine.subject.zoom, coarse.subject.zoom);
+        let fine_key = fine.subject.key_at(0, 0);
+        assert_ne!(fine_key, coarse_key, "the resolution rekeys the tile");
+        assert!(
+            !pipeline.cache.contains(&fine_key),
+            "the fine tile renders fresh"
+        );
+        assert!(
+            pipeline.cache.contains(&coarse_key),
+            "the coarse tile stays cached for the placeholder crop"
+        );
     }
 
     // -- The real generator (gated like every generator-backed test) ------------

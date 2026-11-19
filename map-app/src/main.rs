@@ -9,11 +9,12 @@
 //! the headless `map-core`, so the UI thread never blocks on generation.
 //!
 //! All logic is testable without this binary: [`app`] is the egui skin,
-//! [`state`] the headless state machine, [`view_state`] the pan/zoom
-//! math, [`map_view`] the interactive map widget, [`labels`] the UI
-//! strings.
+//! [`state`] the headless state machine, [`inspector`] the hover sampling
+//! and go-to machinery (T18), [`view_state`] the pan/zoom math,
+//! [`map_view`] the interactive map widget, [`labels`] the UI strings.
 
 mod app;
+mod inspector;
 mod labels;
 mod map_view;
 mod state;

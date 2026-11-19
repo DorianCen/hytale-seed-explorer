@@ -72,12 +72,33 @@ pub const MAP_PLACEHOLDER_OFF_WORLD: &str = "this view is outside the world";
 /// Shown in the map area instead of data when a load failed.
 pub const MAP_PLACEHOLDER_ERROR_PREFIX: &str = "load failed:";
 
-/// Reserved for the go-to dialog (T29 gives it real behavior).
-pub const GO_TO_TITLE: &str = "Go to coordinates (T29)";
-/// The go-to dialog's body placeholder.
-pub const GO_TO_PLACEHOLDER: &str = "Coordinate entry and travel arrive with T29.";
+// -- Go-to dialog (T18) -------------------------------------------------------
+
+/// The go-to dialog's title (`G` opens it).
+pub const GO_TO_TITLE: &str = "Go to coordinates";
+/// One-line hint above the x/z fields.
+pub const GO_TO_HINT: &str = "enter x and z, or paste \"x z\", \"x,z\" or \"/tp x y z\"";
+/// The x field label.
+pub const GO_TO_X: &str = "X";
+/// The z field label.
+pub const GO_TO_Z: &str = "Z";
+/// The go-to submit button.
+pub const GO_TO_GO: &str = "Go";
 /// Generic close button.
 pub const CLOSE: &str = "Close";
+
+// -- Inspector panel (T18) ----------------------------------------------------
+
+/// The collapsible inspector heading in the left panel.
+pub const INSPECTOR: &str = "Inspector";
+/// The inspector's coordinates row label.
+pub const INSPECTOR_COORDINATES: &str = "Coordinates";
+/// The inspector's surface-tint row label (the value is hex).
+pub const INSPECTOR_TINT: &str = "Tint";
+/// The fluid depth row label.
+pub const INSPECTOR_DEPTH: &str = "Depth";
+/// The copy-coordinates button of the inspector panel.
+pub const COPY_COORDINATES: &str = "Copy coordinates";
 
 // -- Error banner ------------------------------------------------------------
 
@@ -89,10 +110,18 @@ pub const RETRY: &str = "Retry";
 
 // -- Status bar --------------------------------------------------------------
 
-pub const STATUS_UNKNOWN: &str = "unknown";
+/// A value the readout cannot know yet (the plan's `?`).
+pub const STATUS_MISSING: &str = "?";
+/// A value that does not exist (no fluid, the plan's `-`).
+pub const STATUS_NONE: &str = "-";
+/// What a pending surface sample shows while it generates.
+pub const STATUS_PENDING: &str = "...";
+/// The readout when the cursor is outside the generatable world.
+pub const STATUS_OUT_OF_WORLD: &str = "out of world";
 pub const STATUS_BIOME: &str = "Biome";
 pub const STATUS_HEIGHT: &str = "Height";
 pub const STATUS_BLOCK: &str = "Block";
+pub const STATUS_FLUID: &str = "Fluid";
 /// Followed by the pending-tile count.
 pub const STATUS_TILES: &str = "tiles";
 /// Followed by the display scale.
@@ -101,6 +130,10 @@ pub const STATUS_ZOOM: &str = "zoom";
 pub const STATUS_PT_PER_BLOCK: &str = "pt/blk";
 /// Prefix of the click-copy feedback (the coordinates follow).
 pub const STATUS_COPIED: &str = "copied";
+/// Precedes the zoom-forced step in the resolution readout.
+pub const STATUS_EFFECTIVE: &str = "effective";
+/// Prefix of the go-to feedback (the coordinates follow).
+pub const STATUS_WENT_TO: &str = "went to";
 
 pub const STATUS_SOURCE_IDLE: &str = "no source";
 pub const STATUS_SOURCE_LOADING: &str = "loading";

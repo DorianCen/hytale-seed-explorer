@@ -2,9 +2,11 @@
 //! in plain data.
 //!
 //! No egui types live here on purpose — the state machine (seed parsing,
-//! source loading, stale-result rejection, resolution changes, status
-//! formatting) is fully unit-testable without a window, a GPU or even the
-//! generator. `app.rs` is the thin egui skin over this module.
+//! source loading, stale-result rejection, resolution changes, go-to
+//! submission, status formatting) is fully unit-testable without a
+//! window, a GPU or even the generator. `app.rs` is the thin egui skin
+//! over this module; the hover sampling state machine itself lives in
+//! [`crate::inspector`].
 //!
 //! # Source loading model
 //!
@@ -27,8 +29,9 @@ use std::sync::Arc;
 use map_core::error::SourceResult;
 use map_core::render::Layer;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
-use map_core::types::{Seed, SeedError};
+use map_core::types::{Rect, Seed, SeedError};
 
+use crate::inspector::{GoToDialog, InspectorState, parse_go_to};
 use crate::labels;
 use crate::view_state::MapViewState;
 
@@ -113,16 +116,6 @@ impl Default for OverlaySettings {
             chunk_grid: false,
         }
     }
-}
-
-/// The hover sample the status bar reports. Placeholder strings until the
-/// inspector (T18) resolves ids through the catalogs; every field is
-/// pre-rendered so [`format_status`] stays pure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusSample {
-    pub biome: String,
-    pub height: i32,
-    pub block: String,
 }
 
 /// What a background load delivers back to the UI thread.
@@ -233,11 +226,19 @@ pub struct AppState {
     /// Cursor block coordinates once the map widget exists (T16).
     cursor: Option<(i32, i32)>,
 
+    /// The hover sampling pipeline (T18): debounced background surface
+    /// samples, a small LRU and the current readout knowledge. Reset
+    /// whenever the source changes — its samples belong to exactly one
+    /// source.
+    inspector: InspectorState,
+
     /// Transient one-line message (keyboard placeholders etc.).
     status: String,
 
-    /// Placeholder toggles driven by keyboard shortcuts.
-    show_go_to: bool,
+    /// The go-to dialog (`G` opens it, T18): text fields plus the inline
+    /// error of the last failed submit. [`None`] = closed.
+    go_to: Option<GoToDialog>,
+
     search_focused: bool,
 
     /// Heavy sources waiting for a background drop. [`Arc`] refs: a
@@ -263,8 +264,9 @@ impl Default for AppState {
             layer: AppLayer::Biomes,
             overlays: OverlaySettings::default(),
             cursor: None,
+            inspector: InspectorState::new(),
             status: String::new(),
-            show_go_to: false,
+            go_to: None,
             search_focused: false,
             retired: Vec::new(),
         }
@@ -416,6 +418,10 @@ impl AppState {
         match result {
             Ok(source) => {
                 self.status = format!("{} {}", labels::STATUS_SOURCE_READY, self.seed_text);
+                // A new source means new biome ids, new surfaces: the
+                // inspector's cached samples and pending readout belong
+                // to the source that just left.
+                self.inspector.reset();
                 self.source = SourceState::Ready(Arc::new(source));
             }
             Err(error) => {
@@ -451,6 +457,9 @@ impl AppState {
         self.source = SourceState::Idle;
         self.loaded_seed_input = None;
         self.status.clear();
+        // Samples and pending reads belong to the dead source; a hover
+        // reply still in flight will find the state reset here and drop.
+        self.inspector.reset();
     }
 
     /// True while a load is in flight (drives the Go button and spinner).
@@ -587,18 +596,81 @@ impl AppState {
         self.status = status.into();
     }
 
-    // -- Keyboard placeholder actions ---------------------------------------
+    // -- Inspector (T18) -----------------------------------------------------
 
-    /// Toggles the go-to dialog placeholder (`G`).
-    pub fn toggle_go_to(&mut self) {
-        self.show_go_to = !self.show_go_to;
-    }
-
-    /// Whether the go-to dialog placeholder is open.
+    /// The hover sampling pipeline (read-only access for the panels).
     #[must_use]
-    pub fn show_go_to(&self) -> bool {
-        self.show_go_to
+    pub fn inspector(&self) -> &InspectorState {
+        &self.inspector
     }
+
+    /// The hover sampling pipeline, for the app's per-frame drive.
+    pub fn inspector_mut(&mut self) -> &mut InspectorState {
+        &mut self.inspector
+    }
+
+    // -- Go-to (T18) ---------------------------------------------------------
+
+    /// Toggles the go-to dialog (`G`): opening starts from empty fields,
+    /// toggling while open closes it (a submit closes it too).
+    pub fn toggle_go_to(&mut self) {
+        self.go_to = if self.go_to.is_some() {
+            None
+        } else {
+            Some(GoToDialog::default())
+        };
+    }
+
+    /// Closes the go-to dialog (`Esc` or the Close button).
+    pub fn close_go_to(&mut self) {
+        self.go_to = None;
+    }
+
+    /// Whether the go-to dialog is open.
+    #[must_use]
+    pub fn go_to(&self) -> Option<&GoToDialog> {
+        self.go_to.as_ref()
+    }
+
+    /// The go-to dialog's editable fields, for the text edits.
+    pub fn go_to_mut(&mut self) -> Option<&mut GoToDialog> {
+        self.go_to.as_mut()
+    }
+
+    /// Validates and applies the go-to dialog: parse the two fields
+    /// ([`parse_go_to`]), reject coordinates outside the generatable
+    /// `world` (showing its range), then center the view — keeping the
+    /// current zoom — and close. The return value tells whether the view
+    /// moved.
+    ///
+    /// A failure leaves the dialog open with the inline error set.
+    pub fn submit_go_to(&mut self, world: Option<Rect>) -> bool {
+        let Some(dialog) = self.go_to.as_mut() else {
+            return false;
+        };
+        let (x, z) = match parse_go_to(&dialog.x_text, &dialog.z_text) {
+            Ok((x, z)) => (x, z),
+            Err(message) => {
+                dialog.error = Some(message);
+                return false;
+            }
+        };
+        if let Some(world) = world
+            && !world.contains(x, z)
+        {
+            dialog.error = Some(format!(
+                "outside the world: x {}..{}, z {}..{}",
+                world.min_x, world.max_x, world.min_z, world.max_z,
+            ));
+            return false;
+        }
+        self.go_to = None;
+        self.view.set_center(f64::from(x), f64::from(z));
+        self.status = format!("{} X:{x} Z:{z}", labels::STATUS_WENT_TO);
+        true
+    }
+
+    // -- Keyboard placeholder actions ---------------------------------------
 
     /// Marks the search section placeholder (`F`).
     pub fn focus_search(&mut self) {
@@ -646,55 +718,46 @@ impl AppState {
     }
 }
 
-/// Formats the status bar as one line of `key: value` pairs, using
-/// `unknown` wherever a value does not exist yet.
+/// The resolution readout: the selector's step, with the zoom-forced
+/// effective step spelled out when it is coarser —
+/// `2×2 (effective 4×4)`.
+#[must_use]
+pub fn format_resolution(step: u32, effective_step: u32) -> String {
+    if effective_step > step {
+        format!(
+            "{step}×{step} ({EFFECTIVE} {effective_step}×{effective_step})",
+            EFFECTIVE = labels::STATUS_EFFECTIVE,
+        )
+    } else {
+        format!("{step}×{step}")
+    }
+}
+
+/// Formats the status bar's tail: everything after the hover readout of
+/// [`inspector::format_readout`] — pending tiles, zoom, the resolution
+/// with its zoom-forced effective step, the layer and the source status.
 ///
-/// Pure on purpose: the app tests it with synthetic values, including the
-/// all-unknown case (no cursor, no source, nothing hovered).
+/// Pure on purpose: the app tests it with synthetic values.
 ///
 /// ```text
-/// X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass |
-/// tiles 12 pending | zoom 1.0 pt/blk | 2×2 | Relief | ready
+/// tiles 12 | zoom 0.5 pt/blk | 2×2 (effective 4×4) | Relief | ready
 /// ```
 #[must_use]
 pub fn format_status(
-    cursor: Option<(i32, i32)>,
-    sample: Option<&StatusSample>,
     pending_tiles: u32,
     zoom: f64,
     step: u32,
+    effective_step: u32,
     layer: &str,
     source_status: &str,
 ) -> String {
-    let (x_text, z_text) = match cursor {
-        Some((x, z)) => (x.to_string(), z.to_string()),
-        None => (
-            labels::STATUS_UNKNOWN.to_string(),
-            labels::STATUS_UNKNOWN.to_string(),
-        ),
-    };
-    let (biome, height, block) = match sample {
-        Some(sample) => (
-            sample.biome.clone(),
-            sample.height.to_string(),
-            sample.block.clone(),
-        ),
-        None => (
-            labels::STATUS_UNKNOWN.to_string(),
-            labels::STATUS_UNKNOWN.to_string(),
-            labels::STATUS_UNKNOWN.to_string(),
-        ),
-    };
     format!(
-        "X:{x_text} Z:{z_text} | {BIO}: {biome} | {HEIGHT}: {height} | \
-         {BLOCK}: {block} | {TILES} {pending_tiles} | {ZOOM} {zoom:.1} {PTBLK} | \
-         {step}×{step} | {layer} | {source_status}",
-        BIO = labels::STATUS_BIOME,
-        HEIGHT = labels::STATUS_HEIGHT,
-        BLOCK = labels::STATUS_BLOCK,
+        "{TILES} {pending_tiles} | {ZOOM} {zoom:.1} {PTBLK} | {resolution} | {layer} | \
+         {source_status}",
         TILES = labels::STATUS_TILES,
         ZOOM = labels::STATUS_ZOOM,
         PTBLK = labels::STATUS_PT_PER_BLOCK,
+        resolution = format_resolution(step, effective_step),
     )
 }
 
@@ -850,9 +913,15 @@ mod tests {
     fn keyboard_placeholders_set_status_and_toggles() {
         let mut state = state();
         state.toggle_go_to();
-        assert!(state.show_go_to());
+        let dialog = state.go_to().expect("the go-to dialog opened");
+        assert!(dialog.x_text.is_empty(), "the dialog starts empty");
+        assert!(dialog.error.is_none());
         state.toggle_go_to();
-        assert!(!state.show_go_to());
+        assert!(state.go_to().is_none(), "toggling again closes it");
+
+        state.toggle_go_to();
+        state.close_go_to();
+        assert!(state.go_to().is_none(), "close is idempotent");
 
         state.focus_search();
         assert!(state.take_search_focus(), "the panel consumes the focus");
@@ -888,33 +957,45 @@ mod tests {
     }
 
     #[test]
+    fn resolution_changes_map_to_the_expected_effective_step() {
+        // The selector sets the user's *minimum* step (T10's
+        // effective_step folds it with the zoom level the view needs):
+        // 2x2 at one point per block is exactly step 2, a zoomed-out
+        // view forces coarser sampling no matter how fine the selector.
+        let mut state = state();
+        assert_eq!(state.resolution_step(), 2, "the plan's 2x2 default");
+        assert_eq!(state.view().tile_step(state.resolution_step()), 2);
+
+        state.set_resolution_step(1);
+        assert_eq!(state.view().tile_step(state.resolution_step()), 1);
+
+        // Two levels out, one point covers four blocks: 1x1 and 2x2 both
+        // render at step 4, while an 8x8 selection stays 8x8.
+        state.view_mut().zoom_at_center(2.0);
+        assert_eq!(state.view().tile_step(1), 4);
+        assert_eq!(state.view().tile_step(2), 4);
+        assert_eq!(state.view().tile_step(8), 8);
+
+        // And the finest selection survives zooming back in.
+        state.set_resolution_step(8);
+        state.view_mut().zoom_at_center(-2.0);
+        assert_eq!(state.view().tile_step(state.resolution_step()), 8);
+    }
+
+    #[test]
     fn status_bar_formats_synthetic_values() {
-        let sample = StatusSample {
-            biome: String::from("Emerald Grove"),
-            height: 71,
-            block: String::from("Grass"),
-        };
-        let line = format_status(
-            Some((-1203, 455)),
-            Some(&sample),
-            12,
-            0.5,
-            2,
-            "Relief",
-            "ready",
-        );
+        // The status bar's tail, after the readout the inspector owns:
+        // a coarser effective step is spelled out, an exact one is not.
+        let line = format_status(12, 0.5, 2, 4, "Relief", "ready");
         assert_eq!(
             line,
-            "X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass \
-             | tiles 12 | zoom 0.5 pt/blk | 2×2 | Relief | ready"
+            "tiles 12 | zoom 0.5 pt/blk | 2×2 (effective 4×4) | Relief | ready"
         );
 
-        // The all-unknown case: works before any source or cursor exists.
-        let unknown = format_status(None, None, 0, 1.0, 2, "Biomes", "no source");
+        let plain = format_status(0, 1.0, 2, 2, "Biomes", "no source");
         assert_eq!(
-            unknown,
-            "X:unknown Z:unknown | Biome: unknown | Height: unknown | \
-             Block: unknown | tiles 0 | zoom 1.0 pt/blk | 2×2 | Biomes | no source"
+            plain,
+            "tiles 0 | zoom 1.0 pt/blk | 2×2 | Biomes | no source"
         );
     }
 
