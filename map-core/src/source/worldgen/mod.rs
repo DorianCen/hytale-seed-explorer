@@ -182,7 +182,7 @@ impl WorldgenSource {
             max_chunk,
         } = ready;
         let identity = GeneratorIdentity {
-            generator_version: worldgen_hytale::GENERATOR_VERSION,
+            generator_version: crate::GENERATOR_VERSION,
             world_assets: format!(
                 "{}@{} ({})",
                 config.world_name,

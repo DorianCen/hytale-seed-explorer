@@ -37,17 +37,30 @@ pub mod types;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-/// The generator identity this build is pinned to (T02). The external
-/// workspace must resolve for this constant to exist.
-pub const GENERATOR_VERSION: u32 = worldgen_hytale::GENERATOR_VERSION;
+/// The generator identity this build is pinned to (T02).
+///
+/// This is the *explorer's* pin of the generator's output-semantics tag.
+/// The generator repo defines the same value as
+/// `worldgen_hytale::GENERATOR_VERSION` (worldgen commit `08dd461`), but
+/// that commit is not yet published on the public `main` the CI checks
+/// out — importing it made the workspace unbuildable there. Keep the two
+/// in sync: CI's "Cross-check the generator version tag" step compares
+/// this constant with the generator's tag whenever the checkout
+/// publishes it, and fails on a mismatch. A bump is a cache-invalidation
+/// action: record it in the commit message (see `docs/seed-semantics.md`
+/// §6 for the policy).
+pub const GENERATOR_VERSION: u32 = 1;
 
 #[cfg(test)]
 mod tests {
     /// Proves the test harness runs AND that the external generator path
     /// dependency resolves from this workspace.
+    ///
+    /// The generator's own `GENERATOR_VERSION` constant is only on its
+    /// unpublished branch today, so this test pins the explorer's value;
+    /// the CI cross-check step keeps the two honest when both exist.
     #[test]
     fn the_external_generator_resolves() {
         assert_eq!(super::GENERATOR_VERSION, 1);
-        assert_eq!(worldgen_hytale::GENERATOR_VERSION, 1);
     }
 }

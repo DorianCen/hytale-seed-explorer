@@ -38,18 +38,31 @@ pub const GOLDEN_NEGATIVE_SHA256: &str =
 
 /// The world-gen folder this repository's sibling checkout ships for
 /// tests, or `None` (with a skip message) on machines without it.
+///
+/// Also requires the user-supplied, git-ignored asset pack: the committed
+/// `testdata/Default` world references prefabs from it, so the generator
+/// cannot load the world without the pack. Tests skip instead of panicking
+/// (CI has no pack — it must not, the assets are proprietary).
 pub fn world_dir() -> Option<PathBuf> {
     let dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hytale-server-rust/testdata/Default");
-    if dir.is_dir() {
-        Some(dir)
-    } else {
+    if !dir.is_dir() {
         eprintln!(
             "skipping: the worldgen checkout is not present at {}",
             dir.display()
         );
-        None
+        return None;
     }
+    let assets = dir.join("../../Assets/extracted");
+    if !assets.is_dir() {
+        eprintln!(
+            "skipping: the worldgen checkout has no asset pack at {} (the committed world \
+             references prefabs from the user-supplied pack)",
+            assets.display()
+        );
+        return None;
+    }
+    Some(dir)
 }
 
 /// The shared, already-loaded golden source (seed 0). Only call this

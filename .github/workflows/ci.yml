@@ -15,11 +15,19 @@
 #   repo lands in worldgen/hytale-server-rust and a symlink places it at
 #   the sibling path Cargo and the tests resolve. Tests skip gracefully
 #   when the checkout is absent; this job requires it.
+# - The worldgen workspace's own GENERATOR_VERSION tag is committed on
+#   its branch (08dd461) but not published on the public main this job
+#   checks out, so map-core pins the same value in its own constant
+#   (map-core/src/lib.rs). The "Cross-check the generator version tag"
+#   step compares the two whenever the generator publishes it.
 # - `cargo build -p map-app` links eframe against X11/Wayland; the apt step
 #   installs the required dev libraries. No window is ever launched in CI:
 #   the GUI gate is a build, not a run.
-# - No test needs the multi-gigabyte asset pack: map-core/map-cli tests run
-#   against the committed golden world data or pure code only.
+# - No test needs the multi-gigabyte asset pack at runtime: generator-backed
+#   tests SKIP when the checkout has no Assets/extracted (the committed world
+#   references prefabs from the user-supplied pack), so CI covers the pure-code
+#   suites and the builds; the golden/fidelity tests run on machines with a
+#   pack. Skipped tests print their reason.
 
 name: ci
 
@@ -47,6 +55,23 @@ jobs:
 
       - name: Place the worldgen checkout at the sibling path Cargo expects
         run: ln -s "$GITHUB_WORKSPACE/worldgen/hytale-server-rust" "$GITHUB_WORKSPACE/../hytale-server-rust"
+
+      - name: Cross-check the generator version tag
+        run: |
+          # The generator's own GENERATOR_VERSION is committed on its
+          # branch (worldgen 08dd461) but not published on the public main
+          # this job checks out, so map-core pins the same value itself.
+          # When the generator publishes its tag, a mismatch must fail here
+          # instead of silently tagging tiles with the wrong identity.
+          generator_lib=worldgen/hytale-server-rust/crates/worldgen-hytale/src/lib.rs
+          explorer_pin=$(sed -n 's/^pub const GENERATOR_VERSION: u32 = \([0-9]*\);/\1/p' map-core/src/lib.rs)
+          generator_pin=$(sed -n 's/^pub const GENERATOR_VERSION: u32 = \([0-9]*\);/\1/p' "$generator_lib" 2>/dev/null || true)
+          if [ -z "$generator_pin" ]; then
+            echo "generator tag not published in the public checkout yet; explorer pin is $explorer_pin"
+            exit 0
+          fi
+          echo "generator tag $generator_pin, explorer pin $explorer_pin"
+          test "$generator_pin" = "$explorer_pin"
 
       - name: Install eframe build dependencies (X11/Wayland dev libs)
         run: |

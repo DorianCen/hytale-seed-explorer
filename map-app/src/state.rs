@@ -1198,7 +1198,10 @@ mod tests {
     fn world_dir() -> Option<PathBuf> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../hytale-server-rust/testdata/Default");
-        dir.is_dir().then_some(dir)
+        // The committed world's prefab references need the user-supplied
+        // asset pack; without it the generator cannot load (CI has none).
+        let assets = dir.join("../../Assets/extracted");
+        (dir.is_dir() && assets.is_dir()).then_some(dir)
     }
 
     #[test]

@@ -32,20 +32,30 @@ const TEST_SEED: &str = "12345";
 /// Serializes tests that share the pool; see the module docs.
 static SHARED_LOCK: Mutex<()> = Mutex::new(());
 
-/// The world-gen folder this repository's sibling checkout ships for tests, or
-/// `None` (with a skip message) on machines without the checkout.
+/// The world-gen folder this repository's sibling checkout ships for tests,
+/// or `None` (with a skip message) on machines without it — including
+/// machines without the user-supplied, git-ignored asset pack, which the
+/// committed world's prefab references require (CI has no pack).
 fn world_dir() -> Option<PathBuf> {
     let dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hytale-server-rust/testdata/Default");
-    if dir.is_dir() {
-        Some(dir)
-    } else {
+    if !dir.is_dir() {
         eprintln!(
             "skipping: the worldgen checkout is not present at {}",
             dir.display()
         );
-        None
+        return None;
     }
+    let assets = dir.join("../../Assets/extracted");
+    if !assets.is_dir() {
+        eprintln!(
+            "skipping: the worldgen checkout has no asset pack at {} (the committed world \
+             references prefabs from the user-supplied pack)",
+            assets.display()
+        );
+        return None;
+    }
+    Some(dir)
 }
 
 /// The shared, already-loaded production source (2 workers, seed `12345`).

@@ -180,6 +180,14 @@ Added at the public root of `worldgen-hytale`
 pub const GENERATOR_VERSION: u32 = 1;
 ```
 
+- **Publication status (2026-11-19):** `08dd461` is committed on the
+  generator repo's branch but not yet pushed to the public `main`, so the
+  constant does not exist in the checkout CI resolves. The explorer
+  therefore pins the same value in `map_core::GENERATOR_VERSION`
+  (`map-core/src/lib.rs`) and CI's "Cross-check the generator version tag"
+  step fails on a mismatch as soon as the generator publishes its tag.
+  Until then, bump the explorer constant in the same commit as an intended
+  generator bump.
 - **What it covers:** the generator's *output semantics* — generation logic,
   world asset/config changes that alter output, registry snapshot semantics
   (block/fluid ids, opacity) when they affect output, and downstream palette
@@ -213,7 +221,7 @@ participates in tile keys because terrain cannot distinguish more.
 
 | Test | Status | Owner |
 |---|---|---|
-| `GENERATOR_VERSION` present, typed, locked at 1 | **done** — `worldgen_hytale::tests::generator_version_is_tagged` | T02 (this task) |
+| `GENERATOR_VERSION` present, typed, locked at 1 | **done** — `worldgen_hytale::tests::generator_version_is_tagged`; not yet on the published generator branch (see §6), the explorer pins it and CI cross-checks | T02 (this task) |
 | `cargo test -p worldgen-hytale` full suite green after the constant | **done** — 691 lib + integration suites pass; `cargo fmt --check`, `clippy -D warnings` clean | T02 |
 | `dump-chunk --seed 42 --chunk 0,0` runs (seed flows through the CLI as i32) | **done** — JSON echoes `"seed": 42` | T02 |
 | Parser: `0`, `1`, `-1`, `i32::MIN`, `i32::MAX` map to themselves | pending type | T07 |
