@@ -20,6 +20,11 @@
 //!   hands out a channel receiver; the texture bridge (`map-app`) drops
 //!   `TextureHandle`s for exactly those keys, which is what frees GPU
 //!   memory.
+//! - **A missing tile has a stand-in.** [`covering_placeholder`] finds
+//!   the nearest cached coarser tile covering a missing tile's world
+//!   rect, with the exact UV crop that paints only that rect — the
+//!   plan's lower-detail placeholder (§5.1) that the T16 viewport draws
+//!   while a tile is still generating.
 //!
 //! # Why a custom LRU instead of `moka`
 //!
@@ -42,7 +47,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
-use crate::coords::ZoomLevel;
+use crate::coords::{TILE_SIZE, TileCoord, ZoomLevel, tile_rect};
 use crate::render::Layer;
 
 /// Fixed bytes [`Tile::byte_size`] charges on top of the pixel buffer:
@@ -453,6 +458,103 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------
+// PlaceholderTile
+// ---------------------------------------------------------------------------
+
+/// A cached, coarser tile that can stand in for a missing one, plus the
+/// texture crop that paints exactly the missing tile's world rect.
+#[derive(Debug, Clone)]
+pub struct PlaceholderTile {
+    /// The cached tile to paint: the same subject (identity, seed,
+    /// layer, mode) at a coarser zoom.
+    pub tile: Arc<Tile>,
+    /// UV crop `(u0, v0, u1, v1)` within the placeholder's texture: the
+    /// fraction of the parent that the missing tile occupies, measured
+    /// from the image's top-left (north-west) corner — the orientation
+    /// contract tiles already follow (tile row 0 = north = image top).
+    pub uv: [f32; 4],
+}
+
+/// Finds the nearest cached coarser tile covering `key`'s world rect —
+/// the plan's lower-detail placeholder (§5.1).
+///
+/// Searches the key's own step doubled, then quadrupled, … up to
+/// [`ZoomLevel::MAX`]'s step, preferring the closest (least blurry)
+/// level; the first cached hit wins. The crop is exact because both
+/// tiles are power-of-two aligned: the child's block rect is a whole
+/// fraction of the parent's, so the UV values are exact f32s in
+/// `[0, 1]`.
+///
+/// Uses [`TileCache::get`] (not `contains`) so a tile actually used for
+/// painting refreshes its LRU recency and counts as a hit.
+///
+/// Returns [`None`] when no coarser tile of the same subject is cached,
+/// when the key is already at the coarsest level, or when either rect
+/// falls outside the representable block space (the caller paints its
+/// loading blank instead).
+#[must_use]
+pub fn covering_placeholder(cache: &TileCache, key: &TileKey) -> Option<PlaceholderTile> {
+    // The child rect is the same for every candidate level; when it does
+    // not fit the i32 block space, no parent can contain it either (a
+    // parent's bounds enclose the child's), so the level scan would find
+    // nothing and None is final here.
+    let child_rect = tile_rect(
+        TileCoord::new(i64::from(key.tx), i64::from(key.ty)),
+        key.zoom.step(),
+    )?;
+    let base_step = u64::from(key.zoom.step());
+    let max_step = u64::from(ZoomLevel::MAX.step());
+    let mut factor: u64 = 2;
+    while base_step * factor <= max_step {
+        let parent_step = u32::try_from(base_step * factor)
+            .expect("the product is bounded by ZoomLevel::MAX.step(), which fits u32");
+        let Some(parent_zoom) = ZoomLevel::from_step(parent_step) else {
+            // A power-of-two step times a power-of-two factor is a power
+            // of two, so this is unreachable; stopping (rather than
+            // panicking) keeps the helper total if ZoomLevel's step
+            // contract ever changes.
+            break;
+        };
+        // Floor division, not Rust's truncating `/`: -1 at factor 2 must
+        // land in the parent at -1, not 0.
+        let divisor =
+            i64::try_from(factor).expect("the factor doubles from 2 and stops at MAX.step()");
+        let tx = i32::try_from(i64::from(key.tx).div_euclid(divisor))
+            .expect("floor division by a factor >= 2 cannot grow a tile index");
+        let ty = i32::try_from(i64::from(key.ty).div_euclid(divisor))
+            .expect("floor division by a factor >= 2 cannot grow a tile index");
+        let parent_key = TileKey {
+            zoom: parent_zoom,
+            tx,
+            ty,
+            ..*key
+        };
+        factor *= 2;
+        let Some(tile) = cache.get(&parent_key) else {
+            continue;
+        };
+        // None ends the search rather than skipping the level: every
+        // coarser parent encloses this one, so it cannot fit if this one
+        // does not.
+        let parent_rect = tile_rect(TileCoord::new(i64::from(tx), i64::from(ty)), parent_step)?;
+        // Blocks per parent side, in i64 so the UV numerators can never
+        // wrap; the value is at most 2^28.
+        let side = i64::from(TILE_SIZE) * i64::from(parent_step);
+        let u0 = (i64::from(child_rect.min_x) - i64::from(parent_rect.min_x)) as f64 / side as f64;
+        let u1 =
+            (i64::from(child_rect.max_x) + 1 - i64::from(parent_rect.min_x)) as f64 / side as f64;
+        let v0 = (i64::from(child_rect.min_z) - i64::from(parent_rect.min_z)) as f64 / side as f64;
+        let v1 =
+            (i64::from(child_rect.max_z) + 1 - i64::from(parent_rect.min_z)) as f64 / side as f64;
+        return Some(PlaceholderTile {
+            tile,
+            uv: [u0 as f32, v0 as f32, u1 as f32, v1 as f32],
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -594,5 +696,158 @@ mod tests {
             tile.byte_size(),
             FIXED_OVERHEAD_BYTES + 262_144, // 256 * 256 * 4
         );
+    }
+
+    // -- Placeholder lookup (T16) -------------------------------------------
+
+    /// A cache that comfortably holds the handful of 2×2 fixtures below
+    /// (each weighs 96 + 16 bytes).
+    fn placeholder_cache() -> TileCache {
+        TileCache::new(1 << 20)
+    }
+
+    /// Caches a 2×2 black tile under `key` — the placeholder helpers only
+    /// read the key, never the pixels.
+    fn cache_tile(cache: &TileCache, key: TileKey) {
+        let tile = Tile::new(key, 2, 2, vec![0u8; 16]).expect("2x2 RGBA is exactly 16 bytes");
+        cache.insert(Arc::new(tile));
+    }
+
+    #[test]
+    fn tile_placeholder_prefers_the_closest_coarser_level() {
+        let cache = placeholder_cache();
+        let child = key(1, 7, Layer::Biome, 0, 0, 1, 1);
+        // Cache the far level first so insertion order cannot be what
+        // makes the near level win.
+        let grandparent = key(1, 7, Layer::Biome, 0, 2, 0, 0);
+        let parent = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        cache_tile(&cache, grandparent);
+        cache_tile(&cache, parent);
+
+        let placeholder = covering_placeholder(&cache, &child).expect("a parent level is cached");
+        assert_eq!(
+            placeholder.tile.key, parent,
+            "the step-2 parent is less blurry than the step-4 grandparent"
+        );
+        assert_eq!(
+            placeholder.tile.key.zoom,
+            ZoomLevel::new(1).expect("level 1 is in range")
+        );
+    }
+
+    #[test]
+    fn tile_placeholder_crops_exact_uv_fractions() {
+        let cache = placeholder_cache();
+        cache_tile(&cache, key(1, 7, Layer::Biome, 0, 1, 0, 0));
+
+        // (1,1) is the south-east quadrant of parent (0,0).
+        let child = key(1, 7, Layer::Biome, 0, 0, 1, 1);
+        let placeholder = covering_placeholder(&cache, &child).expect("the parent is cached");
+        assert_eq!(placeholder.uv, [0.5, 0.5, 1.0, 1.0]);
+
+        // (0,0) is the north-west quadrant.
+        let child = key(1, 7, Layer::Biome, 0, 0, 0, 0);
+        let placeholder = covering_placeholder(&cache, &child).expect("the parent is cached");
+        assert_eq!(placeholder.uv, [0.0, 0.0, 0.5, 0.5]);
+
+        // Negative indices floor toward the more negative parent: -1 / 2
+        // truncates to 0 but floors to -1.
+        cache_tile(&cache, key(1, 7, Layer::Biome, 0, 1, -1, -1));
+        let child = key(1, 7, Layer::Biome, 0, 0, -1, -1);
+        let placeholder = covering_placeholder(&cache, &child).expect("the parent is cached");
+        assert_eq!(
+            (placeholder.tile.key.tx, placeholder.tile.key.ty),
+            (-1, -1),
+            "the parent index uses floor semantics"
+        );
+        assert_eq!(placeholder.uv, [0.5, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn tile_placeholder_skips_to_the_next_level_when_one_is_missing() {
+        let cache = placeholder_cache();
+        let child = key(1, 7, Layer::Biome, 0, 0, 1, 0);
+        // Only the level-2 (step 4) grandparent exists; level 1 misses.
+        cache_tile(&cache, key(1, 7, Layer::Biome, 0, 2, 0, 0));
+
+        let placeholder =
+            covering_placeholder(&cache, &child).expect("the grandparent level is cached");
+        assert_eq!(
+            placeholder.tile.key.zoom,
+            ZoomLevel::new(2).expect("level 2 is in range")
+        );
+        assert_eq!(placeholder.uv, [0.25, 0.0, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn tile_placeholder_returns_none_without_a_matching_subject() {
+        let cache = placeholder_cache();
+        let child = key(1, 7, Layer::Biome, 0, 0, 1, 1);
+        assert!(
+            covering_placeholder(&cache, &child).is_none(),
+            "an empty cache has nothing to stand in"
+        );
+
+        cache_tile(&cache, child);
+        assert!(
+            covering_placeholder(&cache, &child).is_none(),
+            "a tile is not its own placeholder"
+        );
+
+        cache_tile(&cache, key(1, 8, Layer::Biome, 0, 1, 0, 0));
+        assert!(
+            covering_placeholder(&cache, &child).is_none(),
+            "another seed's parent paints different terrain"
+        );
+
+        cache_tile(&cache, key(1, 7, Layer::Height, 0, 1, 0, 0));
+        assert!(
+            covering_placeholder(&cache, &child).is_none(),
+            "another layer's parent paints different data"
+        );
+    }
+
+    #[test]
+    fn tile_placeholder_returns_none_at_the_coarsest_level() {
+        let cache = placeholder_cache();
+        let child = key(1, 7, Layer::Biome, 0, ZoomLevel::MAX.0, 0, 0);
+        assert!(
+            covering_placeholder(&cache, &child).is_none(),
+            "no coarser level exists to cache"
+        );
+    }
+
+    #[test]
+    fn tile_placeholder_uv_stays_inside_the_unit_square() {
+        let cache = placeholder_cache();
+        for level in 0..=2u8 {
+            for &(tx, ty) in &[(-7, 5), (-1, -1), (0, 0), (1, 1), (9, -3)] {
+                let child = key(1, 7, Layer::Biome, 0, level, tx, ty);
+                cache_tile(
+                    &cache,
+                    key(
+                        1,
+                        7,
+                        Layer::Biome,
+                        0,
+                        level + 1,
+                        tx.div_euclid(2),
+                        ty.div_euclid(2),
+                    ),
+                );
+
+                let placeholder =
+                    covering_placeholder(&cache, &child).expect("the immediate parent is cached");
+                let [u0, v0, u1, v1] = placeholder.uv;
+                assert!(
+                    0.0 <= u0 && u0 < u1 && u1 <= 1.0,
+                    "u crop must be a non-empty fraction of the parent: {placeholder:?}"
+                );
+                assert!(
+                    0.0 <= v0 && v0 < v1 && v1 <= 1.0,
+                    "v crop must be a non-empty fraction of the parent: {placeholder:?}"
+                );
+            }
+        }
     }
 }

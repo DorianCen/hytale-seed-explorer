@@ -9,12 +9,16 @@
 //! the headless `map-core`, so the UI thread never blocks on generation.
 //!
 //! All logic is testable without this binary: [`app`] is the egui skin,
-//! [`state`] the headless state machine, [`labels`] the UI strings.
+//! [`state`] the headless state machine, [`view_state`] the pan/zoom
+//! math, [`map_view`] the interactive map widget, [`labels`] the UI
+//! strings.
 
 mod app;
 mod labels;
+mod map_view;
 mod state;
 mod texture;
+mod view_state;
 
 use eframe::egui;
 

@@ -1,6 +1,34 @@
 # T16 — Pan, zoom and viewport rendering
 
-**Status:** proposed
+**Status:** done (deliverable: `map-app/src/map_view.rs` — the egui map
+widget: drag pan (left/middle), wheel zoom anchored at the cursor
+through T10's `zoom_at_cursor`, `+`/`=`/`-` keyboard zoom, click-to-copy
+`x z`, the pure `frame_tiles` request (visible range ∩ generatable
+world, center-tile priorities, unchanged-request dedup), scheduler
+event drain into the T14 GPU bridge, eviction-following texture drops,
+physical-pixel tile rects (the seam rule), parent-tile placeholders
+cropped to exact UVs, a subtle pending tint, and off-thread pipeline
+retirement; plus `map-app/src/view_state.rs` — the headless
+`MapViewState` (continuous `smooth_zoom` with a ceil'd discrete
+`zoom_level`, all conversions delegated to T10) with
+`tile_screen_rect`/`expand_to_pixels` and 17 tests; the biome tile
+renderer `BiomeTileRenderer` in `map-core/src/render/biome.rs` (one
+region query per tile, token-checked before the work unit, world-edge
+tiles query the sample-grid-aligned in-world sub-rect and leave
+transparent margins) with 6 tests; `covering_placeholder`/
+`PlaceholderTile` in `map-core/src/tiles.rs` (nearest cached coarser
+level, exact power-of-two UV crop) with 6 tests; the T13 single-texture
+flow removed (`MapTexture`, grid requests, `MAX_TEXTURE_SAMPLES`,
+`view_texture_rect`) in favor of the T15 pipeline; `AppState` owns the
+`MapViewState`; 9 map-app pipeline/frame tests (fake source + the real
+generator; serve/upload/unchanged-frame/cancel/placeholder, plus the
+T13-style colored-map acceptance through the tile path); supporting:
+`crossbeam-channel` in map-app, a test-support dev-dependency for the
+fake-source pipeline tests, the stale "flips Z" line in `coords.rs`
+module docs corrected to the shipped orientation contract. Manual
+checklist pending a desktop session: pan across seams, zoom at
+corner/edge, fast drag, seed change while loading — each item's math
+and pipeline counterpart is covered headlessly.)
 **Milestone:** 3 — Tiling and navigation
 **Depends on:** T12, T13, T14, T15
 **Blocks:** T18, T23, T29, T30, T31

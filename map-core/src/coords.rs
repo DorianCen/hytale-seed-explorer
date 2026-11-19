@@ -29,8 +29,11 @@
 //!
 //! - **Y axis:** screen Y increases downward (egui), world Z increases
 //!   south. This module applies the same linear mapping to both axes and
-//!   never flips Z — the map widget (T16) flips Z when painting. Keeping the
-//!   flip at the paint boundary means all math here is sign-symmetric.
+//!   never flips Z — so north (−Z) lands at the screen top, exactly the
+//!   orientation the renderers bake into their pixels (image row 0).
+//!   The map widget (T16) consumes this transform as-is for both
+//!   painting and cursor readouts; had a fixup ever been needed, its
+//!   home would be that paint boundary, never here.
 //! - **Intermediate arithmetic** runs in `i64`; values are narrowed to
 //!   `i32` only at the public block boundary, with `None` on overflow.
 //! - **Floor semantics:** a screen point maps to the block whose *floor*

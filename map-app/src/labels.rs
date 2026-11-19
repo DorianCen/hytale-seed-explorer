@@ -57,8 +57,8 @@ pub const MAP_PLACEHOLDER_NO_SOURCE: &str = "load a seed to explore";
 /// Shown while a background load runs.
 pub const MAP_PLACEHOLDER_LOADING: &str = "loading world…";
 
-/// Prefix of the center/zoom readout on the map placeholder.
-pub const MAP_PLACEHOLDER_VIEW: &str = "view";
+/// Shown when a layer is selected whose renderer is a later task's.
+pub const MAP_PLACEHOLDER_LAYER: &str = "this layer's renderer arrives with T17/T28";
 
 /// Shown in the map area instead of data when a load failed.
 pub const MAP_PLACEHOLDER_ERROR_PREFIX: &str = "load failed:";
@@ -90,6 +90,8 @@ pub const STATUS_TILES: &str = "tiles";
 pub const STATUS_ZOOM: &str = "zoom";
 /// The unit after the display scale (points per block).
 pub const STATUS_PT_PER_BLOCK: &str = "pt/blk";
+/// Prefix of the click-copy feedback (the coordinates follow).
+pub const STATUS_COPIED: &str = "copied";
 
 pub const STATUS_SOURCE_IDLE: &str = "no source";
 pub const STATUS_SOURCE_LOADING: &str = "loading";
@@ -104,11 +106,5 @@ pub const STATUS_EXPORT_PLACEHOLDER: &str = "PNG export arrives with T32";
 /// When a load worker vanishes without a result.
 pub const STATUS_WORKER_DIED: &str = "the load worker stopped without reporting";
 
-/// When the biome grid request for the view failed.
-pub const STATUS_GRID_FAILED: &str = "the biome grid request failed";
-
 /// The palette legend header in the left panel.
 pub const PALETTE: &str = "Palette";
-
-/// The central map's text while a grid is being generated.
-pub const MAP_PLACEHOLDER_RENDERING: &str = "rendering the biome map…";

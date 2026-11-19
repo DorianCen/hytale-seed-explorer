@@ -1,4 +1,5 @@
-//! The biome layer (T11 flat path, T13 palette refinements).
+//! The biome layer (T11 flat path, T13 palette refinements, T16 tile
+//! renderer).
 //!
 //! One palette, grounded in worldgen: [`BiomeInfo::map_color`] is the
 //! source of truth (the generator's own `Biome::get_map_color()`, channel
@@ -7,7 +8,7 @@
 //! catalog cannot resolve renders magenta ([`UNKNOWN_BIOME_COLOR`]) and
 //! is logged once, so a worldgen data bug is visible, never hidden.
 //!
-//! Two render paths:
+//! Three render paths:
 //!
 //! - [`render_biome_rgba`] — flat, the default layer and the golden
 //!   (`tests/render_golden.rs`): one pixel per sample, row-major, north
@@ -15,12 +16,21 @@
 //! - [`render_biome_shaded`] — the optional subtle hillshade hook,
 //!   disabled by default; the app stays flat until T17 wires height data
 //!   in (the default layer must never depend on a full-block query).
+//! - [`BiomeTileRenderer`] — what the T15 scheduler calls per tile: one
+//!   biome region query colored with [`render_biome_rgba`], transparent
+//!   margins outside the generatable world.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::catalog::BiomeCatalog;
-use crate::types::{BiomeGrid, BiomeId, HeightGrid};
+use crate::coords::{TILE_SIZE, TileCoord, floor_div, tile_rect};
+use crate::error::{SourceError, SourceResult};
+use crate::scheduler::{CancelToken, TileRenderer};
+use crate::source::WorldSource;
+use crate::tiles::{Tile, TileKey};
+use crate::types::{BiomeGrid, BiomeId, HeightGrid, Rect};
 
 use super::image::{Rgba, RgbaImage};
 
@@ -189,11 +199,152 @@ impl super::LayerRenderer for BiomeRenderer<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tile renderer (T16)
+// ---------------------------------------------------------------------------
+
+/// The biome layer's [`TileRenderer`] (T16): one tile = one biome region
+/// query, colored with [`render_biome_rgba`].
+///
+/// The region query is a single work unit: the cancellation token is
+/// checked before it starts (a cancelled tile never begins work), and a
+/// render that completes despite its token is returned normally — the
+/// scheduler caches it (the pixels are content-addressed) and reports
+/// `Cancelled` itself.
+///
+/// **World limits.** A tile straddling the generatable edge would fail
+/// the whole region query, so when `world` is given the renderer queries
+/// only the in-world sub-rect — aligned to the tile's sample grid, so its
+/// samples land on the same world columns the full tile would sample —
+/// and leaves the out-of-world margins fully transparent (alpha 0). The
+/// app's canvas shows through instead of the renderer fabricating data.
+/// `world: None` means unbounded (fake sources, tests).
+pub struct BiomeTileRenderer {
+    source: Arc<dyn WorldSource>,
+    world: Option<Rect>,
+}
+
+impl BiomeTileRenderer {
+    /// Creates the renderer. `world` is the generatable block rect
+    /// (inclusive bounds); `None` means the source serves any rect.
+    #[must_use]
+    pub fn new(source: Arc<dyn WorldSource>, world: Option<Rect>) -> Self {
+        Self { source, world }
+    }
+}
+
+impl TileRenderer for BiomeTileRenderer {
+    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+        // A cancelled tile never begins its work unit (the region query);
+        // the scheduler is the one that reports the cancellation.
+        if cancel.load(Relaxed) {
+            return Err(SourceError::Cancelled);
+        }
+
+        let step = key.zoom.step();
+        let coord = TileCoord::new(i64::from(key.tx), i64::from(key.ty));
+        let Some(rect) = tile_rect(coord, step) else {
+            // The block bounds left the i32 space. Unreachable for any
+            // view the app schedules, but the key cannot name such a tile.
+            return Err(SourceError::OutOfBounds {
+                x: key.tx,
+                z: key.ty,
+            });
+        };
+
+        // Zeroed means transparent: the out-of-world margins must show the
+        // app's canvas rather than fabricated data.
+        let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+        if let Some((query, offset_x, offset_z)) = aligned_query(rect, self.world, step) {
+            let grid = self.source.biome_region(query, step)?;
+            let patch = render_biome_rgba(&grid, self.source.biome_catalog());
+            for y in 0..patch.height() {
+                for x in 0..patch.width() {
+                    canvas.put_pixel(offset_x + x, offset_z + y, *patch.get_pixel(x, y));
+                }
+            }
+        }
+
+        let tile = Tile::new(*key, TILE_SIZE, TILE_SIZE, canvas.as_raw().clone())
+            .expect("the canvas is TILE_SIZE square with a matching buffer");
+        Ok(tile)
+    }
+}
+
+/// The tile's in-world sub-rect, aligned to its sample grid: the query
+/// rect and the sample offset the resulting patch is blitted at.
+///
+/// Sample `i` covers blocks `tile.min_x + i * step` through
+/// `+ step - 1`, so the sub-rect starts at the first sample fully inside
+/// `world` and ends one past the last one fully inside — a tile
+/// straddling the edge asks the source only for blocks it can generate,
+/// while its samples still land on the columns the full tile would use.
+/// [`None`] when no sample is inside: the tile is fully transparent.
+///
+/// `world: None` means the source serves any rect, so the full tile is
+/// one query and no offset applies.
+#[must_use]
+fn aligned_query(tile: Rect, world: Option<Rect>, step: u32) -> Option<(Rect, u32, u32)> {
+    let Some(world) = world else {
+        return Some((tile, 0, 0));
+    };
+
+    let step_i = i64::from(step);
+    let tile_size = i64::from(TILE_SIZE);
+    // First sample whose block start reaches world.min_*: ceil of the
+    // block distance over the step.
+    let first_x =
+        ceil_div(i64::from(world.min_x) - i64::from(tile.min_x), step_i).clamp(0, tile_size);
+    let first_z =
+        ceil_div(i64::from(world.min_z) - i64::from(tile.min_z), step_i).clamp(0, tile_size);
+    // One past the last sample whose block end stays within world.max_*:
+    // floor of the inclusive span over the step.
+    let end_x =
+        floor_div(i64::from(world.max_x) - i64::from(tile.min_x) + 1, step_i).clamp(0, tile_size);
+    let end_z =
+        floor_div(i64::from(world.max_z) - i64::from(tile.min_z) + 1, step_i).clamp(0, tile_size);
+    let count_x = (end_x - first_x).max(0) as u32;
+    let count_z = (end_z - first_z).max(0) as u32;
+    if count_x == 0 || count_z == 0 {
+        return None;
+    }
+
+    // Clamped to `0..=TILE_SIZE` above, so the narrowings and the block
+    // multiplications below fit by construction (at most 256 * step).
+    let query = Rect::from_dims(
+        tile.min_x + (first_x as i32) * (step as i32),
+        tile.min_z + (first_z as i32) * (step as i32),
+        count_x * step,
+        count_z * step,
+    );
+    Some((query, first_x as u32, first_z as u32))
+}
+
+/// Ceiling division for a positive divisor: the smallest `quotient` with
+/// `quotient * divisor >= value`. The complement of [`floor_div`], valid
+/// across signs (`ceil_div(-5, 2) == -2`) — the sample-grid alignment
+/// needs it for tile origins left of the world.
+#[must_use]
+fn ceil_div(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0, "ceil_div needs a positive divisor");
+    (value + divisor - 1).div_euclid(divisor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::BiomeInfo;
     use crate::render::LayerRenderer;
+
+    use std::sync::atomic::AtomicBool;
+
+    use crate::catalog::{BlockCatalog, FluidCatalog, ZoneCatalog};
+    use crate::coords::ZoomLevel;
+    use crate::render::Layer;
+    use crate::scheduler::cancel_token;
+    use crate::types::{
+        GeneratorIdentity, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
+    };
 
     fn catalog_with(entries: &[(i32, u32)]) -> BiomeCatalog {
         let mut catalog = BiomeCatalog::default();
@@ -337,5 +488,403 @@ mod tests {
             .render(&grid)
             .expect("the biome layer is infallible");
         assert_eq!(via_trait, render_biome_rgba(&grid, &catalog));
+    }
+
+    // -- T16: the biome tile renderer --------------------------------------
+
+    /// The biome id the fake source reports at world `(x, z)`:
+    /// position-dependent over ids 0..=76, so a wrong query rect or blit
+    /// offset necessarily changes pixels.
+    fn fake_biome_id(x: i32, z: i32) -> i32 {
+        x.rem_euclid(7) + z.rem_euclid(11) * 7
+    }
+
+    /// A catalog registering every id [`fake_biome_id`] can produce, each
+    /// with a distinct map color (`r = g = b = id + 1` stays distinct
+    /// inside 24 bits for 77 ids).
+    fn fake_catalog() -> BiomeCatalog {
+        let mut catalog = BiomeCatalog::default();
+        for id in 0..=76 {
+            catalog
+                .insert(BiomeInfo {
+                    id: BiomeId(id),
+                    name: format!("fake biome {id}"),
+                    map_color: (id as u32 + 1) * 0x0001_0101,
+                })
+                .expect("the fake catalog's ids are unique");
+        }
+        catalog
+    }
+
+    fn test_identity() -> GeneratorIdentity {
+        GeneratorIdentity {
+            generator_version: 0,
+            world_assets: String::from("test"),
+            palette_version: 0,
+        }
+    }
+
+    fn zoom(level: u8) -> ZoomLevel {
+        ZoomLevel::new(level).expect("the tests use in-range zoom levels")
+    }
+
+    fn tile_key(tx: i32, ty: i32, zoom: ZoomLevel) -> TileKey {
+        TileKey {
+            identity_hash: test_identity().stable_hash(),
+            generator_seed: 1,
+            layer: Layer::Biome,
+            mode: 0,
+            zoom,
+            tx,
+            ty,
+        }
+    }
+
+    /// A source serving [`fake_biome_id`] over any rect and recording every
+    /// biome region query. Ungated on purpose: biome.rs's tests must run
+    /// without the `test-support` feature.
+    struct FakeBiomeSource {
+        identity: GeneratorIdentity,
+        seed: Seed,
+        biome_catalog: BiomeCatalog,
+        block_catalog: BlockCatalog,
+        fluid_catalog: FluidCatalog,
+        zone_catalog: ZoneCatalog,
+        queries: Arc<Mutex<Vec<(Rect, u32)>>>,
+    }
+
+    /// The failure every layer the biome tile renderer does not touch
+    /// returns.
+    fn unused() -> SourceError {
+        SourceError::Unsupported("not used by the biome tile renderer tests")
+    }
+
+    impl WorldSource for FakeBiomeSource {
+        fn identity(&self) -> &GeneratorIdentity {
+            &self.identity
+        }
+
+        fn seed(&self) -> &Seed {
+            &self.seed
+        }
+
+        fn biome_at(&self, _x: i32, _z: i32) -> SourceResult<BiomeId> {
+            Err(unused())
+        }
+
+        fn biome_region(&self, rect: Rect, step: u32) -> SourceResult<BiomeGrid> {
+            self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((rect, step));
+            let (width, height) = rect.sample_dims(step);
+            let mut values = Vec::with_capacity((width * height) as usize);
+            for row in 0..height {
+                for column in 0..width {
+                    let x = rect.min_x + (column * step) as i32;
+                    let z = rect.min_z + (row * step) as i32;
+                    values.push(BiomeId(fake_biome_id(x, z)));
+                }
+            }
+            Ok(BiomeGrid::new(
+                rect.min_x, rect.min_z, step, width, height, values,
+            ))
+        }
+
+        fn height_at(&self, _x: i32, _z: i32) -> SourceResult<i32> {
+            Err(unused())
+        }
+
+        fn height_region(&self, _rect: Rect, _step: u32) -> SourceResult<HeightGrid> {
+            Err(unused())
+        }
+
+        fn surface_at(&self, _x: i32, _z: i32) -> SourceResult<SurfaceSample> {
+            Err(unused())
+        }
+
+        fn surface_region(&self, _rect: Rect, _step: u32) -> SourceResult<SurfaceGrid> {
+            Err(unused())
+        }
+
+        fn slice_region(&self, _rect: Rect, _step: u32, _y: i32) -> SourceResult<SliceGrid> {
+            Err(unused())
+        }
+
+        fn spawn_points(&self) -> SourceResult<Vec<SpawnPoint>> {
+            Err(unused())
+        }
+
+        fn zone_at(&self, _x: i32, _z: i32) -> SourceResult<Option<ZoneId>> {
+            Err(unused())
+        }
+
+        fn biome_catalog(&self) -> &BiomeCatalog {
+            &self.biome_catalog
+        }
+
+        fn block_catalog(&self) -> &BlockCatalog {
+            &self.block_catalog
+        }
+
+        fn fluid_catalog(&self) -> &FluidCatalog {
+            &self.fluid_catalog
+        }
+
+        fn zone_catalog(&self) -> &ZoneCatalog {
+            &self.zone_catalog
+        }
+    }
+
+    struct Harness {
+        renderer: BiomeTileRenderer,
+        queries: Arc<Mutex<Vec<(Rect, u32)>>>,
+        catalog: BiomeCatalog,
+    }
+
+    fn test_harness(world: Option<Rect>) -> Harness {
+        let catalog = fake_catalog();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeBiomeSource {
+            identity: test_identity(),
+            seed: Seed::parse("1").expect("the test seed is numeric"),
+            biome_catalog: catalog.clone(),
+            block_catalog: BlockCatalog::default(),
+            fluid_catalog: FluidCatalog::default(),
+            zone_catalog: ZoneCatalog::default(),
+            queries: Arc::clone(&queries),
+        };
+        Harness {
+            renderer: BiomeTileRenderer::new(Arc::new(source), world),
+            queries,
+            catalog,
+        }
+    }
+
+    fn recorded_queries(queries: &Mutex<Vec<(Rect, u32)>>) -> Vec<(Rect, u32)> {
+        queries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Asserts tile pixel `(x, y)` shows the fake world sample at
+    /// `(world_x, world_z)`.
+    fn assert_pixel_shows_world(
+        tile: &Tile,
+        (x, y): (u32, u32),
+        (world_x, world_z): (i32, i32),
+        catalog: &BiomeCatalog,
+    ) {
+        let expected = biome_pixel(BiomeId(fake_biome_id(world_x, world_z)), catalog);
+        assert_eq!(
+            tile.pixel(x, y),
+            Some(expected.0),
+            "tile pixel ({x}, {y}) must show the biome at world ({world_x}, {world_z})",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_renders_the_full_tile_inside_the_world() {
+        let harness = test_harness(None);
+        let key = tile_key(0, 0, zoom(0));
+        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
+            .expect("an unbounded source renders every tile");
+
+        assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
+        // Tile (0, 0) at step 1 starts at block (0, 0): tile pixel (x, y)
+        // is world block (x, y).
+        for (x, y) in [
+            (0, 0),
+            (255, 0),
+            (0, 255),
+            (255, 255),
+            (128, 128),
+            (7, 11),
+            (42, 200),
+        ] {
+            assert_pixel_shows_world(&tile, (x, y), (x as i32, y as i32), &harness.catalog);
+        }
+        assert!(
+            tile.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255),
+            "every sample of an in-world tile is opaque",
+        );
+        assert_eq!(
+            recorded_queries(&harness.queries).len(),
+            1,
+            "one tile is one region query",
+        );
+
+        // A world that covers the tile is no different from an unbounded
+        // source: the full tile is one query and the pixels match.
+        let bounded = test_harness(Some(Rect::new(-1_000, -1_000, 1_000, 1_000)));
+        let covered = TileRenderer::render(&bounded.renderer, &key, &cancel_token())
+            .expect("a world covering the tile renders it fully");
+        let origin = tile_rect(TileCoord::new(0, 0), 1).expect("tile (0, 0) fits the i32 space");
+        assert_eq!(
+            recorded_queries(&bounded.queries),
+            vec![(origin, 1)],
+            "the whole tile lies inside the world",
+        );
+        assert_eq!(
+            covered.rgba, tile.rgba,
+            "the covered tile matches the unbounded render",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_leaves_transparent_margins_outside_the_world() {
+        let world = Rect::from_dims(64, 64, 128, 128);
+        let harness = test_harness(Some(world));
+        let key = tile_key(0, 0, zoom(0));
+        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
+            .expect("a partially in-world tile renders");
+
+        for (x, y) in [(0, 0), (63, 200), (200, 63), (192, 192), (255, 255)] {
+            assert_eq!(
+                tile.pixel(x, y).expect("the test pixels are in bounds"),
+                [0, 0, 0, 0],
+                "tile pixel ({x}, {y}) is outside the world and stays transparent",
+            );
+        }
+        // The patch starts at sample (64, 64), which is world block (64, 64).
+        assert_pixel_shows_world(&tile, (64, 64), (64, 64), &harness.catalog);
+        assert_pixel_shows_world(&tile, (70, 90), (70, 90), &harness.catalog);
+        assert_pixel_shows_world(&tile, (191, 191), (191, 191), &harness.catalog);
+
+        assert_eq!(
+            recorded_queries(&harness.queries),
+            vec![(Rect::new(64, 64, 191, 191), 1)],
+            "exactly the in-world sub-rect is queried, at the tile's step",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_aligns_queries_to_the_sample_grid() {
+        let world = Rect::new(65, 65, 254, 254);
+        let harness = test_harness(Some(world));
+        let key = tile_key(0, 0, zoom(1));
+        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
+            .expect("a step-2 tile inside the world renders");
+
+        // Sample 33 starts at block 0 + 33 * 2 = 66 (the first start >= 65);
+        // the last fully inside ends at 253, so 94 samples (188 blocks).
+        assert_eq!(
+            recorded_queries(&harness.queries),
+            vec![(Rect::new(66, 66, 253, 253), 2)],
+            "the query starts on the sample grid, not at world.min",
+        );
+        assert_eq!(
+            Rect::new(66, 66, 253, 253),
+            Rect::from_dims(66, 66, 188, 188),
+            "94 samples of 2 blocks",
+        );
+
+        assert_pixel_shows_world(&tile, (33, 33), (66, 66), &harness.catalog);
+        assert_pixel_shows_world(&tile, (126, 126), (252, 252), &harness.catalog);
+        // Sample 32 covers blocks 64..=65 and sample 127 covers 254..=255:
+        // neither lies wholly inside the world, so both stay transparent.
+        for (x, y) in [(32, 32), (127, 127)] {
+            assert_eq!(
+                tile.pixel(x, y).expect("the test pixels are in bounds")[3],
+                0,
+                "tile pixel ({x}, {y}) is a partially in-world sample and stays transparent",
+            );
+        }
+
+        // The grid-alignment anchors on the untrimmed tile rect: an edge at
+        // origin + 5 starts at sample 3 (ceil(5 / 2)), one at origin + 9
+        // ends at sample 5 (floor(10 / 2), exclusive); a world covering the
+        // tile yields the full-tile query.
+        let origin = tile_rect(TileCoord::new(0, 0), 2).expect("tile (0, 0) fits the i32 space");
+        assert_eq!(
+            aligned_query(origin, Some(Rect::new(5, 0, 9, 511)), 2),
+            Some((Rect::new(6, 0, 9, 511), 3, 0)),
+            "ceil(5 / 2) = 3 keeps the query on the sample grid",
+        );
+        assert_eq!(
+            aligned_query(origin, Some(origin), 2),
+            Some((origin, 0, 0)),
+            "a world covering the tile queries the whole tile",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_renders_a_transparent_tile_fully_outside_the_world() {
+        let harness = test_harness(Some(Rect::from_dims(10_000, 10_000, 32, 32)));
+        let key = tile_key(0, 0, zoom(0));
+        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
+            .expect("a fully out-of-world tile still renders");
+
+        assert!(
+            tile.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 0),
+            "every pixel of a fully out-of-world tile is transparent",
+        );
+        assert!(
+            recorded_queries(&harness.queries).is_empty(),
+            "no region query is issued for a tile with no in-world samples",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_honors_the_cancel_token_before_the_query() {
+        let harness = test_harness(None);
+        let key = tile_key(0, 0, zoom(0));
+
+        let cancelled: CancelToken = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            TileRenderer::render(&harness.renderer, &key, &cancelled),
+            Err(SourceError::Cancelled),
+            "a cancelled tile never begins its work unit",
+        );
+        assert!(
+            recorded_queries(&harness.queries).is_empty(),
+            "the cancel check comes before the region query",
+        );
+
+        assert!(
+            TileRenderer::render(&harness.renderer, &key, &cancel_token()).is_ok(),
+            "an uncancelled tile renders normally",
+        );
+        assert_eq!(
+            recorded_queries(&harness.queries).len(),
+            1,
+            "the uncancelled render issues its one query",
+        );
+    }
+
+    #[test]
+    fn biome_tile_renderer_keeps_tile_dimensions_at_coarser_steps() {
+        let harness = test_harness(None);
+        let key = tile_key(2, -3, zoom(2));
+        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
+            .expect("a coarser tile renders");
+
+        assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
+        let rect = tile_rect(TileCoord::new(2, -3), 4).expect("the tile fits the i32 block space");
+        assert_eq!(rect.width(), 4 * TILE_SIZE, "step 4 spans 1024 blocks");
+        assert_eq!(
+            recorded_queries(&harness.queries),
+            vec![(rect, 4)],
+            "the query is the tile's full floor-aligned block rect",
+        );
+
+        // Sample (0, 0) is the tile's floor-aligned origin; sample (255,
+        // 255) is the last column before its max bound.
+        assert_pixel_shows_world(&tile, (0, 0), (rect.min_x, rect.min_z), &harness.catalog);
+        assert_pixel_shows_world(
+            &tile,
+            (255, 255),
+            (rect.min_x + 255 * 4, rect.min_z + 255 * 4),
+            &harness.catalog,
+        );
     }
 }

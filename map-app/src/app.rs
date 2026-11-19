@@ -1,28 +1,32 @@
-//! The egui skin over the headless [`crate::state`] (T12).
+//! The egui skin over the headless [`crate::state`] (T12), with the
+//! interactive map of T16.
 //!
-//! Everything testable lives in `state.rs`; this module is layout and
-//! wiring only: the plan's three regions (top bar, left panel, central
-//! map), the status bar, keyboard shortcuts and the background source
-//! load. No worldgen work ever happens on the UI thread — loads run on
-//! a spawned thread and results arrive through a channel polled with
-//! `try_recv` (plus a `request_repaint_after` nudge so the UI stays idle
-//! otherwise).
+//! Everything testable lives in `state.rs` and `view_state.rs`; the map
+//! widget (input, tiles, painting) lives in `map_view.rs`. This module
+//! is layout and wiring only: the plan's three regions (top bar, left
+//! panel, central map), the status bar, keyboard shortcuts and the
+//! background source load. No worldgen work ever happens on the UI
+//! thread — loads run on a spawned thread and results arrive through a
+//! channel polled with `try_recv` (plus a `request_repaint_after` nudge
+//! so the UI stays idle otherwise).
+//!
+//! Heavy objects never drop on the UI thread, ever: sources join
+//! generator pools when dropped, and retired tile pipelines (T16) join
+//! their scheduler workers. Both retire through lists the app drains
+//! each frame and drops on detached background threads.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use eframe::egui;
-use egui::{
-    Align2, Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Vec2,
-};
+use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Vec2};
 
-use map_core::render::render_biome_rgba;
 use map_core::source::WorldSource;
 use map_core::source::worldgen::default_world_path;
 
 use crate::labels;
+use crate::map_view::MapView;
 use crate::state::{self, AppLayer, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS};
-use crate::texture::{MapTexture, texture_screen_rect};
 
 /// How often to wake the UI while a background load is in flight.
 const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -32,9 +36,7 @@ pub struct SeedExplorerApp {
     state: AppState,
     /// Result channel of the single in-flight load, when there is one.
     load_rx: Option<Receiver<LoadResult>>,
-    /// Result channel of the single in-flight texture grid request.
-    grid_rx: Option<Receiver<state::GridResult>>,
-    /// The central map area (a placeholder until T16).
+    /// The central map widget (T16): input, tile pipeline, painting.
     map: MapView,
 }
 
@@ -52,8 +54,7 @@ impl SeedExplorerApp {
         SeedExplorerApp {
             state,
             load_rx: None,
-            grid_rx: None,
-            map: MapView::default(),
+            map: MapView::new(),
         }
     }
 
@@ -63,45 +64,37 @@ impl SeedExplorerApp {
         // first, the left panel its column, and the central panel fills
         // the remainder.
         self.poll_load_channel(ctx);
-        self.poll_grid_channel(ctx);
         self.keyboard_shortcuts(ctx);
-
-        // Once a source is ready, request the biome grid for the view
-        // (off-thread) and upload whatever has arrived.
-        self.maybe_request_texture();
-        self.upload_due_texture(ctx);
-
-        // An invalidated source must not leave its map on screen.
-        if *self.state.map_texture() == state::MapTexture::Empty {
-            self.map.clear_texture();
-        }
 
         self.status_bar(ctx);
         self.top_bar(ctx);
         self.error_banner(ctx);
         self.left_panel(ctx);
 
-        // `flash_search` is consumed before the panel reads it — F
-        // highlights the search section for one frame.
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 16, 20)))
+            .frame(egui::Frame::new().fill(Color32::from_rgb(16, 16, 20)))
             .show(ctx, |ui| {
-                self.map.ui(ui, &self.state);
+                self.map.ui(ui, &mut self.state);
             });
 
         if self.state.show_go_to() {
             self.go_to_dialog(ctx);
         }
 
-        // Heavy sources never drop here: hand them to a detached thread.
-        // Cancel first so any in-flight region bands bail at their next
-        // row boundary instead of being waited out by the pool's join.
+        // Heavy objects never drop here: displaced sources and retired
+        // tile pipelines go to detached threads. Cancel the sources
+        // first so any in-flight region bails at its next row boundary
+        // instead of being waited out by the pool's join.
         let retired = self.state.take_retired_sources();
         if !retired.is_empty() {
             for source in &retired {
                 source.cancel_pending();
             }
             std::thread::spawn(move || drop(retired));
+        }
+        let pipelines = self.map.take_retired_pipelines();
+        if !pipelines.is_empty() {
+            std::thread::spawn(move || drop(pipelines));
         }
     }
 
@@ -144,79 +137,13 @@ impl SeedExplorerApp {
         }
     }
 
-    // -- Map texture (T13) ----------------------------------------------
-
-    /// Polls the texture-grid channel: same pattern as the load channel,
-    /// one result per request, stale results dropped by the state.
-    fn poll_grid_channel(&mut self, ctx: &Context) {
-        let Some(receiver) = self.grid_rx.as_ref() else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok((rect, step, result)) => {
-                self.state.apply_grid_result(rect, step, result);
-                self.grid_rx = None;
-            }
-            Err(TryRecvError::Empty) => {
-                ctx.request_repaint_after(LOAD_POLL_INTERVAL);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.grid_rx = None;
-                if self.state.is_texture_pending() {
-                    self.state.grid_worker_died();
-                }
-            }
-        }
-    }
-
-    /// Requests the biome grid for the current view, once a source is
-    /// ready and no request is in flight. The generation happens on a
-    /// spawned thread — `update` never touches the generator.
-    fn maybe_request_texture(&mut self) {
-        if self.state.source().is_none() || self.grid_rx.is_some() {
-            return;
-        }
-        let screen = self.map.screen();
-        let step = self.state.resolution_step();
-        let Some(rect) =
-            state::view_texture_rect(self.state.center(), self.state.scale(), step, screen)
-        else {
-            return;
-        };
-        if !self.state.request_view_texture(rect, step) {
-            return;
-        }
-        let Some(source) = self.state.source_arc() else {
-            return;
-        };
-        let (sender, receiver) = std::sync::mpsc::channel::<state::GridResult>();
-        self.grid_rx = Some(receiver);
-        std::thread::spawn(move || {
-            let result = source.biome_region(rect, step);
-            let _ = sender.send((rect, step, result));
-        });
-    }
-
-    /// Uploads an arrived grid as the map texture (the one egui-side
-    /// copy; the upload itself is a GPU memcpy, safe on the UI thread).
-    fn upload_due_texture(&mut self, ctx: &Context) {
-        let Some((grid, rect, step)) = self.state.grid_to_upload() else {
-            return;
-        };
-        let catalog = self
-            .state
-            .source()
-            .expect("an arrived grid implies a loaded source")
-            .biome_catalog();
-        let image = render_biome_rgba(grid, catalog);
-        self.map.texture = Some(MapTexture::upload(ctx, &image, rect, step));
-        self.state.mark_uploaded();
-    }
-
     // -- Keyboard -------------------------------------------------------------
 
     /// Global shortcuts, none of which may steal keys from a focused text
-    /// field: `G` go-to, `F` search focus, `Ctrl+S` export placeholder.
+    /// field: `G` go-to, `F` search focus, `Ctrl+S` export placeholder,
+    /// and T16's zoom keys — `+`/`=` zoom in, `-` zoom out, one level per
+    /// press anchored on the viewport center (the wheel owns the cursor
+    /// anchor).
     ///
     /// `consume_shortcut` both checks and consumes the press, so the same
     /// key never leaks into the frame's other handling; `COMMAND` is the
@@ -236,6 +163,12 @@ impl SeedExplorerApp {
         }
         if ctx.input_mut(|input| input.consume_shortcut(&export)) {
             self.state.export_placeholder();
+        }
+        if ctx.input_mut(|input| input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals)) {
+            self.state.view_mut().zoom_at_center(-1.0);
+        }
+        if ctx.input_mut(|input| input.key_pressed(Key::Minus)) {
+            self.state.view_mut().zoom_at_center(1.0);
         }
     }
 
@@ -427,13 +360,19 @@ impl SeedExplorerApp {
             });
     }
 
-    /// The plan's bottom bar; pure formatting lives in [`state::format_status`].
+    /// The plan's bottom bar; pure formatting lives in
+    /// [`state::format_status`].
     fn status_bar(&mut self, ctx: &Context) {
+        // The pending count is the last frame's: panels draw before the
+        // map serves this frame's tiles, and egui keeps repainting while
+        // tiles are pending anyway, so the count is at worst one frame
+        // behind and never stuck.
+        let pending = u32::try_from(self.map.pending_tiles()).unwrap_or(u32::MAX);
         let mut line = state::format_status(
             self.state.cursor(),
             None,
-            0,
-            self.state.scale(),
+            pending,
+            self.state.view().scale(),
             self.state.resolution_step(),
             self.state.source_status_text(),
         );
@@ -457,180 +396,27 @@ impl eframe::App for SeedExplorerApp {
 
 impl Drop for SeedExplorerApp {
     fn drop(&mut self) {
-        // Move the heavy source off the UI thread on the way out too:
-        // dropping it joins the generator worker pool, which can block
-        // while a worker finishes a generation.
+        // Move everything heavy off the UI thread on the way out too:
+        // sources join generator pools, tile pipelines join their
+        // scheduler workers, and both can block while a worker finishes.
         self.state.invalidate_source();
         let retired = self.state.take_retired_sources();
-        if !retired.is_empty() {
-            for source in &retired {
-                source.cancel_pending();
-            }
-            // Detached on purpose: at app exit, joining would only delay
-            // the close; the OS reclaims the threads with the process.
-            std::thread::spawn(move || drop(retired));
+        for source in &retired {
+            source.cancel_pending();
         }
-    }
-}
-
-/// The central map area. With a source loaded it paints the biome
-/// texture (T13); otherwise the T12 placeholder (dark canvas, block
-/// grid, view readout). T16 replaces the single texture with pan/zoom
-/// tiles, keeping this struct as the widget.
-pub struct MapView {
-    /// Screen size of the last painted frame, for the request math.
-    screen: Vec2,
-    /// The uploaded biome texture and the world it covers.
-    texture: Option<MapTexture>,
-}
-
-impl Default for MapView {
-    fn default() -> Self {
-        MapView {
-            screen: Vec2::ZERO,
-            texture: None,
-        }
-    }
-}
-
-impl MapView {
-    /// The last painted screen size, as plain floats for
-    /// [`state::view_texture_rect`].
-    fn screen(&self) -> (f32, f32) {
-        (self.screen.x, self.screen.y)
-    }
-
-    /// Drops the texture (an invalidated source's map must not linger).
-    fn clear_texture(&mut self) {
-        self.texture = None;
-    }
-
-    /// Draws one frame of the map.
-    fn ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
-        let rect = ui.max_rect();
-        self.screen = rect.size();
-
-        let painter = ui.painter().clone();
-        // Dark map background (also the letterbox around the texture).
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 16, 20));
-
-        if let Some(texture) = &self.texture {
-            // The real map: the texture covers its world rect, mapped
-            // through the view (center, scale) into this area. UV is the
-            // full texture; the orientation contract (north/row 0 at
-            // image top) makes the mapping a pure translation+scale.
-            let screen_rect =
-                texture_screen_rect(texture, app_state.center(), app_state.scale(), rect);
-            painter.image(
-                texture.id(),
-                screen_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            self.placeholder(ui, &painter, rect, app_state);
-        }
-
-        // A spinner while a grid for the current view is generating.
-        if app_state.is_texture_pending() {
-            let spinner_rect = egui::Rect::from_center_size(
-                rect.center_top() + Vec2::new(0.0, 40.0),
-                Vec2::splat(28.0),
-            );
-            ui.put(spinner_rect, egui::Spinner::new());
-        }
-    }
-
-    /// The no-texture state: grid canvas, status text, view readout.
-    fn placeholder(
-        &mut self,
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        app_state: &AppState,
-    ) {
-        // A faint block grid, 64 points per cell, so the area reads as a
-        // map canvas and not a label.
-        let cell = 64.0;
-        let stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(36, 36, 44));
-        let first_vertical = (rect.left() / cell).ceil() * cell;
-        let mut x = first_vertical;
-        while x < rect.right() {
-            painter.vline(x, rect.y_range(), stroke);
-            x += cell;
-        }
-        let first_horizontal = (rect.top() / cell).ceil() * cell;
-        let mut y = first_horizontal;
-        while y < rect.bottom() {
-            painter.hline(rect.x_range(), y, stroke);
-            y += cell;
-        }
-
-        // The state readout in the middle of the map.
-        let message = match app_state.source_error() {
-            Some(error) => format!("{} {error}", labels::MAP_PLACEHOLDER_ERROR_PREFIX),
-            None if app_state.is_texture_pending() => labels::MAP_PLACEHOLDER_RENDERING.to_string(),
-            None if app_state.is_loading() => labels::MAP_PLACEHOLDER_LOADING.to_string(),
-            None if app_state.source().is_some() => labels::STATUS_SOURCE_READY.to_string(),
-            None => labels::MAP_PLACEHOLDER_NO_SOURCE.to_string(),
-        };
-        let message_color = if app_state.source_error().is_some() {
-            Color32::from_rgb(230, 120, 120)
-        } else {
-            Color32::from_rgb(200, 200, 210)
-        };
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            message,
-            TextStyle::Body.resolve(ui.style()),
-            message_color,
-        );
-
-        // The view readout: current center and zoom, from T10's state.
-        let (center_x, center_z) = app_state.center();
-        let view_text = format!(
-            "{}: ({center_x:.0}, {center_z:.0}) @ {:.1} pt/blk",
-            labels::MAP_PLACEHOLDER_VIEW,
-            app_state.scale(),
-        );
-        painter.text(
-            rect.center_bottom() - Vec2::new(0.0, 16.0),
-            Align2::CENTER_BOTTOM,
-            view_text,
-            TextStyle::Small.resolve(ui.style()),
-            Color32::from_rgb(120, 120, 130),
-        );
-
-        // A spinner while the world itself is loading.
-        if app_state.is_loading() {
-            let spinner_rect = egui::Rect::from_center_size(
-                rect.center_top() + Vec2::new(0.0, 40.0),
-                Vec2::splat(28.0),
-            );
-            ui.put(spinner_rect, egui::Spinner::new());
-        }
+        let pipelines = self.map.take_all_pipelines();
+        // Detached on purpose: at app exit, joining would only delay the
+        // close; the OS reclaims the threads with the process.
+        std::thread::spawn(move || {
+            drop(retired);
+            drop(pipelines);
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-
     use super::*;
-    use map_core::render::render_biome_rgba;
-    use map_core::types::Rect;
-
-    /// The worldgen checkout this repository's sibling ships for tests.
-    fn world_dir() -> Option<PathBuf> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../hytale-server-rust/testdata/Default");
-        // The committed world's prefab references need the user-supplied
-        // asset pack; without it the generator cannot load (CI has none).
-        let assets = dir.join("../../Assets/extracted");
-        (dir.is_dir() && assets.is_dir()).then_some(dir)
-    }
 
     /// The smoke test the task asks for: the shell constructs its
     /// headless parts without a window or a `CreationContext`.
@@ -642,7 +428,11 @@ mod tests {
         assert!(app.load_rx.is_none(), "no load was spawned");
         assert_eq!(app.state.resolution_step(), 2, "the 2x2 default");
         assert_eq!(app.state.layer(), AppLayer::Biomes);
-        assert_eq!(app.map.screen, Vec2::ZERO);
+        assert_eq!(app.map.pending_tiles(), 0, "no tiles pending");
+        // The interactive view starts at the plan's initial view: the
+        // origin at one point per block.
+        assert_eq!(app.state.view().center().x, 0.0);
+        assert_eq!(app.state.view().scale(), 1.0);
         // The version readout falls back to map-core's pinned version
         // before any source is ready.
         assert_eq!(
@@ -655,7 +445,7 @@ mod tests {
                 app.state.cursor(),
                 None,
                 0,
-                app.state.scale(),
+                app.state.view().scale(),
                 app.state.resolution_step(),
                 app.state.source_status_text(),
             )
@@ -681,95 +471,5 @@ mod tests {
         let result = map_core::source::worldgen::WorldgenSource::new(&config);
         assert!(app.state.apply_load_result(generation, result));
         assert!(app.state.source_error().is_some(), "the bad path failed");
-    }
-
-    /// The full T13 acceptance flow, headless against the real
-    /// generator: load a source, request the view's biome grid, render
-    /// and convert it — the exact sequence `update` drives (only the GPU
-    /// blit itself needs a window). A biome-colored map must come out:
-    /// many colors, none of them the placeholder background.
-    #[test]
-    fn the_full_biome_texture_pipeline_produces_a_colored_map() {
-        let Some(world) = world_dir() else {
-            eprintln!("skipping: the worldgen checkout is not present");
-            return;
-        };
-        let mut app = SeedExplorerApp::with_state(AppState::new(&world));
-
-        // Go with a valid seed: the load succeeds.
-        app.state.set_seed_text(String::from("12345"));
-        let request = app.state.begin_load().expect("the load issues");
-        let source = map_core::source::worldgen::WorldgenSource::new(&request.config())
-            .expect("the golden world loads");
-        assert!(app.state.apply_load_result(request.generation, Ok(source)));
-        assert!(app.state.source().is_some(), "ready");
-
-        // The plan's static view: a 1280x800 map area at scale 1, the
-        // default 2x2 resolution — exactly 640x400 capped samples over
-        // 1280x800 blocks.
-        let rect =
-            state::view_texture_rect(app.state.center(), app.state.scale(), 2, (1280.0, 800.0))
-                .expect("the view resolves");
-        assert_eq!(rect, Rect::new(-640, -400, 639, 399));
-        assert!(
-            app.state.request_view_texture(rect, 2),
-            "the first view request issues"
-        );
-
-        // The worker: the real region query, like maybe_request_texture's
-        // spawned thread performs it.
-        let grid = app
-            .state
-            .source()
-            .expect("ready")
-            .biome_region(rect, 2)
-            .expect("the view region serves");
-        assert_eq!((grid.width, grid.height), (640, 400));
-        assert!(
-            app.state.apply_grid_result(rect, 2, Ok(grid)),
-            "the current view's result applies"
-        );
-
-        // The upload path: render + convert (upload_due_texture's body).
-        let (grid, uploaded_rect, uploaded_step) = app
-            .state
-            .grid_to_upload()
-            .expect("the arrived grid waits for upload");
-        let catalog = app.state.source().expect("ready").biome_catalog();
-        let image = render_biome_rgba(grid, catalog);
-        app.state.mark_uploaded();
-        assert!(matches!(
-            app.state.map_texture(),
-            state::MapTexture::Current { .. }
-        ));
-        assert_eq!((uploaded_rect, uploaded_step), (rect, 2));
-
-        // The acceptance: a biome-colored map, not a placeholder. Many
-        // distinct colors, none of them the map background, and no
-        // unknown-biome magenta (the catalog covers the world).
-        let color_image = crate::texture::to_color_image(&image);
-        assert_eq!(color_image.size, [640, 400]);
-        let colors: HashSet<[u8; 3]> = color_image
-            .pixels
-            .iter()
-            .map(|c| [c.r(), c.g(), c.b()])
-            .collect();
-        assert!(
-            colors.len() > 1,
-            "the map shows multiple biome colors, got {}",
-            colors.len()
-        );
-        assert!(
-            !colors.contains(&[16, 16, 20]),
-            "no placeholder background leaks into the map"
-        );
-        assert!(
-            !colors.contains(&[255, 0, 255]),
-            "no unknown-biome magenta in a catalog-covered world"
-        );
-
-        // Invalidate on edit: the map dies with its seed.
-        app.state.set_seed_text(String::from("77"));
-        assert_eq!(app.state.map_texture(), &state::MapTexture::Empty);
     }
 }

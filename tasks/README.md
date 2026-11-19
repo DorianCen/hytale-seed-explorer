@@ -25,7 +25,7 @@ it owns, and the acceptance gate.
 | [T13](T13-biome-layer.md) | Biome layer and palette | 2 | T08, T10, T11 | done |
 | [T14](T14-tile-cache.md) | Tile keys, cache and eviction | 3 | T07, T10 | done |
 | [T15](T15-tile-scheduler.md) | Tile scheduler, workers and cancellation | 3 | T09, T10, T14 | done |
-| [T16](T16-pan-zoom-viewport.md) | Pan, zoom and viewport rendering | 3 | T12, T13, T14, T15 | proposed |
+| [T16](T16-pan-zoom-viewport.md) | Pan, zoom and viewport rendering | 3 | T12, T13, T14, T15 | done |
 | [T17](T17-height-relief-fluid-layers.md) | Height, relief and fluid layers | 4 | T09, T15 | proposed |
 | [T18](T18-inspector-resolution.md) | Inspector readout and resolution selector | 4 | T09, T12, T16 | proposed |
 | [T19](T19-layer-compositing-debug.md) | Layer compositing and debug layers | 4 | T13, T17, T18 | proposed |

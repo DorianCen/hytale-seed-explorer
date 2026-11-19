@@ -26,9 +26,10 @@ use std::sync::Arc;
 
 use map_core::error::SourceResult;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
-use map_core::types::{BiomeGrid, Rect, Seed, SeedError};
+use map_core::types::{Seed, SeedError};
 
 use crate::labels;
+use crate::view_state::MapViewState;
 
 /// The resolution steps the top-bar selector offers (blocks per sample).
 /// The plan's default is 2×2.
@@ -165,93 +166,6 @@ impl std::fmt::Debug for SourceState {
     }
 }
 
-/// The map texture lifecycle (T13). The egui `TextureHandle` lives in the
-/// app (`texture.rs`); this tracks the *data*: what region is being
-/// generated, what has arrived, and what the uploaded texture covers.
-///
-/// A request is issued for exactly one `(rect, step)`; results for
-/// anything else (a newer request, an invalidated source) are dropped.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MapTexture {
-    /// Nothing to show: no source, a failed request, or an invalidated
-    /// view.
-    Empty,
-    /// A biome grid is being generated off the UI thread.
-    Pending { rect: Rect, step: u32 },
-    /// The grid arrived; the app must convert and upload it.
-    ToUpload {
-        grid: BiomeGrid,
-        rect: Rect,
-        step: u32,
-    },
-    /// Current: the uploaded texture covers exactly `rect` at `step`.
-    /// The grid stays for pixel lookups (hover, T18).
-    Current {
-        grid: BiomeGrid,
-        rect: Rect,
-        step: u32,
-    },
-}
-
-/// What a background texture request delivers back to the UI thread:
-/// `(rect, step, result)` — the request's identity travels with the
-/// grid so stale results are recognizable.
-pub type GridResult = (Rect, u32, SourceResult<BiomeGrid>);
-
-/// One texture covers the whole viewport until the tile pipeline (T15
-/// scheduling, T16 painting) replaces this single-texture flow: cap the
-/// request at this many samples per axis. The plan's risk note —
-/// 640×400 samples is acceptable for a first texture, not for repeated
-/// panning.
-pub const MAX_TEXTURE_SAMPLES: u32 = 640;
-
-/// The world rect a map area of `screen` points covers at `center` /
-/// `scale`, sampled at `step`, capped to [`MAX_TEXTURE_SAMPLES`] per
-/// axis and aligned so the center stays centered.
-///
-/// [`None`] when the center or the covered blocks fall outside the `i32`
-/// block space (the app simply does not request such a view).
-#[must_use]
-pub fn view_texture_rect(
-    center: (f64, f64),
-    scale: f64,
-    step: u32,
-    screen: (f32, f32),
-) -> Option<Rect> {
-    // Samples per axis: ceil(points / (scale * step)), at least one,
-    // never above the cap.
-    let samples = |points: f32| -> u32 {
-        let raw = (f64::from(points) / (scale * f64::from(step))).ceil();
-        let clamped = raw.clamp(1.0, f64::from(MAX_TEXTURE_SAMPLES));
-        clamped as u32
-    };
-    let blocks_x = i64::from(samples(screen.0)) * i64::from(step);
-    let blocks_z = i64::from(samples(screen.1)) * i64::from(step);
-
-    // Centered: the rect spans exactly blocks_* per side, origin rounded
-    // so the view center stays the middle sample-wise.
-    let origin = |center: f64, blocks: i64| -> Option<i32> {
-        if !center.is_finite() {
-            return None;
-        }
-        let value = (center - blocks as f64 / 2.0).round();
-        if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
-            return None;
-        }
-        // Bounds-checked above; the cast of an in-range integral f64 is exact.
-        Some(value as i32)
-    };
-    let min_x = origin(center.0, blocks_x)?;
-    let min_z = origin(center.1, blocks_z)?;
-    let max_x = i64::from(min_x)
-        .checked_add(blocks_x - 1)
-        .and_then(|value| i32::try_from(value).ok())?;
-    let max_z = i64::from(min_z)
-        .checked_add(blocks_z - 1)
-        .and_then(|value| i32::try_from(value).ok())?;
-    Some(Rect::new(min_x, min_z, max_x, max_z))
-}
-
 /// The state behind the egui shell.
 ///
 /// Invariants:
@@ -283,10 +197,10 @@ pub struct AppState {
     /// default is 2.
     resolution_step: u32,
 
-    /// View state (T10 vocabulary): world position at the map center and
-    /// the display scale in points per block. T16 drives these.
-    center: (f64, f64),
-    scale: f64,
+    /// The interactive view (T16's pan/zoom state): the world position
+    /// at the map center, the continuous wheel zoom, the viewport size.
+    /// The map widget drives it; everything else reads it.
+    view: MapViewState,
 
     /// The active layer radio and overlay checkboxes (placeholders).
     layer: AppLayer,
@@ -307,9 +221,6 @@ pub struct AppState {
     /// pool joins on *that* thread when the last ref drops — never the
     /// UI thread.
     retired: Vec<Arc<WorldgenSource>>,
-
-    /// The map texture lifecycle (T13).
-    map_texture: MapTexture,
 }
 
 impl Default for AppState {
@@ -324,8 +235,7 @@ impl Default for AppState {
             world_path: PathBuf::new(),
             workers: None,
             resolution_step: 2,
-            center: (0.0, 0.0),
-            scale: 1.0,
+            view: MapViewState::new(),
             layer: AppLayer::Biomes,
             overlays: OverlaySettings::default(),
             cursor: None,
@@ -333,7 +243,6 @@ impl Default for AppState {
             show_go_to: false,
             search_focused: false,
             retired: Vec::new(),
-            map_texture: MapTexture::Empty,
         }
     }
 }
@@ -347,8 +256,6 @@ impl AppState {
             world_path: world_path.into(),
             // The plan's default resolution is 2×2.
             resolution_step: 2,
-            center: (0.0, 0.0),
-            scale: 1.0,
             layer: AppLayer::Biomes,
             ..AppState::default()
         }
@@ -512,15 +419,14 @@ impl AppState {
     /// will be rejected as stale), and an error banner is cleared.
     ///
     /// The transient status line is cleared too: a "ready <seed>" message
-    /// must not outlive the source it announced. The map texture also
-    /// resets — an uploaded image of a dead seed must never stay on
-    /// screen.
+    /// must not outlive the source it announced. The map widget (T16)
+    /// retires its tile pipeline and textures in the same situation —
+    /// a dead seed's tiles must never stay on screen.
     pub fn invalidate_source(&mut self) {
         self.retire_ready_source();
         self.source = SourceState::Idle;
         self.loaded_seed_input = None;
         self.status.clear();
-        self.map_texture = MapTexture::Empty;
     }
 
     /// True while a load is in flight (drives the Go button and spinner).
@@ -585,126 +491,19 @@ impl AppState {
         }
     }
 
-    // -- Map texture (T13) -----------------------------------------------------
-
-    /// The current texture lifecycle phase.
-    #[must_use]
-    pub fn map_texture(&self) -> &MapTexture {
-        &self.map_texture
-    }
-
-    /// True while a texture request is in flight.
-    #[must_use]
-    pub fn is_texture_pending(&self) -> bool {
-        matches!(self.map_texture, MapTexture::Pending { .. })
-    }
-
-    /// Issues a texture request for `(rect, step)` unless the same pair
-    /// is already pending, arrived or current. True means a new request
-    /// was issued and the caller should spawn the worker thread.
-    ///
-    /// A different rect/step replaces a pending or arrived request — the
-    /// newest view wins, exactly like the load-generation guard.
-    pub fn request_view_texture(&mut self, rect: Rect, step: u32) -> bool {
-        match &self.map_texture {
-            MapTexture::Pending { rect: r, step: s } if *r == rect && *s == step => return false,
-            MapTexture::ToUpload {
-                rect: r, step: s, ..
-            } if *r == rect && *s == step => {
-                return false;
-            }
-            MapTexture::Current {
-                rect: r, step: s, ..
-            } if *r == rect && *s == step => {
-                return false;
-            }
-            _ => {}
-        }
-        self.map_texture = MapTexture::Pending { rect, step };
-        true
-    }
-
-    /// Applies a background request's result; true when it was accepted.
-    ///
-    /// Only the still-pending `(rect, step)` applies; anything else — a
-    /// newer view, an invalidated source — drops the grid on the spot.
-    /// A failure resets the phase to [`MapTexture::Empty`] and reports
-    /// itself through the transient status line.
-    pub fn apply_grid_result(
-        &mut self,
-        rect: Rect,
-        step: u32,
-        result: SourceResult<BiomeGrid>,
-    ) -> bool {
-        if !matches!(
-            &self.map_texture,
-            MapTexture::Pending { rect: r, step: s } if *r == rect && *s == step
-        ) {
-            return false;
-        }
-        match result {
-            Ok(grid) => {
-                self.map_texture = MapTexture::ToUpload { grid, rect, step };
-            }
-            Err(error) => {
-                self.status = format!("{}: {error}", labels::STATUS_GRID_FAILED);
-                self.map_texture = MapTexture::Empty;
-            }
-        }
-        true
-    }
-
-    /// The arrived grid waiting for upload, when there is one.
-    #[must_use]
-    pub fn grid_to_upload(&self) -> Option<(&BiomeGrid, Rect, u32)> {
-        match &self.map_texture {
-            MapTexture::ToUpload { grid, rect, step } => Some((grid, *rect, *step)),
-            _ => None,
-        }
-    }
-
-    /// Marks the arrived grid as uploaded and current.
-    pub fn mark_uploaded(&mut self) {
-        if let MapTexture::ToUpload { grid, rect, step } =
-            std::mem::replace(&mut self.map_texture, MapTexture::Empty)
-        {
-            self.map_texture = MapTexture::Current { grid, rect, step };
-        }
-    }
-
-    /// The background request thread died without reporting: fail the
-    /// pending request so the spinner stops and the status says why.
-    pub fn grid_worker_died(&mut self) {
-        if self.is_texture_pending() {
-            self.status = labels::STATUS_WORKER_DIED.to_string();
-            self.map_texture = MapTexture::Empty;
-        }
-    }
-
     // -- View / panel settings ----------------------------------------------
 
-    /// The world position at the map center (T10 vocabulary).
+    /// The interactive map view (T16): center, continuous zoom and
+    /// viewport size. The map widget writes; the status bar, the
+    /// inspector (T18) and go-to (T29) read.
     #[must_use]
-    pub fn center(&self) -> (f64, f64) {
-        self.center
+    pub fn view(&self) -> &MapViewState {
+        &self.view
     }
 
-    /// Sets the map center (T16 pans here).
-    #[allow(dead_code)] // reserved: T16
-    pub fn set_center(&mut self, x: f64, z: f64) {
-        self.center = (x, z);
-    }
-
-    /// The display scale in points per block (T10 vocabulary).
-    #[must_use]
-    pub fn scale(&self) -> f64 {
-        self.scale
-    }
-
-    /// Sets the display scale (T16 zooms here).
-    #[allow(dead_code)] // reserved: T16
-    pub fn set_scale(&mut self, scale: f64) {
-        self.scale = scale;
+    /// Mutable view access, for the map widget's input handling.
+    pub fn view_mut(&mut self) -> &mut MapViewState {
+        &mut self.view
     }
 
     /// The blocks-per-sample resolution (one of [`RESOLUTION_STEPS`]).
@@ -749,7 +548,6 @@ impl AppState {
     }
 
     /// Reports the cursor's block coordinates (or its absence).
-    #[allow(dead_code)] // reserved: T16 feeds the status bar
     pub fn set_cursor(&mut self, cursor: Option<(i32, i32)>) {
         self.cursor = cursor;
     }
@@ -761,7 +559,6 @@ impl AppState {
     }
 
     /// Sets the transient status line.
-    #[allow(dead_code)] // reserved: T29/T32 feedback once their shortcuts do work
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }
@@ -882,7 +679,6 @@ mod tests {
 
     use map_core::error::SourceError;
     use map_core::source::WorldSource;
-    use map_core::types::BiomeId;
 
     fn state() -> AppState {
         AppState::new("/nonexistent/world")
@@ -1042,132 +838,28 @@ mod tests {
     }
 
     #[test]
-    fn texture_lifecycle_request_upload_current() {
+    fn the_view_state_lives_in_the_state_machine() {
+        // T16's pan/zoom state is app state, not widget state: the
+        // widget drives it, everything else reads it. A pan and a zoom
+        // through the app-level accessors behave exactly like the
+        // headless view_state tests promise.
         let mut state = state();
-        let rect = Rect::new(-10, -6, 9, 13);
-        let step = 2;
+        assert_eq!(state.view().center().x, 0.0);
+        assert_eq!(state.view().scale(), 1.0, "the plan's initial view");
 
-        // Idle -> Pending, and the duplicate request is a no-op.
-        assert!(state.request_view_texture(rect, step));
-        assert!(state.is_texture_pending());
-        assert!(
-            !state.request_view_texture(rect, step),
-            "same request twice"
-        );
-        assert!(state.is_texture_pending());
+        state.view_mut().pan_by_screen((100.0, 50.0));
+        assert_eq!(state.view().center().x, -100.0);
+        assert_eq!(state.view().center().z, -50.0);
 
-        // A different view replaces the pending request.
-        let other = Rect::new(0, 0, 19, 19);
-        assert!(state.request_view_texture(other, step));
-        assert!(state.is_texture_pending());
+        state.view_mut().zoom_at_center(1.0);
+        assert_eq!(state.view().smooth_zoom(), 1.0);
+        assert_eq!(state.view().scale(), 0.5);
 
-        // A result for the replaced rect is stale and dropped.
-        let stale = BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(1); 4]);
-        assert!(!state.apply_grid_result(rect, step, Ok(stale)));
-        assert!(state.is_texture_pending(), "the pending view is untouched");
-
-        // The current view's result applies: ToUpload, then Current.
-        let grid = BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(7); 4]);
-        assert!(state.apply_grid_result(other, step, Ok(grid)));
-        assert_eq!(
-            state.map_texture(),
-            &MapTexture::ToUpload {
-                grid: BiomeGrid::new(0, 0, step, 2, 2, vec![BiomeId(7); 4]),
-                rect: other,
-                step,
-            }
-        );
-        let (grid, uploaded_rect, uploaded_step) = state
-            .grid_to_upload()
-            .expect("the arrived grid waits for upload");
-        assert_eq!((grid.width, grid.height), (2, 2));
-        assert_eq!((uploaded_rect, uploaded_step), (other, step));
-
-        state.mark_uploaded();
-        assert!(matches!(state.map_texture(), MapTexture::Current { .. }));
-
-        // The current view does not re-request.
-        assert!(!state.request_view_texture(other, step));
-
-        // A new view starts the cycle again.
-        assert!(state.request_view_texture(rect, step));
-        assert!(state.is_texture_pending());
-    }
-
-    #[test]
-    fn texture_failure_resets_and_reports() {
-        let mut state = state();
-        let rect = Rect::new(0, 0, 63, 63);
-        assert!(state.request_view_texture(rect, 2));
-        assert!(state.apply_grid_result(rect, 2, Err(SourceError::Load(String::from("boom")))));
-        assert_eq!(state.map_texture(), &MapTexture::Empty);
-        assert_eq!(
-            state.status(),
-            format!("{}: load failed: boom", labels::STATUS_GRID_FAILED),
-        );
-    }
-
-    #[test]
-    fn grid_worker_death_fails_the_pending_request() {
-        let mut state = state();
-        assert!(state.request_view_texture(Rect::new(0, 0, 3, 3), 2));
-        state.grid_worker_died();
-        assert_eq!(state.map_texture(), &MapTexture::Empty);
-        assert_eq!(state.status(), labels::STATUS_WORKER_DIED);
-
-        // Without a pending request it changes nothing.
-        state.grid_worker_died();
-        assert_eq!(state.map_texture(), &MapTexture::Empty);
-    }
-
-    #[test]
-    fn invalidate_source_clears_the_texture() {
-        let mut state = state();
-        let rect = Rect::new(0, 0, 31, 31);
-        assert!(state.request_view_texture(rect, 2));
-        state.invalidate_source();
-        assert_eq!(
-            state.map_texture(),
-            &MapTexture::Empty,
-            "a dead seed's map dies with it"
-        );
-    }
-
-    #[test]
-    fn view_texture_rect_covers_the_screen_capped_and_centered() {
-        // The plan's example: a 1280x800 map area at scale 1, step 2 ->
-        // exactly 640x400 samples (1280x800 blocks), centered on (0, 0).
-        let rect =
-            view_texture_rect((0.0, 0.0), 1.0, 2, (1280.0, 800.0)).expect("a sane view resolves");
-        assert_eq!(rect, Rect::new(-640, -400, 639, 399));
-
-        // A negative, fractional center still centers the rect; origins
-        // round half away from zero, so -1843.5 -> -1844 and 55.25 -> 55.
-        let rect = view_texture_rect((-1203.5, 455.25), 1.0, 2, (1280.0, 800.0))
-            .expect("a sane view resolves");
-        assert_eq!(rect.min_x, -1844);
-        assert_eq!(rect.max_x, -1844 + 1279);
-        assert_eq!(rect.min_z, 55);
-        assert_eq!(rect.max_z, 55 + 799);
-
-        // The cap: a giant screen cannot exceed MAX_TEXTURE_SAMPLES.
-        let rect = view_texture_rect((0.0, 0.0), 1.0, 2, (100_000.0, 100_000.0))
-            .expect("the cap keeps the request bounded");
-        assert_eq!(rect.width(), MAX_TEXTURE_SAMPLES * 2);
-        assert_eq!(rect.height(), MAX_TEXTURE_SAMPLES * 2);
-
-        // A tiny area still covers at least one sample per axis; at
-        // scale 0.5, 10 points span 20 blocks = 10 samples at step 2.
-        let rect =
-            view_texture_rect((0.0, 0.0), 0.5, 2, (10.0, 10.0)).expect("a tiny view resolves");
-        assert_eq!(rect.width(), 20);
-        assert_eq!(rect.height(), 20);
-
-        // Absurd centers refuse instead of overflowing.
-        assert!(
-            view_texture_rect((f64::from(i32::MAX) * 2.0, 0.0), 1.0, 2, (10.0, 10.0)).is_none()
-        );
-        assert!(view_texture_rect((f64::NAN, 0.0), 1.0, 2, (10.0, 10.0)).is_none());
+        // The cursor/status plumbing the map widget feeds.
+        state.set_cursor(Some((-1203, 455)));
+        assert_eq!(state.cursor(), Some((-1203, 455)));
+        state.set_status("copied X:-1203 Z:455");
+        assert_eq!(state.status(), "copied X:-1203 Z:455");
     }
 
     #[test]
