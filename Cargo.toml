@@ -45,6 +45,11 @@ worldgen-hytale = { path = "../hytale-server-rust/crates/worldgen-hytale" }
 worldgen-model = { path = "../hytale-server-rust/crates/worldgen-model" }
 hytale-math = { path = "../hytale-server-rust/crates/hytale-math" }
 procedural = { path = "../hytale-server-rust/crates/procedural" }
+# The pack reader for T20's palette tool only: `AssetPack::open` (tree or
+# zip) + `ParentResolver`. It stays a non-dependency of map-core (the
+# decision in docs/assets-and-palette.md §7 — the full registry is
+# ~503 MiB resident, the raw API touches ~3,300 JSON files).
+hytale-assets = { path = "../hytale-server-rust/crates/hytale-assets" }
 
 [profile.release]
 # Keep release builds debuggable enough for profiling (T33).

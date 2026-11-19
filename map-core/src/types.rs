@@ -727,7 +727,8 @@ pub struct GeneratorIdentity {
     pub generator_version: u32,
     /// World folder name + provider version (e.g. `"Default/0.0.0"`).
     pub world_assets: String,
-    /// Palette data version; 0 until the palette task decides otherwise.
+    /// [`palette::PALETTE_VERSION`](crate::palette::PALETTE_VERSION) — bumped
+    /// when the committed fallback palette's data changes.
     pub palette_version: u32,
 }
 

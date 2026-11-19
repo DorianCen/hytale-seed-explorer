@@ -1,8 +1,11 @@
 //! `map-cli` — the headless command line of the Hytale seed explorer.
 //!
-//! Subcommands: `render` (T11, PNG region renders), `info`. `fidelity`
-//! (T05) and `bench` (T04) arrive with their tasks. Everything delegates
-//! to `map-core`; no GUI dependency exists here.
+//! Subcommands: `render` (T11, PNG region renders), `palette` (T20, the
+//! block palette tool), `info`. `fidelity` (T05) and `bench` (T04) arrive
+//! with their tasks. Everything delegates to `map-core`; no GUI dependency
+//! exists here.
+
+mod palette_tool;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -31,6 +34,9 @@ enum Command {
 
     /// Render a region to a PNG (T11: biome layer, one pixel per sample).
     Render(RenderArgs),
+
+    /// Build the schema-1 block palette from the user's asset pack (T20).
+    Palette(palette_tool::PaletteArgs),
 }
 
 #[derive(clap::Args)]
@@ -84,6 +90,7 @@ fn main() {
     let result = match cli.command {
         Command::Info => info(),
         Command::Render(args) => render(args),
+        Command::Palette(args) => palette_tool::run(&args),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");

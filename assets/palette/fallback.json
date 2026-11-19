@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "source": "fallback",
+  "generated_by": "hand-picked original approximations (T20)",
+  "entries": {
+    "Rock_Basalt": {
+      "rgb": [70, 70, 75],
+      "biome_tint": 0.0
+    },
+    "Rock_Gem_Emerald": {
+      "rgb": [80, 200, 140],
+      "biome_tint": 0.0
+    },
+    "Rock_Gravel": {
+      "rgb": [145, 140, 130],
+      "biome_tint": 0.0
+    },
+    "Rock_Moss": {
+      "rgb": [110, 140, 90],
+      "biome_tint": 0.0
+    },
+    "Rock_Sandstone": {
+      "rgb": [193, 166, 124],
+      "biome_tint": 0.0
+    },
+    "Rock_Stone": {
+      "rgb": [128, 128, 128],
+      "biome_tint": 0.0
+    },
+    "Soil_Ash": {
+      "rgb": [90, 88, 86],
+      "biome_tint": 0.0
+    },
+    "Soil_Dirt": {
+      "rgb": [134, 96, 67],
+      "biome_tint": 0.0
+    },
+    "Soil_Gravel_Sand_White": {
+      "rgb": [210, 205, 195],
+      "biome_tint": 0.0
+    },
+    "Soil_Grass": {
+      "rgb": [106, 168, 79],
+      "biome_tint": 1.0
+    },
+    "Soil_Grass_Autumn": {
+      "rgb": [180, 120, 50],
+      "biome_tint": 0.0
+    },
+    "Soil_Grass_Deep": {
+      "rgb": [88, 134, 52],
+      "biome_tint": 1.0
+    },
+    "Soil_Grass_Sunny": {
+      "rgb": [120, 180, 84],
+      "biome_tint": 1.0
+    },
+    "Soil_Grass_Wet": {
+      "rgb": [92, 140, 66],
+      "biome_tint": 1.0
+    },
+    "Soil_Leaves": {
+      "rgb": [110, 170, 70],
+      "biome_tint": 1.0
+    },
+    "Soil_Leaves_Full": {
+      "rgb": [104, 164, 64],
+      "biome_tint": 1.0
+    },
+    "Soil_Mud": {
+      "rgb": [92, 74, 58],
+      "biome_tint": 0.0
+    },
+    "Soil_Sand": {
+      "rgb": [222, 205, 153],
+      "biome_tint": 0.0
+    },
+    "Soil_Seaweed_Block": {
+      "rgb": [70, 130, 90],
+      "biome_tint": 1.0
+    },
+    "Soil_Snow": {
+      "rgb": [235, 240, 244],
+      "biome_tint": 0.0
+    }
+  }
+}

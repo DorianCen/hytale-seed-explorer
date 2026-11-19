@@ -8,6 +8,13 @@ description = "Headless CLI of the Hytale seed explorer: render, search, fidelit
 [dependencies]
 map-core = { workspace = true }
 
+# T20's palette tool: the pack reader (tree or zip) + parent resolver,
+# per docs/assets-and-palette.md §7. map-cli only — map-core stays
+# asset-free.
+hytale-assets = { workspace = true }
+# The generated palette's provenance hash (pack manifest SHA-256).
+sha2 = { workspace = true }
+
 clap = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true }

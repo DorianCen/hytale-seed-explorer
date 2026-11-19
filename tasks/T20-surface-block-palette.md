@@ -1,6 +1,28 @@
 # T20 — Surface block palette data
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/palette.rs` — the
+`map_image.rs` block-color formula copied exactly (truncating-cast
+biome blend, integer `/255` particle multiply under `m < 1`), the pack
++ legacy hex parser (`#`/`0x`, string-or-array, 3/6/8-digit),
+name-keyed `BlockPalette` (ids are schedule-dependent — resolved at
+runtime through the source's own catalog, never persisted in any
+file), the unknown-block grey+hue policy with magenta reserved for no
+metadata, schema-refusing `load`, deterministic `to_json_bytes`, and
+`PALETTE_VERSION = 1` carried in `GeneratorIdentity` so committed
+fallback changes invalidate tiles — plus the committed hand-picked
+`assets/palette/fallback.json` (20 original approximations) and
+`map-cli palette`: the `AssetPack` walk over `Server/Item/Items`
+(tree or zip), the block store's own parent-resolution semantics
+(`ParentResolver` + `MergeHook::Shallow`, INHERIT_ID_AND_PARENT,
+starred state-definition keys), registries-name coverage, SHA-256
+manifest provenance and the `--input/--out/--registries/--fallback/
+--allow-commit` flags. Acceptance green: `cargo test -p map-core
+palette` (2 + 9, pinning the §6 recorded probe values),
+`cargo test -p map-cli palette` (6, incl. the gated real-pack build:
+6135/6135 registries names covered, 6120 pack-derived, byte-identical
+across runs), the real-pack CLI command, and clippy `-D warnings`
+across both crates.)
+
 **Milestone:** 5 — Full block mode
 **Depends on:** T03, T09
 **Blocks:** T21

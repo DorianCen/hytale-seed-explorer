@@ -190,7 +190,7 @@ impl WorldgenSource {
                 config.world_path.display()
             ),
             // Bumped when the committed fallback palette changes (T03/T20).
-            palette_version: 0,
+            palette_version: crate::palette::PALETTE_VERSION,
         };
         Ok(Self {
             seed,
