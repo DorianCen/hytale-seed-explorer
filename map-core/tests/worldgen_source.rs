@@ -379,6 +379,47 @@ fn spawn_and_zone_queries_work() {
     );
 }
 
+/// Proves the T19 zone debug path: the batched `zone_region` grid equals
+/// single-point `zone_at` for every sample, row-major.
+#[test]
+fn zone_region_matches_zone_at_sample_by_sample() {
+    let Some(_world) = world_dir() else {
+        return;
+    };
+    let _serial = exclusive_source();
+    let source = source();
+
+    // 8 x 8 blocks at step 2 → 4 x 4 samples, well inside the world.
+    let rect = Rect::from_dims(8, 8, 8, 8);
+    let step = 2;
+    let grid = source
+        .zone_region(rect, step)
+        .expect("the source serves the zone region");
+    let (width, height) = rect.sample_dims(step);
+    assert_eq!(
+        (grid.width, grid.height, grid.step),
+        (width, height, step),
+        "the zone grid covers exactly the requested samples"
+    );
+
+    let mut expected = Vec::with_capacity((width * height) as usize);
+    for z in 0..height {
+        for x in 0..width {
+            let world_x = rect.min_x + (x * step) as i32;
+            let world_z = rect.min_z + (z * step) as i32;
+            expected.push(
+                source
+                    .zone_at(world_x, world_z)
+                    .expect("the source serves zone lookups"),
+            );
+        }
+    }
+    assert_eq!(
+        grid.zones, expected,
+        "the batched zone grid must equal zone_at at every sample, row-major"
+    );
+}
+
 /// Proves the T08 acceptance bullet: catalog data resolves the ids the query
 /// path returns, plus the golden registries' block names.
 #[test]

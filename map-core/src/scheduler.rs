@@ -235,7 +235,7 @@ struct Shared {
     /// Monotonic job sequence (FIFO tie-breaker in the heap).
     next_seq: u64,
     /// The last request, for change detection.
-    last_request: Option<(TileSubject, TileRect, TileCoord)>,
+    last_request: Option<(Vec<TileSubject>, TileRect, TileCoord)>,
     completed: u64,
     cancelled: u64,
     failed: u64,
@@ -342,22 +342,24 @@ impl TileScheduler {
             .min(4)
     }
 
-    /// Queues every visible tile that is neither cached nor pending,
-    /// nearest `center` first. Cheap by construction: heap inserts under
-    /// one short lock, never a render.
+    /// Queues every visible tile of every subject that is neither cached
+    /// nor pending, nearest `center` first. Cheap by construction: heap
+    /// inserts under one short lock, never a render.
     ///
-    /// `visible` must be tile-space of `subject.zoom`'s step (T10's
-    /// `visible_tiles`); `center` is the viewport's center tile. The
-    /// latest `renderer` wins (one renderer per source in practice).
+    /// `subjects` is the frame's enabled layer set, bottom → top paint
+    /// order (T19); every subject shares `visible` (one step serves all
+    /// layers) and the priority `center`. `visible` must be tile-space
+    /// of the subjects' zoom step (T10's `visible_tiles`). The latest
+    /// `renderer` wins (one renderer per source in practice).
     ///
     /// Returns the request generation: 1 for the first request, bumped
-    /// whenever the `(subject, visible, center)` triple changes; events
+    /// whenever the `(subjects, visible, center)` triple changes; events
     /// carry their job's generation so the app can drop stale ones.
     /// Repeating an unchanged request re-dedups against the cache and
     /// revives queued-but-cancelled tiles without new jobs.
     pub fn schedule(
         &self,
-        subject: TileSubject,
+        subjects: &[TileSubject],
         visible: TileRect,
         center: TileCoord,
         renderer: Arc<dyn TileRenderer>,
@@ -366,49 +368,82 @@ impl TileScheduler {
         guard.renderer = Some(renderer);
         let changed = guard
             .last_request
-            .is_none_or(|(s, v, c)| s != subject || v != visible || c != center);
+            .as_ref()
+            .is_none_or(|(s, v, c)| s.as_slice() != subjects || *v != visible || *c != center);
         if changed {
             guard.generation += 1;
         }
-        guard.last_request = Some((subject, visible, center));
+        guard.last_request = Some((subjects.to_vec(), visible, center));
         let generation = guard.generation;
 
-        for coord in visible.iter() {
-            // Tile keys carry i32 indices; a visible range beyond them
-            // cannot be keyed, so those coordinates are skipped (the
-            // reachable world is far inside, per T10's bounds analysis).
-            let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
-                continue;
-            };
-            let key = subject.key_at(tx, ty);
-            if self.cache.contains(&key) {
-                continue;
+        for subject in subjects {
+            for coord in visible.iter() {
+                // Tile keys carry i32 indices; a visible range beyond them
+                // cannot be keyed, so those coordinates are skipped (the
+                // reachable world is far inside, per T10's bounds analysis).
+                let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
+                    continue;
+                };
+                let key = subject.key_at(tx, ty);
+                if self.cache.contains(&key) {
+                    continue;
+                }
+                if let Some(token) = guard.queued.get(&key) {
+                    // Already queued: revive it if it was cancelled (the
+                    // tile scrolled away and came back) instead of piling a
+                    // second job on. Its stale generation rides along; the
+                    // cache is the truth when the event lands.
+                    token.store(false, Relaxed);
+                    continue;
+                }
+                if guard.in_flight.contains_key(&key) {
+                    continue;
+                }
+                let request = TileRequest {
+                    key,
+                    priority: chebyshev(coord, center),
+                    seq: guard.next_seq,
+                    generation,
+                    cancel: cancel_token(),
+                };
+                guard.next_seq += 1;
+                guard.queued.insert(key, Arc::clone(&request.cancel));
+                guard.queue.push(request);
             }
-            if let Some(token) = guard.queued.get(&key) {
-                // Already queued: revive it if it was cancelled (the
-                // tile scrolled away and came back) instead of piling a
-                // second job on. Its stale generation rides along; the
-                // cache is the truth when the event lands.
-                token.store(false, Relaxed);
-                continue;
-            }
-            if guard.in_flight.contains_key(&key) {
-                continue;
-            }
-            let request = TileRequest {
-                key,
-                priority: chebyshev(coord, center),
-                seq: guard.next_seq,
-                generation,
-                cancel: cancel_token(),
-            };
-            guard.next_seq += 1;
-            guard.queued.insert(key, Arc::clone(&request.cancel));
-            guard.queue.push(request);
         }
         drop(guard);
         self.cond.notify_all();
         generation
+    }
+
+    /// Cancels every queued and in-flight tile the frame no longer
+    /// serves: a position outside `visible`, or a subject that left the
+    /// request (T19's disabled layers — their pending work stops instead
+    /// of rendering on unasked). Cheap: token writes only.
+    ///
+    /// Subsumes [`TileScheduler::cancel_outside`]: an empty `subjects`
+    /// cancels everything pending. A tile that returns to the request
+    /// is *revived* by the next [`TileScheduler::schedule`]; a tile that
+    /// finishes despite its token stays cached, so a re-enabled layer
+    /// serves instantly.
+    pub fn cancel_not_serving(&self, subjects: &[TileSubject], visible: &TileRect) {
+        let guard = lock(&self.shared);
+        let serving = |key: &TileKey| {
+            visible.contains(key_coord(key))
+                && subjects
+                    .iter()
+                    .any(|subject| *subject == TileSubject::from_key(key))
+        };
+        for (key, token) in &guard.queued {
+            if !serving(key) {
+                token.store(true, Relaxed);
+            }
+        }
+        for (key, token) in &guard.in_flight {
+            if !serving(key) {
+                token.store(true, Relaxed);
+            }
+        }
     }
 
     /// Cancels every queued and in-flight tile outside `visible` (the

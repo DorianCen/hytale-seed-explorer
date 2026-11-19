@@ -42,6 +42,12 @@ pub const LAYER_HEIGHT: &str = "Height";
 pub const LAYER_RELIEF: &str = "Relief";
 pub const LAYER_FLUID: &str = "Fluid";
 pub const LAYER_CAVES: &str = "Caves";
+/// The zone debug layer's checkbox (T19).
+pub const LAYER_ZONE: &str = "Zones";
+/// The word before a layer's opacity slider.
+pub const OPACITY: &str = "opacity";
+/// What the status bar says when no renderable layer is enabled.
+pub const LAYERS_NONE: &str = "none";
 
 pub const OVERLAY_STRUCTURES: &str = "Structures";
 pub const OVERLAY_PREFABS: &str = "Prefabs";
@@ -68,6 +74,21 @@ pub const MAP_PLACEHOLDER_CAVES: &str = "cave layers arrive with T28";
 /// Shown when a rendered layer has nothing to serve: the view left the
 /// generatable world.
 pub const MAP_PLACEHOLDER_OFF_WORLD: &str = "this view is outside the world";
+
+/// Shown when every renderable layer is unticked (T19 allows a blank
+/// map rather than forcing a base layer).
+pub const MAP_PLACEHOLDER_NO_LAYERS: &str = "no layer enabled — tick one in the Layers panel";
+
+/// The climate debug note: the plan wants temperature/humidity only if
+/// the generator exposes them — it does not (T19's explicit refusal to
+/// fake them from biome colors).
+pub const CLIMATE_NOTE: &str = "temperature/humidity: not exposed by this generator";
+
+/// The zone debug layer's legend heading (T19).
+pub const ZONE_LEGEND: &str = "Zone colors";
+
+/// The legend's empty-world case.
+pub const ZONE_NONE: &str = "no zones in this world";
 
 /// Shown in the map area instead of data when a load failed.
 pub const MAP_PLACEHOLDER_ERROR_PREFIX: &str = "load failed:";

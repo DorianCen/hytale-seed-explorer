@@ -51,8 +51,8 @@ struct RenderArgs {
     #[arg(long, default_value_t = 2)]
     step: u32,
 
-    /// The layer to render: `biome`, `height`, `relief` and `fluid`
-    /// render (T13/T17); the rest arrive with T20/T28.
+    /// The layer to render: `biome`, `height`, `relief`, `fluid` and `zone`
+    /// render (T13/T17/T19); the rest arrive with T20/T28.
     #[arg(long, default_value = "biome")]
     layer: Layer,
 
@@ -180,11 +180,12 @@ fn render(args: RenderArgs) -> Result<(), String> {
     );
     let cancel = map_core::scheduler::cancel_token();
     let started = Instant::now();
-    // The layer picks the query and the coloring (T17): heights ride the
-    // cheap per-column path; fluids ride the chunk-summary surface path;
-    // relief expands the rect by one sample ring so the output's edges
-    // shade exactly like the interior (the same reason tiles carry a
-    // border). The renderer-less layers name their pending task.
+    // The layer picks the query and the coloring (T17/T19): heights ride
+    // the cheap per-column path; fluids ride the chunk-summary surface
+    // path; zones ride the cheap per-sample zone path; relief expands the
+    // rect by one sample ring so the output's edges shade exactly like the
+    // interior (the same reason tiles carry a border). The renderer-less
+    // layers name their pending task.
     let image = match args.layer {
         Layer::Biome => {
             let grid = source
@@ -221,7 +222,14 @@ fn render(args: RenderArgs) -> Result<(), String> {
             )
             .map_err(|error| error.to_string())?
         }
-        Layer::Surface | Layer::CaveSlice | Layer::CaveDensity | Layer::Zone => {
+        Layer::Zone => {
+            let grid = source
+                .zone_region(rect, args.step)
+                .map_err(|error| error.to_string())?;
+            map_core::render::zone::zone_image(&grid, source.zone_catalog(), &cancel)
+                .map_err(|error| error.to_string())?
+        }
+        Layer::Surface | Layer::CaveSlice | Layer::CaveDensity => {
             return Err(format!(
                 "the layer '{}' has no renderer yet (T20/T28 wire them)",
                 args.layer

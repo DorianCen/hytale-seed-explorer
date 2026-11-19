@@ -19,7 +19,7 @@ use crate::catalog::{BiomeCatalog, BlockCatalog, FluidCatalog, ZoneCatalog};
 use crate::error::SourceResult;
 use crate::types::{
     BiomeGrid, BiomeId, Feature, FeatureFilter, GeneratorIdentity, HeightGrid, Rect, Seed,
-    SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
+    SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
 /// A source of world data at the map-core boundary.
@@ -58,6 +58,9 @@ pub trait WorldSource: Send + Sync {
     fn spawn_points(&self) -> SourceResult<Vec<SpawnPoint>>;
     /// The zone containing a column, if the generator exposes zones.
     fn zone_at(&self, x: i32, z: i32) -> SourceResult<Option<ZoneId>>;
+    /// A zone-id grid covering `rect`, one sample per `step` blocks (T19's
+    /// zone debug layer); [`None`] where the generator reports no zone.
+    fn zone_region(&self, rect: Rect, step: u32) -> SourceResult<ZoneGrid>;
 
     /// Biome id → name/color lookups.
     fn biome_catalog(&self) -> &BiomeCatalog;

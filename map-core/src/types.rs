@@ -441,6 +441,21 @@ pub struct BiomeGrid {
 
 impl_grid!(BiomeGrid, biomes, BiomeId);
 
+/// Zone ids sampled on a regular grid: `step` blocks per sample, row-major
+/// (`z * width + x`), anchored at (`origin_x`, `origin_z`). A sample is
+/// [`None`] where the generator reports no zone for the column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneGrid {
+    pub origin_x: i32,
+    pub origin_z: i32,
+    pub step: u32,
+    pub width: u32,
+    pub height: u32,
+    pub zones: Vec<Option<ZoneId>>,
+}
+
+impl_grid!(ZoneGrid, zones, Option<ZoneId>);
+
 /// Surface heights (in blocks) sampled on a regular grid: `step` blocks per
 /// sample, row-major (`z * width + x`), anchored at (`origin_x`, `origin_z`).
 #[derive(Debug, Clone, PartialEq, Eq)]

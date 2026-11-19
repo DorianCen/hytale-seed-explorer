@@ -17,6 +17,8 @@
 //!   worker threads, cancellation, result events (T15).
 //! - [`render`] — layer renderers: biome, height, relief, blocks, caves
 //!   (T11, T13, T17, T19–T21, T28).
+//! - [`layers`] — the planned layer stack, its settings and the shared
+//!   compositing primitive (T19).
 //! - [`features`] — the feature catalog, icon ids, categories (T23).
 //! - [`search`] — feature/biome search engines (T24, T25).
 //! - [`project`] — waypoints, saved state, share strings (T30, T31).
@@ -27,6 +29,7 @@ pub mod coords;
 pub mod error;
 pub mod export;
 pub mod features;
+pub mod layers;
 pub mod project;
 pub mod render;
 pub mod scheduler;

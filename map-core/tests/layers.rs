@@ -90,6 +90,7 @@ mod fake_layers {
     use map_core::render::fluid::fluid_color;
     use map_core::render::height::height_color;
     use map_core::render::tiles::LayeredTileRenderer;
+    use map_core::render::zone_color;
     use map_core::scheduler::{TileRenderer, TileSubject};
     use map_core::source::WorldSource;
     use map_core::test_support::FakeWorldSource;
@@ -265,17 +266,33 @@ mod fake_layers {
     }
 
     #[test]
+    fn zone_render_tile_matches_the_queried_zones() {
+        // The fake reports zone 0 ("Fake_Zone") for every column, so the
+        // whole tile is one flat hash color — but the pixel check still
+        // proves the zone query path, the catalog lookup and the blit.
+        let renderer = fake_renderer();
+        let tile = render_tile(&renderer, Layer::Zone, 0, 0);
+        assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
+
+        let color = zone_color("Fake_Zone");
+        for y in 0..TILE_SIZE {
+            for x in 0..TILE_SIZE {
+                assert_eq!(
+                    tile.pixel(x, y).expect("the tile is TILE_SIZE square"),
+                    [color[0], color[1], color[2], 255],
+                    "tile pixel ({x}, {y}) must be the fake zone's color"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn layered_render_answers_renderer_less_layers_with_unsupported() {
         // The defensive contract: the app never schedules these (its
         // radios map them to placeholders), and the dispatcher says so
         // with the typed error rather than rendering wrong pixels.
         let renderer = fake_renderer();
-        for layer in [
-            Layer::Surface,
-            Layer::CaveSlice,
-            Layer::CaveDensity,
-            Layer::Zone,
-        ] {
+        for layer in [Layer::Surface, Layer::CaveSlice, Layer::CaveDensity] {
             let result = TileRenderer::render(&renderer, &key(layer, 0, 0), &cancel_token());
             assert_eq!(
                 result.err(),
@@ -285,6 +302,231 @@ mod fake_layers {
                 "{layer} has no renderer"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stack settings and compositing (T19)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-support")]
+mod stack_blend {
+    use map_core::layers::{LayerSettings, LayerStack, blend_over};
+    use map_core::render::Layer;
+
+    /// The synthetic 4x4 base's two opaque checkerboard colors.
+    const GOLDEN_BASE_A: [u8; 4] = [200, 40, 10, 255];
+    const GOLDEN_BASE_B: [u8; 4] = [20, 180, 90, 255];
+
+    /// The synthetic 4x4 top's third color, drawn only on the diagonal.
+    const GOLDEN_TOP_C: [u8; 4] = [10, 20, 230, 200];
+
+    #[test]
+    fn layers_stack_defaults_to_biome_alone() {
+        let stack = LayerStack::new();
+
+        // Exactly one enabled layer: the plan's default.
+        let enabled: Vec<&LayerSettings> = stack.iter().filter(|s| s.enabled).collect();
+        assert_eq!(enabled.len(), 1, "the default stack enables one layer");
+        assert_eq!(enabled[0].id, Layer::Biome);
+        assert_eq!(enabled[0].opacity, 1.0);
+        assert_eq!(stack.enabled_layers(), vec![Layer::Biome]);
+
+        // Sorted by order, Biome bottom and Zone top.
+        let ids: Vec<Layer> = stack.iter().map(|s| s.id).collect();
+        assert_eq!(ids.first(), Some(&Layer::Biome));
+        assert_eq!(ids.last(), Some(&Layer::Zone));
+        let orders: Vec<i16> = stack.iter().map(|s| s.order).collect();
+        assert!(
+            orders.windows(2).all(|pair| pair[0] < pair[1]),
+            "the default stack is sorted bottom → top: {orders:?}"
+        );
+
+        assert_eq!(LayerStack::default(), stack, "Default delegates to new");
+        assert!(!stack.is_dirty(), "a fresh stack is clean");
+    }
+
+    #[test]
+    fn layers_stack_toggle_opacity_and_dirty_flags() {
+        let mut stack = LayerStack::new();
+
+        // A real change dirties; an identical write is a no-op that does
+        // not re-dirty the stack.
+        assert!(stack.set_enabled(Layer::Fluid, true));
+        assert!(stack.is_dirty());
+        assert!(stack.take_dirty());
+        assert!(!stack.is_dirty());
+        assert!(!stack.set_enabled(Layer::Fluid, true));
+        assert!(!stack.is_dirty(), "a no-op toggle must not dirty");
+
+        // Opacity clamps at both ends; each actual change dirties.
+        assert!(stack.set_opacity(Layer::Fluid, 0.25));
+        assert_eq!(stack.opacity(Layer::Fluid), 0.25);
+        assert!(stack.take_dirty());
+        assert!(!stack.set_opacity(Layer::Fluid, 0.25));
+        assert!(!stack.is_dirty(), "a no-op opacity must not dirty");
+
+        assert!(stack.set_opacity(Layer::Fluid, 2.0));
+        assert_eq!(stack.opacity(Layer::Fluid), 1.0, "2.0 clamps to 1.0");
+        assert!(stack.take_dirty());
+        assert!(stack.set_opacity(Layer::Fluid, -1.0));
+        assert_eq!(stack.opacity(Layer::Fluid), 0.0, "-1.0 clamps to 0.0");
+        assert!(stack.take_dirty());
+        assert!(stack.set_opacity(Layer::Fluid, 1.0));
+        assert!(!stack.set_opacity(Layer::Fluid, 1.0));
+
+        assert_eq!(stack.get(Layer::Fluid).map(|s| s.opacity), Some(1.0));
+    }
+
+    #[test]
+    fn layers_stack_reorder_keeps_settings() {
+        let mut stack = LayerStack::new();
+        assert!(stack.set_enabled(Layer::Height, true));
+        assert!(stack.set_opacity(Layer::Height, 0.4));
+
+        // Snapshot every planned entry so the reorder can prove nothing
+        // travels or gets lost.
+        let before: Vec<LayerSettings> = stack.iter().cloned().collect();
+
+        stack.reorder(Layer::Height, -5);
+
+        let first = stack.iter().next().expect("the stack is never empty");
+        assert_eq!(first.id, Layer::Height, "Height is now painted first");
+        assert!(first.enabled, "the move keeps the layer enabled");
+        assert_eq!(first.opacity, 0.4, "the move keeps the opacity");
+
+        for settings in before.iter().filter(|s| s.id != Layer::Height) {
+            assert_eq!(
+                stack.get(settings.id),
+                Some(settings),
+                "{:?} keeps its own settings across a reorder",
+                settings.id
+            );
+        }
+
+        // The enabled paint order follows the new sort: Height (-5) now
+        // precedes the untouched Biome (0).
+        assert_eq!(stack.enabled_layers(), vec![Layer::Height, Layer::Biome]);
+    }
+
+    #[test]
+    fn layers_stack_serde_round_trips() {
+        let mut stack = LayerStack::new();
+        assert!(stack.set_enabled(Layer::Height, true));
+        assert!(stack.set_opacity(Layer::Height, 0.35));
+        assert!(stack.set_enabled(Layer::Fluid, true));
+        assert!(stack.set_enabled(Layer::Biome, false));
+        stack.reorder(Layer::Fluid, -1);
+
+        // The dirty flag is runtime bookkeeping, not state: drain it so
+        // the comparison is about the settings (and prove the skip).
+        assert!(stack.take_dirty());
+
+        let json = serde_json::to_string(&stack).expect("the stack serializes");
+        assert!(
+            !json.contains("\"dirty\""),
+            "dirty is #[serde(skip)] in {json}"
+        );
+
+        let restored: LayerStack = serde_json::from_str(&json).expect("the stack deserializes");
+        assert_eq!(restored, stack);
+
+        let enabled: Vec<Layer> = restored.enabled_layers();
+        assert_eq!(enabled, vec![Layer::Fluid, Layer::Height]);
+        assert_eq!(restored.opacity(Layer::Height), 0.35);
+    }
+
+    #[test]
+    fn blend_over_passes_through_edges() {
+        let base = [10, 20, 30, 255];
+
+        // A fully opaque top at full opacity wins outright.
+        assert_eq!(
+            blend_over(base, [200, 100, 50, 255], 1.0),
+            [200, 100, 50, 255]
+        );
+
+        // A fully transparent top leaves every base pixel untouched.
+        for base in [base, [1, 2, 3, 200], [250, 0, 120, 64]] {
+            assert_eq!(blend_over(base, [7, 8, 9, 0], 1.0), base);
+            assert_eq!(blend_over(base, [7, 8, 9, 0], 0.5), base);
+        }
+
+        // Opacity 0 is the same transparent edge, whatever the top says.
+        for base in [base, [1, 2, 3, 200]] {
+            assert_eq!(blend_over(base, [200, 100, 50, 255], 0.0), base);
+        }
+    }
+
+    #[test]
+    fn blend_over_half_opacity_over_opaque_base_is_exact() {
+        // Opaque red at 50% over opaque blue: a_top = 1.0 * 0.5 = 0.5,
+        // a_base = 1.0, a_out = 0.5 + 1.0 * 0.5 = 1.0.
+        // r = round(255 * 0.5) = round(127.5) = 128;
+        // b = round(255 * 1.0 * 0.5) = round(127.5) = 128.
+        assert_eq!(
+            blend_over([0, 0, 255, 255], [255, 0, 0, 255], 0.5),
+            [128, 0, 128, 255]
+        );
+
+        // Top alpha 128 at opacity 1.0: a_top = 128/255 ≈ 0.501961,
+        // a_base = 1.0, a_out = 1.0.
+        // r = round(255 * 0.501961) = 128;
+        // b = round(255 * (1 - 0.501961)) = round(127.0) = 127.
+        assert_eq!(
+            blend_over([0, 0, 255, 255], [255, 0, 0, 128], 1.0),
+            [128, 0, 127, 255]
+        );
+    }
+
+    #[test]
+    fn layers_golden_composite_of_two_synthetic_layers() {
+        // Two 4x4 synthetic layers, row-major. The base is an opaque
+        // two-color checkerboard; the top is the third color on the main
+        // diagonal at alpha 200, fully transparent elsewhere.
+        let base: Vec<[u8; 4]> = (0..16)
+            .map(|i| {
+                let (x, y) = (i % 4, i / 4);
+                if (x + y) % 2 == 0 {
+                    GOLDEN_BASE_A
+                } else {
+                    GOLDEN_BASE_B
+                }
+            })
+            .collect();
+        let top: Vec<[u8; 4]> = (0..16)
+            .map(|i| {
+                let (x, y) = (i % 4, i / 4);
+                if x == y { GOLDEN_TOP_C } else { [0, 0, 0, 0] }
+            })
+            .collect();
+
+        let out: Vec<[u8; 4]> = base
+            .iter()
+            .zip(&top)
+            .map(|(&base_pixel, &top_pixel)| blend_over(base_pixel, top_pixel, 0.5))
+            .collect();
+
+        // Uncovered pixels pass their checkerboard square through
+        // exactly, for both colors: (2, 0) is even (A), (1, 0) is odd (B).
+        assert_eq!(out[2], GOLDEN_BASE_A, "(2, 0) is base-only");
+        assert_eq!(out[1], GOLDEN_BASE_B, "(1, 0) is base-only");
+
+        // A covered diagonal pixel: a_top = (200/255) * 0.5 = 0.392157,
+        // a_base = 1.0, a_out = 1.0. Over base A ([200, 40, 10]):
+        // r = round(10 * 0.392157 + 200 * 0.607843) = round(125.4902) = 125;
+        // g = round(20 * 0.392157 + 40 * 0.607843) = round(32.1569) = 32;
+        // b = round(230 * 0.392157 + 10 * 0.607843) = round(96.2745) = 96.
+        let covered = [125, 32, 96, 255];
+        assert_eq!(out[5], covered, "(1, 1) blends the diagonal over A");
+        assert_eq!(out[0], covered, "(0, 0), the corner, blends over A");
+        assert_eq!(out[10], covered, "(2, 2) blends over A");
+        assert_eq!(out[15], covered, "(3, 3) blends over A");
+
+        // The whole composite stays opaque and actually changed where
+        // the diagonal ran.
+        assert!(out.iter().all(|pixel| pixel[3] == 255));
+        assert_ne!(out[5], GOLDEN_BASE_A, "the diagonal really composited");
     }
 }
 

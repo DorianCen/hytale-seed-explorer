@@ -15,7 +15,7 @@ use crate::source::{FeatureSource, WorldSource};
 use crate::types::{
     BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureMetadata, FluidId,
     GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid, SpawnPoint, SurfaceGrid,
-    SurfaceSample, ZoneId,
+    SurfaceSample, ZoneGrid, ZoneId,
 };
 
 /// A cheap, deterministic [`WorldSource`] for renderers, tiles and the UI.
@@ -174,6 +174,26 @@ impl FakeWorldSource {
         SurfaceGrid::new(rect.min_x, rect.min_z, step, width, height, values)
     }
 
+    /// The fake zone formula: one zone covers the whole world, matching
+    /// [`WorldSource::zone_at`].
+    fn zone_for(_x: i32, _z: i32) -> Option<ZoneId> {
+        Some(ZoneId(0))
+    }
+
+    fn zone_grid(&self, rect: Rect, step: u32) -> ZoneGrid {
+        let (width, height) = rect.sample_dims(step);
+        let mut values = Vec::with_capacity(width as usize * height as usize);
+        for z in 0..height {
+            for x in 0..width {
+                values.push(Self::zone_for(
+                    Self::sample_coord(rect.min_x, x, step),
+                    Self::sample_coord(rect.min_z, z, step),
+                ));
+            }
+        }
+        ZoneGrid::new(rect.min_x, rect.min_z, step, width, height, values)
+    }
+
     /// Builds cubic `width`-block bounds used by the fake prefabs, so the
     /// largest bounds dimension (the `min_size` fallback) is exactly `width`.
     fn prefab_bounds(position: (i32, i32, i32), width: i32) -> Rect3 {
@@ -240,6 +260,10 @@ impl WorldSource for FakeWorldSource {
 
     fn zone_at(&self, _x: i32, _z: i32) -> SourceResult<Option<ZoneId>> {
         Ok(Some(ZoneId(0)))
+    }
+
+    fn zone_region(&self, rect: Rect, step: u32) -> SourceResult<ZoneGrid> {
+        Ok(self.zone_grid(rect, step))
     }
 
     fn biome_catalog(&self) -> &BiomeCatalog {

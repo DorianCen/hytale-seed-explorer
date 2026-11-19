@@ -2,11 +2,11 @@
 //! in plain data.
 //!
 //! No egui types live here on purpose — the state machine (seed parsing,
-//! source loading, stale-result rejection, resolution changes, go-to
-//! submission, status formatting) is fully unit-testable without a
-//! window, a GPU or even the generator. `app.rs` is the thin egui skin
-//! over this module; the hover sampling state machine itself lives in
-//! [`crate::inspector`].
+//! source loading, stale-result rejection, resolution changes, the
+//! layer stack, go-to submission, status formatting) is fully
+//! unit-testable without a window, a GPU or even the generator.
+//! `app.rs` is the thin egui skin over this module; the hover sampling
+//! state machine itself lives in [`crate::inspector`].
 //!
 //! # Source loading model
 //!
@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use map_core::error::SourceResult;
+use map_core::layers::LayerStack;
 use map_core::render::Layer;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
 use map_core::types::{Rect, Seed, SeedError};
@@ -39,60 +40,31 @@ use crate::view_state::MapViewState;
 /// The plan's default is 2×2.
 pub const RESOLUTION_STEPS: [u32; 4] = [1, 2, 4, 8];
 
-/// The layer radios in the left panel. `Biomes`, `Height`, `Relief` and
-/// `Fluid` render (T13/T17); `Surface` and `Caves` exist so the panel
-/// shape is frozen and T20/T28 wire their renderers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppLayer {
-    Biomes,
-    Surface,
-    Height,
-    Relief,
-    Fluid,
-    Caves,
+/// Whether the panel offers `layer` a checkbox (T19): true for every
+/// layer with a renderer today. The later layers stay [`LayerStack`]
+/// entries — their settings persist for their arrival — but no checkbox
+/// schedules an unsupported query.
+#[must_use]
+pub fn offers_layer(layer: Layer) -> bool {
+    matches!(
+        layer,
+        Layer::Biome | Layer::Height | Layer::Relief | Layer::Fluid | Layer::Zone
+    )
 }
 
-impl AppLayer {
-    /// The label of each radio button, kept in [`crate::labels`] for
-    /// T34's docs/screenshots.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            AppLayer::Biomes => labels::LAYER_BIOMES,
-            AppLayer::Surface => labels::LAYER_SURFACE,
-            AppLayer::Height => labels::LAYER_HEIGHT,
-            AppLayer::Relief => labels::LAYER_RELIEF,
-            AppLayer::Fluid => labels::LAYER_FLUID,
-            AppLayer::Caves => labels::LAYER_CAVES,
-        }
+/// The panel label of a layer (checkboxes, the status summary and the
+/// future-layer notes share one mapping so the vocabulary never drifts).
+#[must_use]
+pub fn layer_label(layer: Layer) -> &'static str {
+    match layer {
+        Layer::Biome => labels::LAYER_BIOMES,
+        Layer::Height => labels::LAYER_HEIGHT,
+        Layer::Relief => labels::LAYER_RELIEF,
+        Layer::Fluid => labels::LAYER_FLUID,
+        Layer::Zone => labels::LAYER_ZONE,
+        Layer::Surface => labels::LAYER_SURFACE,
+        Layer::CaveSlice | Layer::CaveDensity => labels::LAYER_CAVES,
     }
-
-    /// The layer the tile pipeline renders for this radio, when it has a
-    /// renderer. The tile keys carry it, so switching layers switches
-    /// keys — stale tiles of the previous layer can never be served.
-    ///
-    /// [`None`] = the renderer is a later task's (the map shows the
-    /// "arrives with T…" placeholder).
-    #[must_use]
-    pub fn tile_layer(self) -> Option<Layer> {
-        match self {
-            AppLayer::Biomes => Some(Layer::Biome),
-            AppLayer::Height => Some(Layer::Height),
-            AppLayer::Relief => Some(Layer::Relief),
-            AppLayer::Fluid => Some(Layer::Fluid),
-            AppLayer::Surface | AppLayer::Caves => None,
-        }
-    }
-
-    /// All layers in panel order.
-    pub const ALL: [AppLayer; 6] = [
-        AppLayer::Biomes,
-        AppLayer::Surface,
-        AppLayer::Height,
-        AppLayer::Relief,
-        AppLayer::Fluid,
-        AppLayer::Caves,
-    ];
 }
 
 /// The overlay checkboxes of the left panel. Placeholder booleans until
@@ -219,8 +191,12 @@ pub struct AppState {
     /// The map widget drives it; everything else reads it.
     view: MapViewState,
 
-    /// The active layer radio and overlay checkboxes (placeholders).
-    layer: AppLayer,
+    /// The layer stack (T19): every planned layer with enable, opacity
+    /// and order. It is plain session state — a source reload never
+    /// touches it, so settings survive; serialization arrives with T31.
+    layers: LayerStack,
+
+    /// The overlay checkboxes of the left panel (placeholders).
     overlays: OverlaySettings,
 
     /// Cursor block coordinates once the map widget exists (T16).
@@ -261,7 +237,7 @@ impl Default for AppState {
             workers: None,
             resolution_step: 2,
             view: MapViewState::new(),
-            layer: AppLayer::Biomes,
+            layers: LayerStack::new(),
             overlays: OverlaySettings::default(),
             cursor: None,
             inspector: InspectorState::new(),
@@ -282,7 +258,6 @@ impl AppState {
             world_path: world_path.into(),
             // The plan's default resolution is 2×2.
             resolution_step: 2,
-            layer: AppLayer::Biomes,
             ..AppState::default()
         }
     }
@@ -556,16 +531,46 @@ impl AppState {
         }
     }
 
-    /// The active layer radio.
+    /// The layer stack (read-only access for the panels).
     #[must_use]
-    pub fn layer(&self) -> AppLayer {
-        self.layer
+    pub fn layers(&self) -> &LayerStack {
+        &self.layers
     }
 
-    /// Selects a layer radio (the panel calls this even though only
-    /// `Biomes` renders today).
-    pub fn set_layer(&mut self, layer: AppLayer) {
-        self.layer = layer;
+    /// The layer stack, for the panel's toggles and sliders.
+    pub fn layers_mut(&mut self) -> &mut LayerStack {
+        &mut self.layers
+    }
+
+    /// The frame's paint list: enabled layers the panel offers, in stack
+    /// order (bottom → top), each with its paint-time opacity. Only
+    /// these are scheduled and painted — a disabled or unsupported
+    /// layer never reaches the scheduler.
+    #[must_use]
+    pub fn schedulable_layers(&self) -> Vec<(Layer, f32)> {
+        self.layers
+            .enabled_layers()
+            .into_iter()
+            .filter(|layer| offers_layer(*layer))
+            .map(|layer| (layer, self.layers.opacity(layer)))
+            .collect()
+    }
+
+    /// The status bar's layer segment: the enabled layers joined with
+    /// `+` (e.g. `Biomes+Fluid`), or [`labels::LAYERS_NONE`] when the
+    /// map is blank on purpose.
+    #[must_use]
+    pub fn layer_summary(&self) -> String {
+        let enabled: Vec<&str> = self
+            .schedulable_layers()
+            .iter()
+            .map(|(layer, _)| layer_label(*layer))
+            .collect();
+        if enabled.is_empty() {
+            labels::LAYERS_NONE.to_string()
+        } else {
+            enabled.join("+")
+        }
     }
 
     /// The overlay checkboxes (mutable so the panel writes them directly).
@@ -889,14 +894,128 @@ mod tests {
     }
 
     #[test]
-    fn layer_and_overlay_placeholders_write_through() {
+    fn layers_default_to_biomes_and_toggle_through_the_stack() {
+        // T19: the radio became a stack of checkboxes. The default is
+        // the plan's (Biome alone at full opacity); toggling others
+        // grows the paint list in stack order, and the status summary
+        // follows.
         let mut state = state();
-        assert_eq!(state.layer(), AppLayer::Biomes, "biomes is the default");
-        for layer in AppLayer::ALL {
-            state.set_layer(layer);
-            assert_eq!(state.layer(), layer);
-        }
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![(Layer::Biome, 1.0)],
+            "the plan's default: one layer, full opacity"
+        );
+        assert_eq!(state.layer_summary(), labels::LAYER_BIOMES);
 
+        // Enabling Height and Fluid paints bottom → top in stack order.
+        assert!(state.layers_mut().set_enabled(Layer::Height, true));
+        assert!(state.layers_mut().set_enabled(Layer::Fluid, true));
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![
+                (Layer::Biome, 1.0),
+                (Layer::Height, 1.0),
+                (Layer::Fluid, 1.0)
+            ],
+            "the paint list is the stack's order, not the click order"
+        );
+        assert_eq!(
+            state.layer_summary(),
+            format!(
+                "{}+{}+{}",
+                labels::LAYER_BIOMES,
+                labels::LAYER_HEIGHT,
+                labels::LAYER_FLUID
+            )
+        );
+
+        // Opacity clamps into 0..=1 and feeds the paint list. A clamp
+        // that lands on the current value is a no-op write (false); a
+        // real change reports true and reaches the paint list.
+        assert!(!state.layers_mut().set_opacity(Layer::Height, 2.0));
+        assert_eq!(state.layers_mut().opacity(Layer::Height), 1.0, "clamped");
+        assert!(state.layers_mut().set_opacity(Layer::Height, 0.25));
+        assert_eq!(
+            state.schedulable_layers()[1],
+            (Layer::Height, 0.25),
+            "the slider's value reaches the paint list"
+        );
+
+        // Disabling everything is allowed: a blank map with a summary.
+        for layer in [Layer::Biome, Layer::Height, Layer::Fluid] {
+            state.layers_mut().set_enabled(layer, false);
+        }
+        assert_eq!(state.schedulable_layers(), Vec::new());
+        assert_eq!(state.layer_summary(), labels::LAYERS_NONE);
+    }
+
+    #[test]
+    fn layers_unoffered_and_future_layers_never_reach_the_scheduler() {
+        // The stack carries every planned layer so settings persist, but
+        // only layers with renderers get a checkbox and a tile request:
+        // Surface/Caves (T20/T28) are never schedulable however their
+        // entries read.
+        let mut state = state();
+        assert!(state.layers_mut().set_enabled(Layer::Surface, true));
+        assert!(state.layers_mut().set_enabled(Layer::CaveSlice, true));
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![(Layer::Biome, 1.0)],
+            "unsupported layers stay out of the request"
+        );
+        assert_eq!(state.layer_summary(), labels::LAYER_BIOMES);
+    }
+
+    #[test]
+    fn layers_survive_a_source_reload() {
+        // Session state, not source state: a reload (or a failed one)
+        // never touches the stack — T31 then serializes it across
+        // restarts.
+        let mut state = state();
+        assert!(state.layers_mut().set_enabled(Layer::Zone, true));
+        assert!(state.layers_mut().set_opacity(Layer::Zone, 0.4));
+        assert!(state.layers_mut().set_enabled(Layer::Biome, false));
+
+        state.set_seed_text(String::from("7"));
+        let request = state.begin_load().expect("the load issues");
+        assert!(state.apply_load_result(
+            request.generation,
+            Err(SourceError::Load(String::from("no such world"))),
+        ));
+        assert!(!state.layers().enabled_layers().contains(&Layer::Biome));
+        assert!(state.layers().enabled_layers().contains(&Layer::Zone));
+        assert_eq!(state.layers().opacity(Layer::Zone), 0.4);
+    }
+
+    #[test]
+    fn layers_labels_and_offers_agree_on_the_vocabulary() {
+        // Every planned layer has a label; the offered set is exactly
+        // the layers with renderers today (Zone joined with T19).
+        for layer in [
+            Layer::Biome,
+            Layer::Height,
+            Layer::Relief,
+            Layer::Fluid,
+            Layer::Surface,
+            Layer::CaveSlice,
+            Layer::CaveDensity,
+            Layer::Zone,
+        ] {
+            assert!(!layer_label(layer).is_empty(), "{layer:?} is labelled");
+            assert_eq!(
+                offers_layer(layer),
+                !matches!(
+                    layer,
+                    Layer::Surface | Layer::CaveSlice | Layer::CaveDensity
+                ),
+                "{layer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_placeholders_write_through() {
+        let mut state = state();
         let overlays = state.overlays_mut();
         overlays.chunk_grid = true;
         overlays.prefabs = false;
@@ -997,34 +1116,6 @@ mod tests {
             plain,
             "tiles 0 | zoom 1.0 pt/blk | 2×2 | Biomes | no source"
         );
-    }
-
-    #[test]
-    fn every_layer_radio_names_a_tile_layer_or_declares_it_pending() {
-        // The renderable radios map to their `Layer` (the tile keys carry
-        // it, so switching layers switches keys); the rest declare their
-        // pending task through the map placeholder instead.
-        assert_eq!(state().layer(), AppLayer::Biomes, "biomes is the default");
-        for (radio, tile_layer) in [
-            (AppLayer::Biomes, Some(Layer::Biome)),
-            (AppLayer::Surface, None),
-            (AppLayer::Height, Some(Layer::Height)),
-            (AppLayer::Relief, Some(Layer::Relief)),
-            (AppLayer::Fluid, Some(Layer::Fluid)),
-            (AppLayer::Caves, None),
-        ] {
-            assert_eq!(radio.tile_layer(), tile_layer, "{radio:?}");
-            // Every radio has a label; the panel order covers all of them.
-            assert!(!radio.label().is_empty());
-            assert!(AppLayer::ALL.contains(&radio));
-        }
-
-        // Every radio is selectable through the state machine.
-        let mut state = state();
-        for layer in AppLayer::ALL {
-            state.set_layer(layer);
-            assert_eq!(state.layer(), layer);
-        }
     }
 
     // -- The ready transition, gated on the real generator ------------------

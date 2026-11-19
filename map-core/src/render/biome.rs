@@ -271,7 +271,8 @@ mod tests {
     use crate::render::tiles::tile_query;
     use crate::scheduler::cancel_token;
     use crate::types::{
-        GeneratorIdentity, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
+        GeneratorIdentity, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid,
+        ZoneId,
     };
 
     fn catalog_with(entries: &[(i32, u32)]) -> BiomeCatalog {
@@ -544,6 +545,10 @@ mod tests {
         }
 
         fn zone_at(&self, _x: i32, _z: i32) -> SourceResult<Option<ZoneId>> {
+            Err(unused())
+        }
+
+        fn zone_region(&self, _rect: Rect, _step: u32) -> SourceResult<ZoneGrid> {
             Err(unused())
         }
 

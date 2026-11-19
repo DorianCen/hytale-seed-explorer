@@ -28,6 +28,7 @@ use crate::render::biome::BiomeTileRenderer;
 use crate::render::fluid::FluidTileRenderer;
 use crate::render::height::HeightTileRenderer;
 use crate::render::relief::ReliefTileRenderer;
+use crate::render::zone::ZoneTileRenderer;
 use crate::scheduler::{CancelToken, TileRenderer};
 use crate::source::WorldSource;
 use crate::tiles::{Tile, TileKey};
@@ -226,6 +227,7 @@ pub struct LayeredTileRenderer {
     height: HeightTileRenderer,
     relief: ReliefTileRenderer,
     fluid: FluidTileRenderer,
+    zone: ZoneTileRenderer,
 }
 
 impl LayeredTileRenderer {
@@ -237,7 +239,8 @@ impl LayeredTileRenderer {
             biome: BiomeTileRenderer::new(Arc::clone(&source), world),
             height: HeightTileRenderer::new(Arc::clone(&source), world),
             relief: ReliefTileRenderer::new(Arc::clone(&source), world),
-            fluid: FluidTileRenderer::new(source, world, fluid_opacity),
+            fluid: FluidTileRenderer::new(Arc::clone(&source), world, fluid_opacity),
+            zone: ZoneTileRenderer::new(source, world),
         }
     }
 }
@@ -249,7 +252,8 @@ impl TileRenderer for LayeredTileRenderer {
             Layer::Height => TileRenderer::render(&self.height, key, cancel),
             Layer::Relief => TileRenderer::render(&self.relief, key, cancel),
             Layer::Fluid => TileRenderer::render(&self.fluid, key, cancel),
-            Layer::Surface | Layer::CaveSlice | Layer::CaveDensity | Layer::Zone => {
+            Layer::Zone => TileRenderer::render(&self.zone, key, cancel),
+            Layer::Surface | Layer::CaveSlice | Layer::CaveDensity => {
                 Err(SourceError::Unsupported(
                     "this layer has no renderer yet (surface: T20/T21, caves: T28)",
                 ))

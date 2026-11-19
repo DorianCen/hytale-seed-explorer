@@ -27,7 +27,9 @@ use map_core::source::worldgen::default_world_path;
 use crate::inspector::{self, HoverKnowledge, HoverReply, Readout};
 use crate::labels;
 use crate::map_view::MapView;
-use crate::state::{self, AppLayer, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS};
+use crate::state::{
+    self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, layer_label, offers_layer,
+};
 
 /// How often to wake the UI while a background load is in flight.
 const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -395,10 +397,12 @@ impl SeedExplorerApp {
             });
     }
 
-    /// The plan's left panel: layer radios, overlay checkboxes, search
-    /// placeholder, the inspector (T18) and the palette diagnostics.
+    /// The plan's left panel: the layer stack's checkboxes and opacity
+    /// sliders (T19), overlay checkboxes, search placeholder, the
+    /// inspector (T18), the zone legend and the palette diagnostics.
     /// Widget order is stable across frames so egui keeps its state;
-    /// every control writes into [`AppState`].
+    /// every control writes into [`AppState`] — through buffered locals
+    /// where a closure would otherwise hold the borrow.
     fn left_panel(&mut self, ctx: &Context) {
         // Consumed here so the F shortcut highlights the section once.
         let flash_search = self.state.take_search_focus();
@@ -413,21 +417,45 @@ impl SeedExplorerApp {
         let effective = self.state.view().tile_step(step);
         let mut copied = false;
 
+        // The layer stack's edits, buffered while the panel closure
+        // borrows the stack read-only and applied after it returns.
+        let mut toggled: Option<(map_core::render::Layer, bool)> = None;
+        let mut opacity_edited: Option<(map_core::render::Layer, f32)> = None;
+
         egui::SidePanel::left(Id::new("left-panel"))
             .default_width(190.0)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.label(RichText::new(labels::GROUP_LAYERS).strong());
-                let mut layer = self.state.layer();
-                for candidate in AppLayer::ALL {
+                // Every offered layer in stack order: the checkbox, and
+                // — while enabled — its opacity slider. Order is paint
+                // order, bottom → top; the unoffered future layers get
+                // their grayed "arrives with" notes instead.
+                for settings in self.state.layers().iter().filter(|s| offers_layer(s.id)) {
+                    let mut enabled = settings.enabled;
                     if ui
-                        .radio_value(&mut layer, candidate, candidate.label())
+                        .checkbox(&mut enabled, layer_label(settings.id))
                         .changed()
                     {
-                        self.state.set_layer(layer);
+                        toggled = Some((settings.id, enabled));
+                    }
+                    if enabled {
+                        let mut opacity = settings.opacity;
+                        ui.horizontal(|ui| {
+                            ui.label(labels::OPACITY);
+                            if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)).changed() {
+                                opacity_edited = Some((settings.id, opacity));
+                            }
+                        });
                     }
                 }
+                ui.label(RichText::new(labels::MAP_PLACEHOLDER_SURFACE).weak());
+                ui.label(RichText::new(labels::MAP_PLACEHOLDER_CAVES).weak());
+                // The plan's climate debug layers: only if the
+                // generator exposes a per-column query — it does not,
+                // and the refusal is explicit rather than approximated.
+                ui.label(RichText::new(labels::CLIMATE_NOTE).weak());
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -568,8 +596,49 @@ impl SeedExplorerApp {
                                 });
                             }
                         });
+
+                    // The zone debug layer's legend (T19): the layer
+                    // colors by a stable name hash, so the legend is how
+                    // a color becomes a name again.
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(labels::ZONE_LEGEND)
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mut zones: Vec<_> = source.zone_catalog().iter().collect();
+                            if zones.is_empty() {
+                                ui.label(labels::ZONE_NONE);
+                            }
+                            // Sorted like the palette: stable list, no
+                            // HashMap jitter.
+                            zones.sort_by(|a, b| a.name.cmp(&b.name));
+                            for info in zones {
+                                let [r, g, b] = map_core::render::zone_color(&info.name);
+                                ui.horizontal(|ui| {
+                                    let (swatch, _) = ui.allocate_exact_size(
+                                        Vec2::new(12.0, 12.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        swatch,
+                                        2.0,
+                                        Color32::from_rgb(r, g, b),
+                                    );
+                                    ui.label(&info.name);
+                                });
+                            }
+                        });
                 }
             });
+        // The layer edits were buffered while the panel held the stack:
+        // apply them here, where the state is mutable again. Each write
+        // marks the stack dirty (T31's persistence hook) and the next
+        // frame's request follows the new settings.
+        if let Some((layer, enabled)) = toggled {
+            self.state.layers_mut().set_enabled(layer, enabled);
+        }
+        if let Some((layer, opacity)) = opacity_edited {
+            self.state.layers_mut().set_opacity(layer, opacity);
+        }
         // The copy button only sets a flag inside the panel: the
         // clipboard write and the status feedback happen here, where
         // the state is mutable again.
@@ -660,7 +729,9 @@ impl SeedExplorerApp {
             // The step the renderer actually samples at — the zoom may
             // force coarser than the selector's minimum.
             self.state.view().tile_step(self.state.resolution_step()),
-            self.state.layer().label(),
+            // The enabled layer set, e.g. "Biomes+Fluid", or the blank
+            // map's word.
+            &self.state.layer_summary(),
             self.state.source_status_text(),
         ));
         if !self.state.status().is_empty() {
@@ -719,7 +790,11 @@ mod tests {
         assert!(app.load_rx.is_none(), "no load was spawned");
         assert!(app.hover_rx.is_none(), "no hover request was spawned");
         assert_eq!(app.state.resolution_step(), 2, "the 2x2 default");
-        assert_eq!(app.state.layer(), AppLayer::Biomes);
+        // The plan's default layer set: Biome alone, at full opacity.
+        assert_eq!(
+            app.state.schedulable_layers(),
+            vec![(map_core::render::Layer::Biome, 1.0)]
+        );
         assert_eq!(app.map.pending_tiles(), 0, "no tiles pending");
         // The interactive view starts at the plan's initial view: the
         // origin at one point per block.
@@ -732,14 +807,15 @@ mod tests {
             format!("{} {}", labels::VERSION, map_core::GENERATOR_VERSION),
         );
         // Status formatting is available before anything is loaded; the
-        // tail carries the plan's default resolution.
+        // tail carries the plan's default resolution and the default
+        // layer set.
         assert!(
             state::format_status(
                 0,
                 app.state.view().scale(),
                 app.state.resolution_step(),
                 app.state.view().tile_step(app.state.resolution_step()),
-                app.state.layer().label(),
+                &app.state.layer_summary(),
                 app.state.source_status_text(),
             )
             .contains("2×2")

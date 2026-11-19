@@ -36,7 +36,7 @@ use crate::source::chunks::{
 };
 use crate::types::{
     BiomeGrid, BiomeId, BlockId, FluidId, GeneratorIdentity, HeightGrid, Rect, Seed, SliceGrid,
-    SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
+    SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
 pub(crate) use pool::LoadSpec;
@@ -484,6 +484,18 @@ impl WorldSource for WorldgenSource {
         self.pool.zone_at(x, z)
     }
 
+    fn zone_region(&self, rect: Rect, step: u32) -> SourceResult<ZoneGrid> {
+        let out = self.pool.zone_region(rect, step, self.fresh_cancel())?;
+        Ok(ZoneGrid::new(
+            out.origin_x,
+            out.origin_z,
+            out.step,
+            out.width,
+            out.height,
+            out.values,
+        ))
+    }
+
     fn biome_catalog(&self) -> &BiomeCatalog {
         &self.catalogs.biomes
     }
@@ -660,6 +672,37 @@ pub(crate) fn biome_region(
         }
     }
     GridOut::new(rect, step, width, height, ids)
+}
+
+/// Serves one zone band: per-sample zone lookup from the same result as
+/// the biome walk, checking the cancellation token between row batches.
+/// A column where the generator reports no zone stays [`None`].
+pub(crate) fn zone_region(
+    generator: &Rc<ChunkGenerator>,
+    seed: i32,
+    rect: Rect,
+    step: u32,
+    cancel: &CancelToken,
+) -> SourceResult<GridOut<Option<ZoneId>>> {
+    let (width, height) = rect.sample_dims(step);
+    let mut zones = Vec::with_capacity((width * height) as usize);
+    for z in 0..height {
+        if z % CANCEL_CHECK_ROWS == 0 && cancel.load(Ordering::Relaxed) {
+            return Err(SourceError::Cancelled);
+        }
+        let world_z = rect.min_z + z as i32 * step as i32;
+        for x in 0..width {
+            let world_x = rect.min_x + x as i32 * step as i32;
+            let result = generator.get_zone_biome_result_at(seed, world_x, world_z);
+            zones.push(
+                result
+                    .get_zone_result()
+                    .and_then(|zone_result| zone_result.get_zone())
+                    .map(|zone| ZoneId(zone.id)),
+            );
+        }
+    }
+    GridOut::new(rect, step, width, height, zones)
 }
 
 /// Serves one height band: per-sample `get_height`, checking the

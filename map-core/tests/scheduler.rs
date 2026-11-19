@@ -141,7 +141,7 @@ fn scheduler_renders_visible_tiles_nearest_center_first() {
     let subject = subject();
 
     let generation = scheduler.schedule(
-        subject,
+        &[subject],
         visible,
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -228,7 +228,7 @@ fn scheduler_duplicate_schedule_calls_do_not_duplicate_jobs() {
     let generations: Vec<u64> = (0..3)
         .map(|_| {
             scheduler.schedule(
-                subject,
+                &[subject],
                 visible,
                 TileCoord::new(0, 0),
                 Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -252,7 +252,7 @@ fn scheduler_duplicate_schedule_calls_do_not_duplicate_jobs() {
 
     // Re-scheduling after completion re-dedups against the cache.
     let after = scheduler.schedule(
-        subject,
+        &[subject],
         visible,
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -278,7 +278,7 @@ fn scheduler_cached_tiles_are_not_requested_again() {
     cache.insert(Arc::new(preexisting));
 
     scheduler.schedule(
-        subject,
+        &[subject],
         view(0, 0, 3),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -317,7 +317,7 @@ fn scheduler_cancel_outside_stops_in_flight_and_queued_tiles() {
     let subject = subject();
 
     scheduler.schedule(
-        subject,
+        &[subject],
         view(0, 0, 5),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -377,6 +377,82 @@ fn scheduler_cancel_outside_stops_in_flight_and_queued_tiles() {
 }
 
 #[test]
+fn scheduler_cancel_not_serving_stops_a_disabled_layer_only() {
+    // T19's toggle row: two layers over the same view, long renders so
+    // the cancellation lands mid-flight. Dropping one layer from the
+    // request cancels exactly that layer's tiles; the other layer keeps
+    // serving, and re-requesting the disabled layer revives its
+    // queued tile (the cache-dedup path never duplicated it).
+    let cache = Arc::new(TileCache::new(1024 * 1024));
+    let scheduler = TileScheduler::new(2, Arc::clone(&cache));
+    let events = scheduler.events();
+    let renderer = Arc::new(FakeRenderer::new(60));
+    let biome = subject();
+    let height = TileSubject::new(1, 7, Layer::Height, 0, ZoomLevel::MIN);
+
+    scheduler.schedule(
+        &[biome, height],
+        view(0, 0, 3),
+        TileCoord::new(0, 0),
+        Arc::clone(&renderer) as Arc<dyn TileRenderer>,
+    );
+    std::thread::sleep(Duration::from_millis(30));
+
+    // The height layer's checkbox unticks: only biome tiles are served.
+    scheduler.cancel_not_serving(&[biome], &view(0, 0, 3));
+
+    assert!(
+        wait_until(30_000, || idle(&scheduler)),
+        "the pipeline settles after the layer toggle: {:?}",
+        scheduler.stats()
+    );
+    let stats = scheduler.stats();
+    assert_eq!(
+        stats.cancelled, 9,
+        "exactly the height layer's nine tiles stopped"
+    );
+    assert_eq!(stats.failed, 0, "no failures, only cancellations");
+
+    // Re-requesting both layers revives the height tiles (revive, not
+    // duplicate) and every tile of both layers eventually completes.
+    scheduler.schedule(
+        &[biome, height],
+        view(0, 0, 3),
+        TileCoord::new(0, 0),
+        Arc::clone(&renderer) as Arc<dyn TileRenderer>,
+    );
+    assert!(
+        wait_until(30_000, || {
+            let stats = scheduler.stats();
+            stats.completed == 18 && idle(&scheduler)
+        }),
+        "both layers complete after the toggle-back: {:?}",
+        scheduler.stats()
+    );
+    assert_eq!(
+        renderer.start_order().len(),
+        18,
+        "no tile rendered twice across the toggle cycle"
+    );
+    // Every height tile landed in the cache with exactly one Ready.
+    for tx in -1..=1 {
+        for ty in -1..=1 {
+            assert!(
+                cache.contains(&height.key_at(tx, ty)),
+                "height tile ({tx}, {ty}) is cached after the revive"
+            );
+        }
+    }
+    assert_eq!(
+        drain(&events)
+            .iter()
+            .filter(|event| matches!(event, TileEvent::Ready { .. }))
+            .count(),
+        18
+    );
+}
+
+#[test]
 fn scheduler_stale_generation_events_are_marked_not_fresh() {
     // Two disjoint one-tile views: the tile of view A finishes under
     // generation 1 while the app has already moved to generation 2.
@@ -387,13 +463,13 @@ fn scheduler_stale_generation_events_are_marked_not_fresh() {
     let subject = subject();
 
     let gen_a = scheduler.schedule(
-        subject,
+        &[subject],
         TileRect::new(TileCoord::new(0, 0), TileCoord::new(0, 0)),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
     );
     let gen_b = scheduler.schedule(
-        subject,
+        &[subject],
         TileRect::new(TileCoord::new(10, 10), TileCoord::new(10, 10)),
         TileCoord::new(10, 10),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -439,7 +515,7 @@ fn scheduler_panic_is_contained_and_reported() {
     let renderer = Arc::new(FakeRenderer::with_panics(2, &panics));
 
     scheduler.schedule(
-        subject,
+        &[subject],
         view(0, 0, 5),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -478,7 +554,7 @@ fn scheduler_shutdown_joins_all_workers_cleanly() {
     let scheduler = TileScheduler::new(2, Arc::clone(&cache));
     let renderer = Arc::new(FakeRenderer::new(30));
     scheduler.schedule(
-        subject(),
+        &[subject()],
         view(0, 0, 3),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -506,7 +582,7 @@ fn scheduler_cancelling_one_hundred_tiles_mid_render_stops_early() {
     let renderer = Arc::new(FakeRenderer::new(5));
 
     scheduler.schedule(
-        subject(),
+        &[subject()],
         view(0, 0, 10),
         TileCoord::new(0, 0),
         Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -545,7 +621,7 @@ fn scheduler_thirty_view_changes_settle_on_the_final_view() {
     for step in 0..30 {
         let visible = view(i64::from(step), 0, 3);
         scheduler.schedule(
-            subject,
+            &[subject],
             visible,
             TileCoord::new(i64::from(step), 0),
             Arc::clone(&renderer) as Arc<dyn TileRenderer>,
@@ -567,7 +643,7 @@ fn scheduler_thirty_view_changes_settle_on_the_final_view() {
     assert!(
         wait_until(30_000, || {
             scheduler.schedule(
-                subject,
+                &[subject],
                 final_view,
                 TileCoord::new(29, 0),
                 Arc::clone(&renderer) as Arc<dyn TileRenderer>,

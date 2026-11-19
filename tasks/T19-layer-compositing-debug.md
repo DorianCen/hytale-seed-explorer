@@ -1,6 +1,27 @@
 # T19 — Layer compositing and debug layers
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/layers.rs` — `LayerSettings`
+/`LayerStack` (the full planned set bottom → top, enable/disable,
+opacity clamped 0..=1, reorder, serde for T31, a dirty flag) and
+`blend_over`, the one straight-alpha compositing primitive the app's
+egui tints and a future export (T32) share — plus the zone debug layer:
+`WorldSource::zone_region` (a batched `ZoneGrid` of `Option<ZoneId>`
+through the worker pool's band-split machinery, verified against
+`zone_at` on the real generator), `render/zone.rs` (`zone_color` — a
+stable FNV-1a hash of the zone *name* over the hue wheel —
+`zone_image` with None-transparent and `zone#N` fallbacks,
+`ZoneTileRenderer`), the `LayeredTileRenderer`/CLI dispatch, and the
+compositing wiring: `TileScheduler::schedule` takes the frame's whole
+subject slice with `cancel_not_serving` (a disabled layer's pending
+tiles stop), `map_view` paints enabled layers bottom → top tinted with
+`Color32::from_white_alpha(opacity)` (base layer keeps the progressive
+placeholder), and the panel's checkboxes/sliders replace the radio
+with a zone legend, future-layer notes and the explicit climate
+refusal. Acceptance filters green: `cargo test -p map-core layers`
+(lib + goldens; 17 with `--features test-support`, incl. the 4×4
+golden composite and the stack/serde/blend tests),
+`cargo test -p map-app layers` (7), full suites 169/67/4 passed.)
+
 **Milestone:** 4 — Layers and inspector
 **Depends on:** T13, T17, T18
 **Blocks:** T21

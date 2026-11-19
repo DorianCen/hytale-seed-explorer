@@ -70,6 +70,12 @@ pub(crate) enum Command {
         cancel: CancelToken,
         reply: Reply<GridOut<crate::types::BiomeId>>,
     },
+    ZoneRegion {
+        rect: Rect,
+        step: u32,
+        cancel: CancelToken,
+        reply: Reply<GridOut<Option<crate::types::ZoneId>>>,
+    },
     HeightRegion {
         rect: Rect,
         step: u32,
@@ -344,6 +350,24 @@ impl GeneratorPool {
         })
     }
 
+    /// Requests a zone grid over `rect`, band-split across the pool (T19's
+    /// debug layer; same cheap per-sample zone lookup as `zone_at`).
+    pub fn zone_region(
+        &self,
+        rect: Rect,
+        step: u32,
+        cancel: CancelToken,
+    ) -> SourceResult<GridOut<Option<crate::types::ZoneId>>> {
+        self.region(rect, step, cancel, |rect, step, cancel, reply| {
+            Command::ZoneRegion {
+                rect,
+                step,
+                cancel,
+                reply,
+            }
+        })
+    }
+
     /// Requests a height grid over `rect`, band-split across the pool.
     pub fn height_region(
         &self,
@@ -554,6 +578,16 @@ fn worker_main(
             } => {
                 let result =
                     crate::source::worldgen::height_region(&generator, seed, rect, step, &cancel);
+                let _ = send_reply(reply, result);
+            }
+            Command::ZoneRegion {
+                rect,
+                step,
+                cancel,
+                reply,
+            } => {
+                let result =
+                    crate::source::worldgen::zone_region(&generator, seed, rect, step, &cancel);
                 let _ = send_reply(reply, result);
             }
             Command::SpawnPoints { reply } => {
