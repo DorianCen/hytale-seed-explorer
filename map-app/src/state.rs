@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use map_core::error::SourceResult;
+use map_core::render::Layer;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
 use map_core::types::{Seed, SeedError};
 
@@ -35,14 +36,16 @@ use crate::view_state::MapViewState;
 /// The plan's default is 2×2.
 pub const RESOLUTION_STEPS: [u32; 4] = [1, 2, 4, 8];
 
-/// The layer radios in the left panel. Placeholder data until the real
-/// renderers land: `Biomes` is the only one with a renderer (T11); the
-/// others exist so the panel shape is frozen and T13/T17/T28 wire them.
+/// The layer radios in the left panel. `Biomes`, `Height`, `Relief` and
+/// `Fluid` render (T13/T17); `Surface` and `Caves` exist so the panel
+/// shape is frozen and T20/T28 wire their renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppLayer {
     Biomes,
     Surface,
     Height,
+    Relief,
+    Fluid,
     Caves,
 }
 
@@ -55,15 +58,36 @@ impl AppLayer {
             AppLayer::Biomes => labels::LAYER_BIOMES,
             AppLayer::Surface => labels::LAYER_SURFACE,
             AppLayer::Height => labels::LAYER_HEIGHT,
+            AppLayer::Relief => labels::LAYER_RELIEF,
+            AppLayer::Fluid => labels::LAYER_FLUID,
             AppLayer::Caves => labels::LAYER_CAVES,
         }
     }
 
+    /// The layer the tile pipeline renders for this radio, when it has a
+    /// renderer. The tile keys carry it, so switching layers switches
+    /// keys — stale tiles of the previous layer can never be served.
+    ///
+    /// [`None`] = the renderer is a later task's (the map shows the
+    /// "arrives with T…" placeholder).
+    #[must_use]
+    pub fn tile_layer(self) -> Option<Layer> {
+        match self {
+            AppLayer::Biomes => Some(Layer::Biome),
+            AppLayer::Height => Some(Layer::Height),
+            AppLayer::Relief => Some(Layer::Relief),
+            AppLayer::Fluid => Some(Layer::Fluid),
+            AppLayer::Surface | AppLayer::Caves => None,
+        }
+    }
+
     /// All layers in panel order.
-    pub const ALL: [AppLayer; 4] = [
+    pub const ALL: [AppLayer; 6] = [
         AppLayer::Biomes,
         AppLayer::Surface,
         AppLayer::Height,
+        AppLayer::Relief,
+        AppLayer::Fluid,
         AppLayer::Caves,
     ];
 }
@@ -630,7 +654,7 @@ impl AppState {
 ///
 /// ```text
 /// X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass |
-/// tiles 12 pending | zoom 1.0 pt/blk | 2×2 | ready
+/// tiles 12 pending | zoom 1.0 pt/blk | 2×2 | Relief | ready
 /// ```
 #[must_use]
 pub fn format_status(
@@ -639,6 +663,7 @@ pub fn format_status(
     pending_tiles: u32,
     zoom: f64,
     step: u32,
+    layer: &str,
     source_status: &str,
 ) -> String {
     let (x_text, z_text) = match cursor {
@@ -663,7 +688,7 @@ pub fn format_status(
     format!(
         "X:{x_text} Z:{z_text} | {BIO}: {biome} | {HEIGHT}: {height} | \
          {BLOCK}: {block} | {TILES} {pending_tiles} | {ZOOM} {zoom:.1} {PTBLK} | \
-         {step}×{step} | {source_status}",
+         {step}×{step} | {layer} | {source_status}",
         BIO = labels::STATUS_BIOME,
         HEIGHT = labels::STATUS_HEIGHT,
         BLOCK = labels::STATUS_BLOCK,
@@ -869,20 +894,56 @@ mod tests {
             height: 71,
             block: String::from("Grass"),
         };
-        let line = format_status(Some((-1203, 455)), Some(&sample), 12, 0.5, 2, "ready");
+        let line = format_status(
+            Some((-1203, 455)),
+            Some(&sample),
+            12,
+            0.5,
+            2,
+            "Relief",
+            "ready",
+        );
         assert_eq!(
             line,
             "X:-1203 Z:455 | Biome: Emerald Grove | Height: 71 | Block: Grass \
-             | tiles 12 | zoom 0.5 pt/blk | 2×2 | ready"
+             | tiles 12 | zoom 0.5 pt/blk | 2×2 | Relief | ready"
         );
 
         // The all-unknown case: works before any source or cursor exists.
-        let unknown = format_status(None, None, 0, 1.0, 2, "no source");
+        let unknown = format_status(None, None, 0, 1.0, 2, "Biomes", "no source");
         assert_eq!(
             unknown,
             "X:unknown Z:unknown | Biome: unknown | Height: unknown | \
-             Block: unknown | tiles 0 | zoom 1.0 pt/blk | 2×2 | no source"
+             Block: unknown | tiles 0 | zoom 1.0 pt/blk | 2×2 | Biomes | no source"
         );
+    }
+
+    #[test]
+    fn every_layer_radio_names_a_tile_layer_or_declares_it_pending() {
+        // The renderable radios map to their `Layer` (the tile keys carry
+        // it, so switching layers switches keys); the rest declare their
+        // pending task through the map placeholder instead.
+        assert_eq!(state().layer(), AppLayer::Biomes, "biomes is the default");
+        for (radio, tile_layer) in [
+            (AppLayer::Biomes, Some(Layer::Biome)),
+            (AppLayer::Surface, None),
+            (AppLayer::Height, Some(Layer::Height)),
+            (AppLayer::Relief, Some(Layer::Relief)),
+            (AppLayer::Fluid, Some(Layer::Fluid)),
+            (AppLayer::Caves, None),
+        ] {
+            assert_eq!(radio.tile_layer(), tile_layer, "{radio:?}");
+            // Every radio has a label; the panel order covers all of them.
+            assert!(!radio.label().is_empty());
+            assert!(AppLayer::ALL.contains(&radio));
+        }
+
+        // Every radio is selectable through the state machine.
+        let mut state = state();
+        for layer in AppLayer::ALL {
+            state.set_layer(layer);
+            assert_eq!(state.layer(), layer);
+        }
     }
 
     // -- The ready transition, gated on the real generator ------------------

@@ -1,6 +1,47 @@
 # T17 — Height, relief and fluid layers
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/render/tiles.rs` grew the
+shared per-tile plumbing — `TileQuery`/`tile_query` (T16's aligned
+query generalized with a border ring, `ceil_div` moved to `coords.rs`),
+`blit_patch`, the `render_layer_tile` skeleton, and
+`LayeredTileRenderer` dispatching on the tile key's layer — plus
+`map-core/src/render/height.rs` (`SEA_LEVEL`, the documented
+`HEIGHT_COLORS` hypsometric ramp, `height_color`/`height_image`,
+`HeightTileRenderer`; the task's "optional contour/shade hook, disabled
+by default" is the relief layer's own existence — compositing a shade
+onto other layers is T19's), `relief.rs` (one-sample-border hillshade ×
+the height ramp; NW light per the T13 convention — the task's light
+vector with the Z sign flipped and the flip documented; per-block slope
+normalization so zoom levels shade alike; nearest-valid-height edge
+clamping — no wrap, no zeros, no seams; `ReliefTileRenderer`) and
+`fluid.rs` (`FLUID_COLOR`, `DEFAULT_FLUID_OPACITY`,
+`fluid_color`/`fluid_image` with the depth-capped blend that never
+saturates, dry pass-through; `FluidTileRenderer`); the app's radios
+gained Relief/Fluid with `AppLayer::tile_layer()` driving the tile
+subject (switching layers switches keys — no stale tiles by
+construction), the status bar shows the layer name, and the map
+placeholder distinguishes "arrives with T20/T28" from "outside the
+world"; `map-cli render --layer height|relief|fluid`; tests:
+`height_render_*`/`relief_render_*`/`fluid_render_*` unit tests
+(3+5+4: the ramp at key elevations, light-facing brightness, flat
+uniformity, edge clamping, step normalization, monotone capped depth,
+dry pass-through, cancellation between row batches),
+`map-core/tests/layers.rs` (9: fake-driven tile end-to-end — ramp
+exactness against the queried heights, seam-free relief across a tile
+boundary, wet/dry fluid, pre-query cancellation, typed unsupported for
+renderer-less layers — and three generator-gated goldens on the varied
+shore window at `(272, -192)`: height four bands, relief a shaded
+spectrum, fluid real wet blends; byte-identical repeats), plus one
+map-app layer-switching pipeline test; benchmark rows in
+`docs/benchmarks.md` §Layer tiles (T04 format): height tile 20.38 s
+median / relief 20.63 s at 2 workers — the 65,536-column tile exceeds
+the generator's 50,000-entry column cache and pays the honest churn
+(the no-chunk design this task chose; summary-derived heights stay
+T33's follow-up), fluid tile 86.23 s cold / ~0.2 s warm summaries; the
+task's manual `worldgen-cli render-map --mode Height` shape check was
+automated and passed: the reference grayscale inverted back to heights
+agrees with the explorer's height field 4,096/4,096 within the 8-bit
+quantization)
 **Milestone:** 4 — Layers and inspector
 **Depends on:** T09, T15
 **Blocks:** T19, T21

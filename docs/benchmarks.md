@@ -122,6 +122,50 @@ Java JMH references from the port's own bench headers: `weighted_lookup_03`
 `weighted_lookup_10` 21.73 ns (Rust ~1.6× faster). First baseline run — no
 criterion change statistics yet.
 
+## Layer tiles (T17)
+
+One full layer tile through the whole pipeline — the 256×256-sample rect a
+tile of the map asks for, at the plan's default 2×2 sampling (512×512
+blocks) — via `map-cli render --release`, seed 0, 2 workers, cold caches:
+
+```sh
+cargo build --release -p map-cli
+./target/release/map-cli render --world testdata/Default --seed 0 \
+  --center 0,0 --size 256 --step 2 --layer height --out target/height-tile.png
+./target/release/map-cli render --world testdata/Default --seed 0 \
+  --center 0,0 --size 256 --step 2 --layer relief --out target/relief-tile.png
+./target/release/map-cli render --world testdata/Default --seed 0 \
+  --center 0,0 --size 256 --step 2 --layer fluid --out target/fluid-tile.png
+```
+
+| Metric | Median | p95 (worst of n) |
+|---|---:|---:|
+| Height tile (65,536 column queries, +ramp) | **20.38 s** (n=3) | 20.40 s |
+| Relief tile (bordered 258×258 query, +hillshade) | **20.63 s** (n=3) | 20.86 s |
+| Fluid tile (surface summaries, 256 chunks cold, 2 workers) | **86.23 s** (n=1, cold) | — |
+
+What the numbers say:
+
+- **The height path is the generator's column cache, not the columns.**
+  A tile always asks for 65,536 samples and the per-instance column cache
+  holds 50,000 (the T01 §4 thrash finding): every height/relief tile pays
+  the ~310 µs/sample steady state — 3.5× better than the raw probe's
+  single-threaded 70 s (T04), thanks to the pool's band-splitting, but
+  still far from the **0.031 s** of a biome-warm 4,096-sample window
+  (T08). Windows under the cache are µs/sample; the tile shape is what
+  breaks it. Follow-ups for T33: derive tile heights from the chunk
+  summaries (T09's cached-surface row: 0.21 s warm) instead of per-column
+  queries, or cap a tile's sample count for the expensive layers.
+- **The fluid path is chunk-bound**, as T09 predicted: 256 chunks per
+  512-block tile at ~0.34 s each (2 workers) ≈ 86 s cold; warm summaries
+  bring the same tile to ~0.2 s. The summary cache does the work — the
+  first tile over any area is the expensive one, for every layer.
+- **Relief's border is free** (20.63 vs 20.38 s: the 258×258 query rides
+  the same churn), and the shading itself is nanoseconds per sample.
+- The layer goldens (tests/layers.rs) sit on a 256-block shore window at
+  step 4 (height/relief ≈ 0.4 s debug, under the cache) and a 128-block
+  window at step 2 for fluids (16 chunks ≈ 30 s debug cold).
+
 ## Feature enumeration (10,000×10,000)
 
 **Blocked on T22** (no public `features_in` query exists yet — T01 audit §2).
@@ -223,6 +267,9 @@ Only release runs on the environment above (or note the change).
 | 2026-11-18 | slice region 4,096 @ y=64 (4 chunks, cold), 2 workers | 1.80 s | `pool_bench` as above | T09 |
 | 2026-11-18 | surface region @ step 2, summaries cached | 0.21 s | `pool_bench` as above | T09 |
 | 2026-11-18 | biome 512×512 PNG end to end (map-cli render, 2 workers, cold caches) | 1.08 s load + 3.47 s sample+encode | `cargo run --release -p map-cli -- render --seed 0 --center 0,0 --size 512 --step 2 --layer biome --out target/region-512.png` | T11 |
+| 2026-11-19 | height tile 65,536 cols @ step 2 (map-cli render, 2 workers) | 20.38 s median / 20.40 p95 | `cargo run --release -p map-cli -- render --seed 0 --center 0,0 --size 256 --step 2 --layer height ...` | T17 |
+| 2026-11-19 | relief tile (bordered query + hillshade, same setup) | 20.63 s median / 20.86 p95 | `... --layer relief ...` | T17 |
+| 2026-11-19 | fluid tile (256 chunk summaries cold, 2 workers) | 86.23 s (n=1) | `... --layer fluid ...` | T17 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

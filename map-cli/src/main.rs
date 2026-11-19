@@ -51,8 +51,8 @@ struct RenderArgs {
     #[arg(long, default_value_t = 2)]
     step: u32,
 
-    /// The layer to render (`biome` has a renderer today; the rest
-    /// arrive with T17/T20/T28).
+    /// The layer to render: `biome`, `height`, `relief` and `fluid`
+    /// render (T13/T17); the rest arrive with T20/T28.
     #[arg(long, default_value = "biome")]
     layer: Layer,
 
@@ -157,15 +157,6 @@ fn render(args: RenderArgs) -> Result<(), String> {
     let center = parse_center(&args.center)?;
     let rect = center_rect(center, args.size, args.step)?;
 
-    // Only the biome layer renders today (T13); the other names parse
-    // for keys/share strings but have no renderer yet.
-    let Layer::Biome = args.layer else {
-        return Err(format!(
-            "the layer '{}' has no renderer yet (T17/T20/T28 wire them)",
-            args.layer
-        ));
-    };
-
     let mut config = WorldgenSourceConfig::new(&args.world, &args.seed);
     config.assets_root = args.assets;
     config.registries_path = args.registries;
@@ -187,27 +178,102 @@ fn render(args: RenderArgs) -> Result<(), String> {
         center.1,
         source.worker_count(),
     );
+    let cancel = map_core::scheduler::cancel_token();
     let started = Instant::now();
-    let grid = source
-        .biome_region(rect, args.step)
-        .map_err(|error| error.to_string())?;
+    // The layer picks the query and the coloring (T17): heights ride the
+    // cheap per-column path; fluids ride the chunk-summary surface path;
+    // relief expands the rect by one sample ring so the output's edges
+    // shade exactly like the interior (the same reason tiles carry a
+    // border). The renderer-less layers name their pending task.
+    let image = match args.layer {
+        Layer::Biome => {
+            let grid = source
+                .biome_region(rect, args.step)
+                .map_err(|error| error.to_string())?;
+            render_biome_rgba(&grid, source.biome_catalog())
+        }
+        Layer::Height => {
+            let grid = source
+                .height_region(rect, args.step)
+                .map_err(|error| error.to_string())?;
+            map_core::render::height::height_image(&grid, &cancel)
+                .map_err(|error| error.to_string())?
+        }
+        Layer::Relief => {
+            let bordered = expand_by_step(rect, args.step)?;
+            let grid = source
+                .height_region(bordered, args.step)
+                .map_err(|error| error.to_string())?;
+            // The grid starts one sample north-west of the output; its
+            // outer ring is read for shading, never painted.
+            map_core::render::relief::relief_image(&grid, (-1, -1), args.size, args.size, &cancel)
+                .map_err(|error| error.to_string())?
+        }
+        Layer::Fluid => {
+            let grid = source
+                .surface_region(rect, args.step)
+                .map_err(|error| error.to_string())?;
+            map_core::render::fluid::fluid_image(
+                &grid,
+                source.biome_catalog(),
+                map_core::render::fluid::DEFAULT_FLUID_OPACITY,
+                &cancel,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        Layer::Surface | Layer::CaveSlice | Layer::CaveDensity | Layer::Zone => {
+            return Err(format!(
+                "the layer '{}' has no renderer yet (T20/T28 wire them)",
+                args.layer
+            ));
+        }
+    };
     let sampled = started.elapsed();
-    let image = render_biome_rgba(&grid, source.biome_catalog());
     let bytes = encode_png(&image).map_err(|error| error.to_string())?;
 
     write_png(&args.out, &bytes)?;
     println!(
-        "wrote {} ({}x{} px, step {}, {}x{} blocks, load {:.2}s, sample {:.2}s)",
+        "wrote {} ({}x{} px, step {}, {}x{} blocks, layer {}, load {:.2}s, sample+render {:.2}s)",
         args.out.display(),
         args.size,
         args.size,
         args.step,
         args.size * args.step,
         args.size * args.step,
+        args.layer,
         loaded.as_secs_f64(),
         sampled.as_secs_f64(),
     );
     Ok(())
+}
+
+/// Expands `rect` by one `step`-sample ring on every side — relief's
+/// neighbour heights. `i64` throughout so absurd sizes fail cleanly
+/// instead of wrapping.
+fn expand_by_step(rect: Rect, step: u32) -> Result<Rect, String> {
+    let span = i64::from(step);
+    let min_x = i64::from(rect.min_x)
+        .checked_sub(span)
+        .ok_or_else(|| format!("--center {} at step {step} underflows x", rect.min_x))?;
+    let min_z = i64::from(rect.min_z)
+        .checked_sub(span)
+        .ok_or_else(|| format!("--center {} at step {step} underflows z", rect.min_z))?;
+    let max_x = i64::from(rect.max_x)
+        .checked_add(span)
+        .ok_or_else(|| format!("--center {} at step {step} overflows x", rect.max_x))?;
+    let max_z = i64::from(rect.max_z)
+        .checked_add(span)
+        .ok_or_else(|| format!("--center {} at step {step} overflows z", rect.max_z))?;
+    let to_i32 = |value: i64| {
+        i32::try_from(value)
+            .map_err(|_| format!("the relief border at step {step} leaves the i32 block space"))
+    };
+    Ok(Rect::new(
+        to_i32(min_x)?,
+        to_i32(min_z)?,
+        to_i32(max_x)?,
+        to_i32(max_z)?,
+    ))
 }
 
 /// Writes the encoded PNG bytes, creating parent directories so

@@ -2,12 +2,15 @@
 //!
 //! The first one — the flat biome layer — lives in [`biome`], along with
 //! the optional subtle hillshade hook (disabled by default; T17 wires
-//! heights in). [`image`] owns the pixel-buffer contract and the
-//! deterministic PNG encoder. The later layers (height, relief, surface
-//! blocks, caves: T17, T19–T21, T28) plug into the [`LayerRenderer`]
-//! shape. Everything here is headless: pure functions over map-core's
-//! own grid types, testable without a GPU (the golden test
-//! `tests/render_golden.rs` runs the real generator and hashes the PNG).
+//! a dedicated relief layer instead). [`image`] owns the pixel-buffer
+//! contract and the deterministic PNG encoder. The later layers —
+//! height, relief, fluids ([`height`], [`relief`], [`fluid`], T17),
+//! surface blocks (T20/T21), caves (T28) — plug into the
+//! [`LayerRenderer`] shape and, for the tile pipeline, the shared
+//! per-tile skeleton in [`tiles`]. Everything here is headless: pure
+//! functions over map-core's own grid types, testable without a GPU
+//! (the golden test `tests/render_golden.rs` runs the real generator
+//! and hashes the PNG).
 //!
 //! Color rules for the biome layer (the plan's first golden, kept flat
 //! on purpose — the hillshade hook is opt-in):
@@ -20,7 +23,11 @@
 //!   visible, never silent.
 
 pub mod biome;
+pub mod fluid;
+pub mod height;
 pub mod image;
+pub mod relief;
+pub mod tiles;
 
 use std::fmt;
 use std::str::FromStr;
@@ -29,15 +36,16 @@ use crate::error::{SourceError, SourceResult};
 
 pub use biome::{BiomeRenderer, UNKNOWN_BIOME_COLOR, biome_pixel, render_biome_rgba};
 pub use image::{RgbaImage, encode_png};
+pub use tiles::{TileQuery, blit_patch, tile_query};
 
 /// A renderable layer. Tile keys (T14) and the CLI `--layer` flag carry
 /// this.
 ///
 /// The full planned set exists already so tile identity (and, later, T31
-/// share strings) is frozen before the renderers arrive: only
-/// [`Layer::Biome`] has a renderer today (T13); T17/T20/T28 wire the
-/// rest. Parsing a name succeeds for every variant; a renderer-less one
-/// is rejected where it is used, not where it is named.
+/// share strings) is frozen before the renderers arrive: [`Layer::Biome`]
+/// plus height/relief/fluid (T17) have renderers; T20/T28 wire the rest.
+/// Parsing a name succeeds for every variant; a renderer-less one is
+/// rejected where it is used, not where it is named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Layer {
     /// The flat biome map color layer.

@@ -39,6 +39,8 @@ pub const GROUP_SEARCH: &str = "Search";
 pub const LAYER_BIOMES: &str = "Biomes";
 pub const LAYER_SURFACE: &str = "Surface";
 pub const LAYER_HEIGHT: &str = "Height";
+pub const LAYER_RELIEF: &str = "Relief";
+pub const LAYER_FLUID: &str = "Fluid";
 pub const LAYER_CAVES: &str = "Caves";
 
 pub const OVERLAY_STRUCTURES: &str = "Structures";
@@ -57,8 +59,15 @@ pub const MAP_PLACEHOLDER_NO_SOURCE: &str = "load a seed to explore";
 /// Shown while a background load runs.
 pub const MAP_PLACEHOLDER_LOADING: &str = "loading world…";
 
-/// Shown when a layer is selected whose renderer is a later task's.
-pub const MAP_PLACEHOLDER_LAYER: &str = "this layer's renderer arrives with T17/T28";
+/// Shown when the Surface layer is selected (its renderer is T20/T21's).
+pub const MAP_PLACEHOLDER_SURFACE: &str = "surface blocks arrive with T20/T21";
+
+/// Shown when a Caves layer is selected (its renderer is T28's).
+pub const MAP_PLACEHOLDER_CAVES: &str = "cave layers arrive with T28";
+
+/// Shown when a rendered layer has nothing to serve: the view left the
+/// generatable world.
+pub const MAP_PLACEHOLDER_OFF_WORLD: &str = "this view is outside the world";
 
 /// Shown in the map area instead of data when a load failed.
 pub const MAP_PLACEHOLDER_ERROR_PREFIX: &str = "load failed:";

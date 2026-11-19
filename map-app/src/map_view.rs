@@ -40,8 +40,8 @@ use eframe::egui;
 use egui::{Color32, PointerButton, Response};
 
 use map_core::coords::{TileCoord, TileRect, ZoomLevel, floor_div, tiles_in};
-use map_core::render::Layer;
-use map_core::render::biome::BiomeTileRenderer;
+use map_core::render::fluid::DEFAULT_FLUID_OPACITY;
+use map_core::render::tiles::LayeredTileRenderer;
 use map_core::scheduler::{TileEvent, TileRenderer, TileScheduler, TileSubject};
 use map_core::source::WorldSource;
 use map_core::tiles::{TileCache, TileKey, covering_placeholder};
@@ -219,8 +219,9 @@ pub struct TilePipeline {
 }
 
 impl TilePipeline {
-    /// Builds the pipeline for `source`: a fresh cache, the biome tile
-    /// renderer with the world's limits, and the default worker pool.
+    /// Builds the pipeline for `source`: a fresh cache, the layer
+    /// dispatcher (one renderer for every layer the radios can select —
+    /// the tile key decides), and the default worker pool.
     ///
     /// The identity + seed are pinned *before* the renderer takes the
     /// source — they key every tile this pipeline ever requests, and a
@@ -228,7 +229,11 @@ impl TilePipeline {
     fn new(source: Arc<dyn WorldSource>, world: Option<Rect>) -> Self {
         let served = (source.identity().stable_hash(), source.seed().generator());
         let cache = Arc::new(TileCache::new(TILE_CACHE_BUDGET_BYTES));
-        let renderer = Arc::new(BiomeTileRenderer::new(source, world));
+        let renderer = Arc::new(LayeredTileRenderer::new(
+            source,
+            world,
+            DEFAULT_FLUID_OPACITY,
+        ));
         let scheduler = TileScheduler::new(TileScheduler::default_workers(), Arc::clone(&cache));
         let events = scheduler.events();
         TilePipeline {
@@ -330,25 +335,21 @@ impl MapView {
             // A later task's layer renders no tiles, but the drain below
             // still keeps the pending count honest while its placeholder
             // is on screen.
-            let request = (state.layer() == AppLayer::Biomes)
-                .then(|| {
-                    let view = state.view();
-                    let step = view.tile_step(state.resolution_step());
-                    // The effective step is a power of two inside the
-                    // level range by construction (T10), so this expect is
-                    // an invariant, not a failure path.
-                    let zoom = ZoomLevel::from_step(step)
-                        .expect("effective_step yields an in-range power of two");
-                    let subject = TileSubject::new(
-                        pipeline.served.0,
-                        pipeline.served.1,
-                        Layer::Biome,
-                        0,
-                        zoom,
-                    );
-                    frame_tiles(view, subject, pipeline.world)
-                })
-                .flatten();
+            let request = state.layer().tile_layer().and_then(|layer| {
+                let view = state.view();
+                let step = view.tile_step(state.resolution_step());
+                // The effective step is a power of two inside the
+                // level range by construction (T10), so this expect is
+                // an invariant, not a failure path.
+                let zoom = ZoomLevel::from_step(step)
+                    .expect("effective_step yields an in-range power of two");
+                // The subject's layer is the radio's: switching layers
+                // switches keys, so a cached tile of the old layer can
+                // never be served for the new one.
+                let subject =
+                    TileSubject::new(pipeline.served.0, pipeline.served.1, layer, 0, zoom);
+                frame_tiles(view, subject, pipeline.world)
+            });
             self.serve(ui.ctx(), &mut pipeline, request.as_ref());
             if let Some(request) = &request {
                 self.paint(ui.ctx(), &painter, request, &pipeline, state.view());
@@ -608,13 +609,21 @@ impl MapView {
         }
 
         let message = match state.source() {
-            Some(_) => labels::MAP_PLACEHOLDER_LAYER.to_string(),
             None => match state.source_error() {
                 Some(error) => {
                     format!("{} {error}", labels::MAP_PLACEHOLDER_ERROR_PREFIX)
                 }
                 None if state.is_loading() => labels::MAP_PLACEHOLDER_LOADING.to_string(),
                 None => labels::MAP_PLACEHOLDER_NO_SOURCE.to_string(),
+            },
+            // A loaded world: either the radio's renderer is a later
+            // task's, or the view simply left the generatable world.
+            Some(_) => match state.layer() {
+                AppLayer::Surface => labels::MAP_PLACEHOLDER_SURFACE.to_string(),
+                AppLayer::Caves => labels::MAP_PLACEHOLDER_CAVES.to_string(),
+                AppLayer::Biomes | AppLayer::Height | AppLayer::Relief | AppLayer::Fluid => {
+                    labels::MAP_PLACEHOLDER_OFF_WORLD.to_string()
+                }
             },
         };
         let message_color = if state.source_error().is_some() {
@@ -675,9 +684,15 @@ mod tests {
         view
     }
 
-    /// The frame request for `pipeline`'s own subject at `zoom`.
-    fn request_for(pipeline: &TilePipeline, view: &MapViewState, zoom: ZoomLevel) -> FrameTiles {
-        let subject = TileSubject::new(pipeline.served.0, pipeline.served.1, Layer::Biome, 0, zoom);
+    /// The frame request for `pipeline`'s own subject at `zoom` for
+    /// `layer` — the exact subject the widget builds for that radio.
+    fn request_for(
+        pipeline: &TilePipeline,
+        view: &MapViewState,
+        zoom: ZoomLevel,
+        layer: Layer,
+    ) -> FrameTiles {
+        let subject = TileSubject::new(pipeline.served.0, pipeline.served.1, layer, 0, zoom);
         frame_tiles(view, subject, pipeline.world)
             .expect("the test views sit inside the representable space")
     }
@@ -774,7 +789,7 @@ mod tests {
         let mut map = MapView::new();
         let mut pipeline = fake_pipeline();
         let view = view(0.0, 600.0, 400.0);
-        let request = request_for(&pipeline, &view, ZoomLevel::MIN);
+        let request = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Biome);
 
         settle(&mut map, &ctx, &mut pipeline, &request);
 
@@ -820,7 +835,7 @@ mod tests {
         let mut map = MapView::new();
         let mut pipeline = fake_pipeline();
         let view = view(0.0, 600.0, 400.0);
-        let request = request_for(&pipeline, &view, ZoomLevel::MIN);
+        let request = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Biome);
 
         settle(&mut map, &ctx, &mut pipeline, &request);
         assert_eq!(pipeline.scheduler.stats().generations, 1);
@@ -843,13 +858,13 @@ mod tests {
         let mut map = MapView::new();
         let mut pipeline = fake_pipeline();
         let first_view = view(0.0, 600.0, 400.0);
-        let first = request_for(&pipeline, &first_view, ZoomLevel::MIN);
+        let first = request_for(&pipeline, &first_view, ZoomLevel::MIN, Layer::Biome);
         settle(&mut map, &ctx, &mut pipeline, &first);
         let first_key = first.subject.key_at(0, 0);
 
         let mut far_view = view(0.0, 600.0, 400.0);
         far_view.pan_by_screen((200_000.0, 0.0));
-        let second = request_for(&pipeline, &far_view, ZoomLevel::MIN);
+        let second = request_for(&pipeline, &far_view, ZoomLevel::MIN, Layer::Biome);
         assert!(
             !second.visible.contains(TileCoord::new(0, 0)),
             "the two views are disjoint"
@@ -878,11 +893,12 @@ mod tests {
             &pipeline,
             &coarse_view,
             ZoomLevel::new(1).expect("in range"),
+            Layer::Biome,
         );
         settle(&mut map, &ctx, &mut pipeline, &coarse);
 
         let fine_view = view(0.0, 600.0, 400.0);
-        let fine = request_for(&pipeline, &fine_view, ZoomLevel::MIN);
+        let fine = request_for(&pipeline, &fine_view, ZoomLevel::MIN, Layer::Biome);
         let child = fine.subject.key_at(0, 0);
         assert!(
             !pipeline.cache.contains(&child),
@@ -900,6 +916,45 @@ mod tests {
         assert!(map.textures.texture_id(&placeholder.tile.key).is_some());
         // Tile (0, 0) is the north-west quarter of its parent.
         assert_eq!(placeholder.uv, [0.0, 0.0, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn switching_layers_serves_only_the_new_layers_tiles() {
+        // The T17 acceptance rule "switching layers does not show stale
+        // tiles from the previous layer", at the pipeline level: the
+        // subject's layer moves with the radio, keys differ per layer,
+        // and the new layer's tile renders through the same pipeline
+        // even though the old layer's tile at the same position is
+        // already cached.
+        let ctx = egui::Context::default();
+        let mut map = MapView::new();
+        let mut pipeline = fake_pipeline();
+        let view = view(0.0, 600.0, 400.0);
+
+        let biomes = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Biome);
+        settle(&mut map, &ctx, &mut pipeline, &biomes);
+        let biome_key = biomes.subject.key_at(0, 0);
+        assert!(pipeline.cache.contains(&biome_key), "biomes served first");
+
+        // The same view, the Height radio: a different subject, keys the
+        // cached biome tile can never satisfy.
+        let heights = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Height);
+        assert_eq!(heights.subject.layer, Layer::Height);
+        let height_key = heights.subject.key_at(0, 0);
+        assert_ne!(height_key, biome_key, "layers never share a key");
+        assert!(
+            !pipeline.cache.contains(&height_key),
+            "the cached biome tile does not answer the height radio"
+        );
+
+        settle(&mut map, &ctx, &mut pipeline, &heights);
+        assert!(
+            pipeline.cache.contains(&height_key),
+            "the height tile served"
+        );
+        assert!(map.textures.texture_id(&height_key).is_some());
+        // And the biome tile is still cached for the switch back.
+        assert!(pipeline.cache.contains(&biome_key));
     }
 
     // -- The real generator (gated like every generator-backed test) ------------
@@ -934,7 +989,12 @@ mod tests {
         // The plan's default resolution: 2x2 at one point per block ->
         // effective step 2 (level 1).
         let view = view(0.0, 600.0, 400.0);
-        let request = request_for(&pipeline, &view, ZoomLevel::new(1).expect("in range"));
+        let request = request_for(
+            &pipeline,
+            &view,
+            ZoomLevel::new(1).expect("in range"),
+            Layer::Biome,
+        );
         let center_key = request.subject.key_at(
             i32::try_from(request.center.x).expect("in i32"),
             i32::try_from(request.center.z).expect("in i32"),

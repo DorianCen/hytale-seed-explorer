@@ -88,6 +88,19 @@ pub fn floor_mod(value: i64, divisor: i64) -> i64 {
     value - floor_div(value, divisor) * divisor
 }
 
+/// Ceiling division for a positive divisor: the smallest `quotient`
+/// with `quotient * divisor >= value`. The sign-symmetric complement of
+/// [`floor_div`] (`ceil_div(-5, 2) == -2`), used by the tile query
+/// planner to find the first sample that reaches into a rect.
+///
+/// `divisor` must be positive; the helpers in this module only ever
+/// pass positive powers of two.
+#[must_use]
+pub fn ceil_div(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0, "ceil_div needs a positive divisor");
+    (value + divisor - 1).div_euclid(divisor)
+}
+
 /// Asserts that `step` is a usable blocks-per-sample value.
 fn assert_valid_step(step: u32) {
     assert!(

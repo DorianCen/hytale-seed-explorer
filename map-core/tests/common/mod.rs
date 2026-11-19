@@ -6,6 +6,13 @@
 //! Each test binary links its own copy (and loads its own generator);
 //! skip-aware helpers make that safe on machines without the checkout.
 
+// Each linking test binary uses a subset of this fixture (T17's
+// `layers`, for instance, needs only the source, the step-2 rect
+// helper and the hash functions); the unused remainder would read as
+// dead code in that binary under `-D warnings`, so the shared fixture
+// opts out of that one lint here, once, instead of per item.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 

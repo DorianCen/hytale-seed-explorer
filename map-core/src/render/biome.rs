@@ -14,25 +14,27 @@
 //!   (`tests/render_golden.rs`): one pixel per sample, row-major, north
 //!   (−Z) at image row 0.
 //! - [`render_biome_shaded`] — the optional subtle hillshade hook,
-//!   disabled by default; the app stays flat until T17 wires height data
-//!   in (the default layer must never depend on a full-block query).
+//!   disabled by default; the app stays flat — shading a *composite*
+//!   is T19's compositing, and the shaded-relief layer itself is
+//!   [`super::relief`] (T17). The default layer must never depend on a
+//!   full-block query.
 //! - [`BiomeTileRenderer`] — what the T15 scheduler calls per tile: one
-//!   biome region query colored with [`render_biome_rgba`], transparent
-//!   margins outside the generatable world.
+//!   biome region query colored with [`render_biome_rgba`] on the shared
+//!   [`super::tiles`] skeleton, transparent margins outside the
+//!   generatable world.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::catalog::BiomeCatalog;
-use crate::coords::{TILE_SIZE, TileCoord, floor_div, tile_rect};
-use crate::error::{SourceError, SourceResult};
+use crate::error::SourceResult;
 use crate::scheduler::{CancelToken, TileRenderer};
 use crate::source::WorldSource;
 use crate::tiles::{Tile, TileKey};
 use crate::types::{BiomeGrid, BiomeId, HeightGrid, Rect};
 
 use super::image::{Rgba, RgbaImage};
+use super::tiles::render_layer_tile;
 
 /// The color for data the catalog cannot resolve: magenta.
 pub const UNKNOWN_BIOME_COLOR: [u8; 3] = [255, 0, 255];
@@ -235,99 +237,23 @@ impl BiomeTileRenderer {
 
 impl TileRenderer for BiomeTileRenderer {
     fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
-        // A cancelled tile never begins its work unit (the region query);
-        // the scheduler is the one that reports the cancellation.
-        if cancel.load(Relaxed) {
-            return Err(SourceError::Cancelled);
-        }
-
-        let step = key.zoom.step();
-        let coord = TileCoord::new(i64::from(key.tx), i64::from(key.ty));
-        let Some(rect) = tile_rect(coord, step) else {
-            // The block bounds left the i32 space. Unreachable for any
-            // view the app schedules, but the key cannot name such a tile.
-            return Err(SourceError::OutOfBounds {
-                x: key.tx,
-                z: key.ty,
-            });
-        };
-
-        // Zeroed means transparent: the out-of-world margins must show the
-        // app's canvas rather than fabricated data.
-        let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
-        if let Some((query, offset_x, offset_z)) = aligned_query(rect, self.world, step) {
-            let grid = self.source.biome_region(query, step)?;
-            let patch = render_biome_rgba(&grid, self.source.biome_catalog());
-            for y in 0..patch.height() {
-                for x in 0..patch.width() {
-                    canvas.put_pixel(offset_x + x, offset_z + y, *patch.get_pixel(x, y));
-                }
-            }
-        }
-
-        let tile = Tile::new(*key, TILE_SIZE, TILE_SIZE, canvas.as_raw().clone())
-            .expect("the canvas is TILE_SIZE square with a matching buffer");
-        Ok(tile)
+        // The shared skeleton (see `render::tiles`): cancel check, the
+        // aligned in-world query, the transparent canvas, the blit. The
+        // biome layer supplies one batched region query and the catalog
+        // colors; border 0 - shading is not this layer's job.
+        render_layer_tile(
+            self.source.as_ref(),
+            key,
+            cancel,
+            self.world,
+            0,
+            |source, rect, step| source.biome_region(rect, step),
+            |grid, query, _cancel| {
+                let patch = render_biome_rgba(grid, self.source.biome_catalog());
+                Ok((patch, query.origin))
+            },
+        )
     }
-}
-
-/// The tile's in-world sub-rect, aligned to its sample grid: the query
-/// rect and the sample offset the resulting patch is blitted at.
-///
-/// Sample `i` covers blocks `tile.min_x + i * step` through
-/// `+ step - 1`, so the sub-rect starts at the first sample fully inside
-/// `world` and ends one past the last one fully inside — a tile
-/// straddling the edge asks the source only for blocks it can generate,
-/// while its samples still land on the columns the full tile would use.
-/// [`None`] when no sample is inside: the tile is fully transparent.
-///
-/// `world: None` means the source serves any rect, so the full tile is
-/// one query and no offset applies.
-#[must_use]
-fn aligned_query(tile: Rect, world: Option<Rect>, step: u32) -> Option<(Rect, u32, u32)> {
-    let Some(world) = world else {
-        return Some((tile, 0, 0));
-    };
-
-    let step_i = i64::from(step);
-    let tile_size = i64::from(TILE_SIZE);
-    // First sample whose block start reaches world.min_*: ceil of the
-    // block distance over the step.
-    let first_x =
-        ceil_div(i64::from(world.min_x) - i64::from(tile.min_x), step_i).clamp(0, tile_size);
-    let first_z =
-        ceil_div(i64::from(world.min_z) - i64::from(tile.min_z), step_i).clamp(0, tile_size);
-    // One past the last sample whose block end stays within world.max_*:
-    // floor of the inclusive span over the step.
-    let end_x =
-        floor_div(i64::from(world.max_x) - i64::from(tile.min_x) + 1, step_i).clamp(0, tile_size);
-    let end_z =
-        floor_div(i64::from(world.max_z) - i64::from(tile.min_z) + 1, step_i).clamp(0, tile_size);
-    let count_x = (end_x - first_x).max(0) as u32;
-    let count_z = (end_z - first_z).max(0) as u32;
-    if count_x == 0 || count_z == 0 {
-        return None;
-    }
-
-    // Clamped to `0..=TILE_SIZE` above, so the narrowings and the block
-    // multiplications below fit by construction (at most 256 * step).
-    let query = Rect::from_dims(
-        tile.min_x + (first_x as i32) * (step as i32),
-        tile.min_z + (first_z as i32) * (step as i32),
-        count_x * step,
-        count_z * step,
-    );
-    Some((query, first_x as u32, first_z as u32))
-}
-
-/// Ceiling division for a positive divisor: the smallest `quotient` with
-/// `quotient * divisor >= value`. The complement of [`floor_div`], valid
-/// across signs (`ceil_div(-5, 2) == -2`) — the sample-grid alignment
-/// needs it for tile origins left of the world.
-#[must_use]
-fn ceil_div(value: i64, divisor: i64) -> i64 {
-    debug_assert!(divisor > 0, "ceil_div needs a positive divisor");
-    (value + divisor - 1).div_euclid(divisor)
 }
 
 #[cfg(test)]
@@ -339,8 +265,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use crate::catalog::{BlockCatalog, FluidCatalog, ZoneCatalog};
-    use crate::coords::ZoomLevel;
+    use crate::coords::{TILE_SIZE, TileCoord, ZoomLevel, tile_rect};
+    use crate::error::SourceError;
     use crate::render::Layer;
+    use crate::render::tiles::tile_query;
     use crate::scheduler::cancel_token;
     use crate::types::{
         GeneratorIdentity, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneId,
@@ -796,20 +724,26 @@ mod tests {
             );
         }
 
-        // The grid-alignment anchors on the untrimmed tile rect: an edge at
-        // origin + 5 starts at sample 3 (ceil(5 / 2)), one at origin + 9
-        // ends at sample 5 (floor(10 / 2), exclusive); a world covering the
-        // tile yields the full-tile query.
+        // The grid-alignment anchors on the untrimmed tile rect, through
+        // the shared planner: an edge at origin + 5 starts at sample 3
+        // (ceil(5 / 2)), one at origin + 9 ends at sample 5
+        // (floor(10 / 2), exclusive); a world covering the tile yields
+        // the full-tile query.
         let origin = tile_rect(TileCoord::new(0, 0), 2).expect("tile (0, 0) fits the i32 space");
+        let plan = tile_query(origin, Some(Rect::new(5, 0, 9, 511)), 2, 0)
+            .expect("the world overlaps the tile");
+        assert_eq!(plan.rect, Rect::new(6, 0, 9, 511));
         assert_eq!(
-            aligned_query(origin, Some(Rect::new(5, 0, 9, 511)), 2),
-            Some((Rect::new(6, 0, 9, 511), 3, 0)),
-            "ceil(5 / 2) = 3 keeps the query on the sample grid",
+            plan.origin,
+            (3, 0),
+            "ceil(5 / 2) = 3 keeps the query on the sample grid"
         );
+        let plan = tile_query(origin, Some(origin), 2, 0).expect("the world covers the tile");
+        assert_eq!(plan.rect, origin);
         assert_eq!(
-            aligned_query(origin, Some(origin), 2),
-            Some((origin, 0, 0)),
-            "a world covering the tile queries the whole tile",
+            plan.origin,
+            (0, 0),
+            "a world covering the tile queries the whole tile"
         );
     }
 

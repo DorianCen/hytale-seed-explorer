@@ -374,6 +374,7 @@ impl SeedExplorerApp {
             pending,
             self.state.view().scale(),
             self.state.resolution_step(),
+            self.state.layer().label(),
             self.state.source_status_text(),
         );
         if !self.state.status().is_empty() {
@@ -447,6 +448,7 @@ mod tests {
                 0,
                 app.state.view().scale(),
                 app.state.resolution_step(),
+                app.state.layer().label(),
                 app.state.source_status_text(),
             )
             .contains("2×2")
