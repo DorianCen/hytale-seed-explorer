@@ -25,14 +25,20 @@ and this file gets fixed.
   `.github/workflows/ci.yml`. No window is ever opened in CI — the GUI
   gate is `cargo build -p map-app`.
 - Never commit game assets or palettes derived from them: Hytale assets
-  are proprietary (`docs/assets-and-palette.md` has the rules).
+  are proprietary (`docs/assets-and-palette.md` has the rules). The only
+  committed palette is `assets/palette/fallback.json` — hand-picked
+  original approximations; regenerate the real one from the user's pack
+  with `map-cli palette` (see `docs/assets-and-palette.md` §11) and keep
+  it out of the tree. A fallback-data change bumps
+  `palette::PALETTE_VERSION` — a cache-invalidation action recorded in
+  the commit message, like a generator bump.
 
 ## Commands
 
 ```sh
 cargo test -p map-core -p map-cli                  # headless suite
 cargo test -p map-core --features test-support      # fake-source tests
-cargo test -p map-core <filter>                     # e.g. tile_cache, scheduler
+cargo test -p map-core <filter>                     # e.g. tile_cache, layers, refinement
 cargo test -p map-app                               # shell unit tests (CI only builds map-app)
 cargo run -p map-app                                # desktop shell
 cargo run -p map-cli -- info                        # CLI smoke / identity dump
@@ -40,9 +46,16 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
 ```
 
 - **Test-name filters are the acceptance gate.** Each task's
-  `Acceptance` section names a filter (`tile_cache`, `scheduler`,
-  `texture_cache`, …) and the tests are deliberately named with that
-  prefix; a new test that misses the prefix is invisible to the gate.
+  `Acceptance` section names a filter (`tile_cache`, `inspector`,
+  `resolution`, `layers`, `palette`, `surface_render`, `refinement`,
+  …) and the tests are deliberately named with that prefix; a new test
+  that misses the prefix is invisible to the gate.
+- **Performance numbers are release-only and recorded, not rerun.**
+  `docs/benchmarks.md` is the regression table; append a row after a
+  release run of the relevant probe or `#[ignore]` bench (e.g.
+  `cargo test -p map-core --features test-support --release --test
+  surface_render -- --ignored surface_bench --nocapture`). Debug
+  timings are ~8× worse and never comparable.
 - `map-core` must stay GUI-free. CI fails the build on any GUI dep:
   `! cargo tree -p map-core -e normal | grep -E "eframe|egui|arboard|winit|wgpu"`.
 
@@ -61,7 +74,7 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
   run, results, deviations, follow-ups.
 - Marking done: the board row flips to `done` and the task file's status
   becomes `**Status:** done (deliverable: …)` naming what landed (see
-  T10/T13/T14/T15 for the idiom). Commit subjects follow `TNN: title`.
+  T18–T21 for the current idiom). Commit subjects follow `TNN: title`.
 - Subagent packets (docs/status updates, mechanical edits) fit a child
   session; implementation that must stay coherent does not.
 
@@ -80,6 +93,14 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
   (T02: low-32-bit truncation of the input; string hashing does not
   exist — never add a hash fallback). Seed/version/asset/palette changes
   flow through the key, never a side channel.
+- The scheduler's request is a **pass list**, not a subject:
+  `schedule_passes(&[TilePass])` queues each pass nearest-center first,
+  refine passes behind every fill (`REFINE_PENALTY`), and
+  `cancel_not_serving(&[TilePass])` keeps only what some pass claims.
+  T21's full-block layer rides this: a coarse fill pass (step 4) plus a
+  fine refine pass — the coarse tiles are placeholder parents
+  (`covering_placeholder` crosses zooms), never painted directly.
+  Extend `schedule`/`cancel` through the pass APIs, not around them.
 - Heavy background objects (generator sources, worker pools) are dropped
   on background threads, never the UI thread — see the retirement
   pattern in `map-app/src/state.rs`.
@@ -119,3 +140,12 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
 - Do not force a cheap/free model onto large or high-risk work; keep
   that in the main session. Record the subagent model in the task
   report when it matters.
+- **Concurrent subagents need disjoint crates.** A subagent can only
+  verify what compiles: `cargo test -p map-core` builds map-core alone
+  (map-app is a *dependent*, not a dependency), so a map-core subagent
+  runs green while the main session edits map-app — but two agents in
+  one crate will keep hitting each other's mid-edit states. Sequence
+  same-crate packets; never let a subagent run `--workspace`/`--all`
+  while a sibling crate is in flight. Give every subagent the exact
+  public API its work must compile against, and the main session
+  re-verifies the tests itself.
