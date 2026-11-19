@@ -51,7 +51,8 @@ struct RenderArgs {
     #[arg(long, default_value_t = 2)]
     step: u32,
 
-    /// The layer to render; only `biome` exists yet (T17/T20/T28 add more).
+    /// The layer to render (`biome` has a renderer today; the rest
+    /// arrive with T17/T20/T28).
     #[arg(long, default_value = "biome")]
     layer: Layer,
 
@@ -156,6 +157,15 @@ fn render(args: RenderArgs) -> Result<(), String> {
     let center = parse_center(&args.center)?;
     let rect = center_rect(center, args.size, args.step)?;
 
+    // Only the biome layer renders today (T13); the other names parse
+    // for keys/share strings but have no renderer yet.
+    let Layer::Biome = args.layer else {
+        return Err(format!(
+            "the layer '{}' has no renderer yet (T17/T20/T28 wire them)",
+            args.layer
+        ));
+    };
+
     let mut config = WorldgenSourceConfig::new(&args.world, &args.seed);
     config.assets_root = args.assets;
     config.registries_path = args.registries;
@@ -166,42 +176,38 @@ fn render(args: RenderArgs) -> Result<(), String> {
     let source = WorldgenSource::new(&config).map_err(|error| error.to_string())?;
     let loaded = started.elapsed();
 
-    match args.layer {
-        Layer::Biome => {
-            eprintln!(
-                "rendering {}x{} @ step {} ({}x{} blocks around {}, {}) via {}",
-                args.size,
-                args.size,
-                args.step,
-                args.size * args.step,
-                args.size * args.step,
-                center.0,
-                center.1,
-                source.worker_count(),
-            );
-            let started = Instant::now();
-            let grid = source
-                .biome_region(rect, args.step)
-                .map_err(|error| error.to_string())?;
-            let sampled = started.elapsed();
-            let image = render_biome_rgba(&grid, source.biome_catalog());
-            let bytes = encode_png(&image).map_err(|error| error.to_string())?;
+    eprintln!(
+        "rendering {}x{} @ step {} ({}x{} blocks around {}, {}) via {}",
+        args.size,
+        args.size,
+        args.step,
+        args.size * args.step,
+        args.size * args.step,
+        center.0,
+        center.1,
+        source.worker_count(),
+    );
+    let started = Instant::now();
+    let grid = source
+        .biome_region(rect, args.step)
+        .map_err(|error| error.to_string())?;
+    let sampled = started.elapsed();
+    let image = render_biome_rgba(&grid, source.biome_catalog());
+    let bytes = encode_png(&image).map_err(|error| error.to_string())?;
 
-            write_png(&args.out, &bytes)?;
-            println!(
-                "wrote {} ({}x{} px, step {}, {}x{} blocks, load {:.2}s, sample {:.2}s)",
-                args.out.display(),
-                args.size,
-                args.size,
-                args.step,
-                args.size * args.step,
-                args.size * args.step,
-                loaded.as_secs_f64(),
-                sampled.as_secs_f64(),
-            );
-            Ok(())
-        }
-    }
+    write_png(&args.out, &bytes)?;
+    println!(
+        "wrote {} ({}x{} px, step {}, {}x{} blocks, load {:.2}s, sample {:.2}s)",
+        args.out.display(),
+        args.size,
+        args.size,
+        args.step,
+        args.size * args.step,
+        args.size * args.step,
+        loaded.as_secs_f64(),
+        sampled.as_secs_f64(),
+    );
+    Ok(())
 }
 
 /// Writes the encoded PNG bytes, creating parent directories so

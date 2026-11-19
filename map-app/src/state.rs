@@ -198,8 +198,9 @@ pub enum MapTexture {
 /// grid so stale results are recognizable.
 pub type GridResult = (Rect, u32, SourceResult<BiomeGrid>);
 
-/// One texture covers the whole viewport until T14 tiles the map: cap
-/// the request at this many samples per axis. The plan's risk note —
+/// One texture covers the whole viewport until the tile pipeline (T15
+/// scheduling, T16 painting) replaces this single-texture flow: cap the
+/// request at this many samples per axis. The plan's risk note —
 /// 640×400 samples is acceptable for a first texture, not for repeated
 /// panning.
 pub const MAX_TEXTURE_SAMPLES: u32 = 640;

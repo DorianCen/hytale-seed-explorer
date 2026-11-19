@@ -227,7 +227,7 @@ participates in tile keys because terrain cannot distinguish more.
 | Parser: `0`, `1`, `-1`, `i32::MIN`, `i32::MAX` map to themselves | pending type | T07 |
 | Parser: i64 outside i32 → documented truncation (e.g. `4294967297` → 1) | pending type | T07 |
 | Parser: empty/whitespace/non-numeric → typed error, never a hash | pending type | T07 |
-| Version bump invalidates a tile key | pending key | T14 |
+| Version bump invalidates a tile key | **done** — tile keys hash `GeneratorIdentity::stable_hash`; unit tests in `map-core/src/tiles.rs` + `tests/tile_cache.rs` | T14 |
 
 ## 8. Resolved plan markers (report to the main agent — done by this task)
 

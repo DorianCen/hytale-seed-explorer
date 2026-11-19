@@ -31,17 +31,45 @@ pub use biome::{BiomeRenderer, UNKNOWN_BIOME_COLOR, biome_pixel, render_biome_rg
 pub use image::{RgbaImage, encode_png};
 
 /// A renderable layer. Tile keys (T14) and the CLI `--layer` flag carry
-/// this; only the biome layer exists yet — T17/T20/T28 extend the enum.
+/// this.
+///
+/// The full planned set exists already so tile identity (and, later, T31
+/// share strings) is frozen before the renderers arrive: only
+/// [`Layer::Biome`] has a renderer today (T13); T17/T20/T28 wire the
+/// rest. Parsing a name succeeds for every variant; a renderer-less one
+/// is rejected where it is used, not where it is named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Layer {
     /// The flat biome map color layer.
     Biome,
+    /// Terrain surface height (T17).
+    Height,
+    /// Height-derived hillshade relief (T17).
+    Relief,
+    /// Topmost surface blocks (T20/T21).
+    Surface,
+    /// Fluids and their depth (T17).
+    Fluid,
+    /// One horizontal cave slice; the Y bucket travels in the tile
+    /// key's `mode` (T28).
+    CaveSlice,
+    /// Cave-volume density heat map (T28).
+    CaveDensity,
+    /// Zone regions (T19-era; `zone_at` exists since T08).
+    Zone,
 }
 
 impl fmt::Display for Layer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Layer::Biome => "biome",
+            Layer::Height => "height",
+            Layer::Relief => "relief",
+            Layer::Surface => "surface",
+            Layer::Fluid => "fluid",
+            Layer::CaveSlice => "cave-slice",
+            Layer::CaveDensity => "cave-density",
+            Layer::Zone => "zone",
         })
     }
 }
@@ -55,8 +83,16 @@ impl FromStr for Layer {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text {
             "biome" => Ok(Layer::Biome),
+            "height" => Ok(Layer::Height),
+            "relief" => Ok(Layer::Relief),
+            "surface" => Ok(Layer::Surface),
+            "fluid" => Ok(Layer::Fluid),
+            "cave-slice" => Ok(Layer::CaveSlice),
+            "cave-density" => Ok(Layer::CaveDensity),
+            "zone" => Ok(Layer::Zone),
             _ => Err(SourceError::Unsupported(
-                "unknown layer: only 'biome' exists (T17/T20/T28 add more)",
+                "unknown layer name (expected biome, height, relief, surface, \
+                 fluid, cave-slice, cave-density or zone)",
             )),
         }
     }
@@ -83,11 +119,25 @@ mod tests {
 
     #[test]
     fn layer_parses_and_displays_its_cli_names() {
-        assert_eq!("biome".parse::<Layer>(), Ok(Layer::Biome));
-        assert_eq!(Layer::Biome.to_string(), "biome");
+        // Every planned layer parses and round-trips its name (tile keys
+        // and share strings know the full set); renderers arrive with
+        // T17/T20/T28.
+        for (name, layer) in [
+            ("biome", Layer::Biome),
+            ("height", Layer::Height),
+            ("relief", Layer::Relief),
+            ("surface", Layer::Surface),
+            ("fluid", Layer::Fluid),
+            ("cave-slice", Layer::CaveSlice),
+            ("cave-density", Layer::CaveDensity),
+            ("zone", Layer::Zone),
+        ] {
+            assert_eq!(name.parse::<Layer>(), Ok(layer));
+            assert_eq!(layer.to_string(), name);
+        }
         // Unknown names are typed errors, not panics.
         assert!(matches!(
-            "height".parse::<Layer>(),
+            "nope".parse::<Layer>(),
             Err(SourceError::Unsupported(_))
         ));
     }

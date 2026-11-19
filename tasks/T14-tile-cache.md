@@ -1,6 +1,14 @@
 # T14 — Tile keys, cache and eviction
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/tiles.rs` — `TileKey`
+(identity hash + generator seed + layer/mode + zoom + tile x/y), `Tile`
+(validated RGBA buffer, `pixel`, `byte_size`), `TileCache` (byte-weighed
+LRU with synchronous eviction notifications over a crossbeam channel,
+`invalidate_seed`/`invalidate_version`/`clear`, `CacheStats` for T33) —
+plus `map-core/tests/tile_cache.rs` (9 tests, incl. the ~1 MB budget /
+100-insert stress run), the `TextureCache` app bridge in
+`map-app/src/texture.rs` (4 tests), and `render::Layer` extended to the
+planned layer set so tile identity is frozen before T17/T20/T28)
 **Milestone:** 3 — Tiling and navigation
 **Depends on:** T07, T10
 **Blocks:** T15, T16
