@@ -87,6 +87,7 @@ mod fake_layers {
     use map_core::coords::{TILE_SIZE, TileCoord, ZoomLevel, tile_rect};
     use map_core::error::SourceError;
     use map_core::render::Layer;
+    use map_core::render::SurfaceOptions;
     use map_core::render::fluid::fluid_color;
     use map_core::render::height::height_color;
     use map_core::render::tiles::LayeredTileRenderer;
@@ -104,6 +105,7 @@ mod fake_layers {
             Arc::new(FakeWorldSource::new("7")),
             None,
             DEFAULT_FLUID_OPACITY,
+            SurfaceOptions::default(),
         )
     }
 
@@ -292,12 +294,12 @@ mod fake_layers {
         // radios map them to placeholders), and the dispatcher says so
         // with the typed error rather than rendering wrong pixels.
         let renderer = fake_renderer();
-        for layer in [Layer::Surface, Layer::CaveSlice, Layer::CaveDensity] {
+        for layer in [Layer::CaveSlice, Layer::CaveDensity] {
             let result = TileRenderer::render(&renderer, &key(layer, 0, 0), &cancel_token());
             assert_eq!(
                 result.err(),
                 Some(SourceError::Unsupported(
-                    "this layer has no renderer yet (surface: T20/T21, caves: T28)"
+                    "this layer has no renderer yet (caves: T28)"
                 )),
                 "{layer} has no renderer"
             );

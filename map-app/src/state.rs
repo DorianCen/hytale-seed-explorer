@@ -48,7 +48,7 @@ pub const RESOLUTION_STEPS: [u32; 4] = [1, 2, 4, 8];
 pub fn offers_layer(layer: Layer) -> bool {
     matches!(
         layer,
-        Layer::Biome | Layer::Height | Layer::Relief | Layer::Fluid | Layer::Zone
+        Layer::Biome | Layer::Height | Layer::Relief | Layer::Fluid | Layer::Surface | Layer::Zone
     )
 }
 
@@ -710,14 +710,12 @@ impl AppState {
     }
 
     /// The worker-pool size override for the next load.
-    #[allow(dead_code)] // reserved: T31's settings panel
     #[must_use]
     pub fn workers(&self) -> Option<usize> {
         self.workers
     }
 
     /// Sets the worker-pool size override.
-    #[allow(dead_code)] // reserved: T31's settings panel
     pub fn set_workers(&mut self, workers: Option<usize>) {
         self.workers = workers;
     }
@@ -816,6 +814,27 @@ mod tests {
             "a second Go while loading changes nothing"
         );
         assert!(state.is_loading());
+    }
+
+    #[test]
+    fn workers_setting_applies_to_the_next_load() {
+        // T21's cost control: the top bar's cap feeds the GENERATOR pool
+        // of the next load, never the current one.
+        let mut state = state();
+        state.set_workers(Some(4));
+        assert_eq!(state.workers(), Some(4));
+        state.set_seed_text(String::from("42"));
+        let request = state.begin_load().expect("the load issues");
+        assert_eq!(
+            request.workers,
+            Some(4),
+            "the cap rides the next load request"
+        );
+        assert_eq!(
+            request.config().workers,
+            Some(4),
+            "and reaches the generator config"
+        );
     }
 
     #[test]
@@ -953,17 +972,20 @@ mod tests {
     fn layers_unoffered_and_future_layers_never_reach_the_scheduler() {
         // The stack carries every planned layer so settings persist, but
         // only layers with renderers get a checkbox and a tile request:
-        // Surface/Caves (T20/T28) are never schedulable however their
-        // entries read.
+        // Caves (T28) never schedule however their entries read, while
+        // Surface joined once T21 made it render.
         let mut state = state();
         assert!(state.layers_mut().set_enabled(Layer::Surface, true));
         assert!(state.layers_mut().set_enabled(Layer::CaveSlice, true));
         assert_eq!(
             state.schedulable_layers(),
-            vec![(Layer::Biome, 1.0)],
-            "unsupported layers stay out of the request"
+            vec![(Layer::Biome, 1.0), (Layer::Surface, 1.0)],
+            "surface is schedulable now; caves still are not"
         );
-        assert_eq!(state.layer_summary(), labels::LAYER_BIOMES);
+        assert_eq!(
+            state.layer_summary(),
+            format!("{}+{}", labels::LAYER_BIOMES, labels::LAYER_SURFACE)
+        );
     }
 
     #[test]
@@ -990,7 +1012,7 @@ mod tests {
     #[test]
     fn layers_labels_and_offers_agree_on_the_vocabulary() {
         // Every planned layer has a label; the offered set is exactly
-        // the layers with renderers today (Zone joined with T19).
+        // the layers with renderers today (Surface joined with T21).
         for layer in [
             Layer::Biome,
             Layer::Height,
@@ -1004,10 +1026,7 @@ mod tests {
             assert!(!layer_label(layer).is_empty(), "{layer:?} is labelled");
             assert_eq!(
                 offers_layer(layer),
-                !matches!(
-                    layer,
-                    Layer::Surface | Layer::CaveSlice | Layer::CaveDensity
-                ),
+                !matches!(layer, Layer::CaveSlice | Layer::CaveDensity),
                 "{layer:?}"
             );
         }

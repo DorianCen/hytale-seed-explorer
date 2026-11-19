@@ -8,22 +8,24 @@
 //!
 //! # Frame loop
 //!
-//! 1. compute the frame's request (pure: [`frame_tiles`]) — one
-//!    subject per *enabled* layer, bottom → top;
+//! 1. compute the frame's request (pure: [`frame_tiles`]) — every
+//!    enabled layer's paint subject at the fine step, plus the
+//!    scheduler passes (T21's coarse fill and fine refine for the
+//!    surface layer when it needs them);
 //! 2. when it *changed*, hand it to the scheduler (it queues the
-//!    missing tiles nearest the center first) and cancel everything
-//!    that is not in the request — tiles that scrolled out of view
-//!    *and* tiles of layers the user just disabled (T19);
+//!    missing tiles nearest each pass's center first) and cancel
+//!    everything that is not in the request — tiles that scrolled out
+//!    of view *and* tiles of layers the user just disabled (T19);
 //! 3. drain scheduler events — `Ready` tiles upload into the GPU bridge
 //!    exactly once per key, the tile cache being the state of record;
 //! 4. drop GPU textures for CPU-evicted tiles (T14's contract);
-//! 5. paint each visible tile layer by layer, bottom → top: the base
-//!    (first) layer carries T16's progressive placeholder semantics
-//!    (exact texture, else cropped parent, else a quiet tint); every
-//!    layer above draws only its exact texture, tinted with the
-//!    layer's opacity (`Color32::from_white_alpha`) — egui's blending
-//!    is exactly `map_core::layers::blend_over`'s math, so the screen
-//!    and a future export (T32) agree by construction.
+//! 5. paint each visible tile layer by layer, bottom → top at the fine
+//!    step: every layer may crop its own cached coarser parent as a
+//!    placeholder (T21's progressive fill), while the quiet pending
+//!    tint stays exclusive to the base (first) layer. Each texture is
+//!    tinted with the layer's opacity (`Color32::from_white_alpha`) —
+//!    egui's blending is exactly `map_core::layers::blend_over`'s math,
+//!    so the screen and a future export (T32) agree by construction.
 //!
 //! Pipelines never die on the UI thread: a stale one (its source was
 //! invalidated or reloaded) is parked in `retired` and the app drops
@@ -48,7 +50,8 @@ use egui::{Color32, PointerButton, Response};
 use map_core::coords::{TileCoord, TileRect, ZoomLevel, floor_div, tiles_in};
 use map_core::render::fluid::DEFAULT_FLUID_OPACITY;
 use map_core::render::tiles::LayeredTileRenderer;
-use map_core::scheduler::{TileEvent, TileRenderer, TileScheduler, TileSubject};
+use map_core::render::{Layer, SurfaceOptions};
+use map_core::scheduler::{TileEvent, TilePass, TileRenderer, TileScheduler, TileSubject};
 use map_core::source::WorldSource;
 use map_core::tiles::{TileCache, TileKey, covering_placeholder};
 use map_core::types::Rect;
@@ -72,6 +75,12 @@ const SCROLL_POINTS_PER_LEVEL: f32 = 50.0;
 /// While tiles are pending, keep frames coming so a finished tile pops
 /// in on the very next one instead of waiting for other input.
 const TILE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The coarse rung of the surface layer's progressive fill (T21): fine
+/// detail (1×1/2×2) rides a step-4 fill pass first — the plan's "step 4
+/// or 8" rung, chosen over 8 because a 2,048-block placeholder tile
+/// scales too coarsely to read as terrain.
+const SURFACE_COARSE_STEP: u32 = 4;
 
 /// The map canvas: the letterbox around the world, the color behind
 /// transparent tile margins, and the loading blank.
@@ -106,32 +115,59 @@ fn alpha_byte(opacity: f32) -> u8 {
 // The frame request (pure, headless-testable)
 // ---------------------------------------------------------------------------
 
-/// One frame's tile request: what the scheduler should be serving.
-///
-/// Pure on purpose — the same view, subject set and world always
-/// produce the identical request, which is what keeps the pipeline
-/// from re-queuing differently-rounded tiles every frame. Opacity is
-/// deliberately absent: it never keys a tile, so the paint list (not
-/// the request identity) carries it.
+/// One paint step of the frame: the layers sharing one sampling step,
+/// with the opacity that never keys a tile (map-app's mirror of
+/// `map_core::scheduler::TilePass`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FrameTiles {
-    /// The enabled layers' tile identities, bottom → top paint order
-    /// (T19). Every subject shares one zoom: the frame's effective
-    /// step serves all layers alike.
-    pub subjects: Vec<TileSubject>,
-    /// The visible tile range, one-tile-expanded (T10) and clamped to
-    /// the generatable world.
+pub struct FramePass {
+    pub layers: Vec<(TileSubject, f32)>,
     pub visible: TileRect,
-    /// The tile the queue's nearest-first priorities radiate from.
     pub center: TileCoord,
+    pub refine: bool,
 }
 
-/// Computes the frame's request from the pure view state: the visible
-/// tile range at the subjects' shared step, clamped to the generatable
-/// world, plus the center tile for priorities.
+/// A pass the app wants, before its visible range is computed (the
+/// layers share one zoom by construction).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassLayers {
+    pub layers: Vec<(TileSubject, f32)>,
+    pub refine: bool,
+}
+
+/// What the canvas draws: every enabled layer at the FINE step,
+/// bottom → top.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintFrame {
+    pub visible: TileRect,
+    pub center: TileCoord,
+    pub layers: Vec<(TileSubject, f32)>,
+}
+
+/// One frame's tile request: the scheduler passes plus the paint plan.
 ///
-/// [`None`] when the view leaves the representable block space or lies
-/// entirely outside the world — the widget paints the canvas and
+/// Pure on purpose — the same view, paint list, pass list and world
+/// always produce the identical request, which is what keeps the
+/// pipeline from re-queuing differently-rounded tiles every frame. The
+/// whole struct is the dedup identity: a progressive frame's coarse
+/// fill pass differs from the next frame's even when the paint plan is
+/// unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameTiles {
+    /// The scheduler's passes, fill passes before refinement passes.
+    pub passes: Vec<FramePass>,
+    /// The canvas's own plan: every enabled layer at the fine step,
+    /// bottom → top.
+    pub paint: PaintFrame,
+}
+
+/// Computes the frame's request from the pure view state: the paint
+/// plan's fine range (clamped to the generatable world) plus each
+/// pass's own range at its own sampling step, and the pass centers for
+/// priorities.
+///
+/// [`None`] when the paint list is empty, the paint range leaves the
+/// representable block space or lies entirely outside the world, or
+/// every pass resolved to nothing — the widget paints the canvas and
 /// requests nothing rather than a range that cannot exist. (Tiles
 /// already queued for a superseded range are left to finish or be
 /// cancelled by a later request; the degenerate case is a view flung
@@ -139,12 +175,55 @@ pub struct FrameTiles {
 #[must_use]
 pub fn frame_tiles(
     view: &MapViewState,
-    subjects: Vec<TileSubject>,
+    paint: Vec<(TileSubject, f32)>,
+    passes: Vec<PassLayers>,
     world: Option<Rect>,
 ) -> Option<FrameTiles> {
-    // All subjects share the frame's step by construction (one zoom for
-    // every layer of one view); an empty set has nothing to key.
-    let step = subjects.first()?.zoom.step();
+    // The paint list is the frame's fine step: every enabled layer
+    // paints at the same zoom by construction.
+    let paint_step = paint.first()?.0.zoom.step();
+    let (paint_visible, paint_center) = visible_and_center(view, paint_step, world)?;
+
+    let mut frame_passes = Vec::with_capacity(passes.len());
+    for pass in passes {
+        // An entry without layers has no step to key; the app never
+        // builds one (its fill pass is conditional on being non-empty).
+        let Some((first, _)) = pass.layers.first() else {
+            continue;
+        };
+        let Some((visible, center)) = visible_and_center(view, first.zoom.step(), world) else {
+            continue;
+        };
+        frame_passes.push(FramePass {
+            layers: pass.layers,
+            visible,
+            center,
+            refine: pass.refine,
+        });
+    }
+    if frame_passes.is_empty() {
+        return None;
+    }
+
+    Some(FrameTiles {
+        passes: frame_passes,
+        paint: PaintFrame {
+            visible: paint_visible,
+            center: paint_center,
+            layers: paint,
+        },
+    })
+}
+
+/// One step's visible range and priority center: the view's tiles at
+/// `step`, clamped to the generatable world. [`None`] when the view
+/// leaves the representable block space or lies entirely outside the
+/// world.
+fn visible_and_center(
+    view: &MapViewState,
+    step: u32,
+    world: Option<Rect>,
+) -> Option<(TileRect, TileCoord)> {
     let mut visible = view.visible_tiles(step)?;
     if let Some(world) = world {
         visible = intersect_tiles(visible, tiles_in(&world, step))?;
@@ -164,11 +243,7 @@ pub fn frame_tiles(
             visible.max.z,
         ),
     );
-    Some(FrameTiles {
-        subjects,
-        visible,
-        center,
-    })
+    Some((visible, center))
 }
 
 /// The intersection of two inclusive tile ranges; [`None`] when empty.
@@ -252,6 +327,7 @@ impl TilePipeline {
             source,
             world,
             DEFAULT_FLUID_OPACITY,
+            SurfaceOptions::default(),
         ));
         let scheduler = TileScheduler::new(TileScheduler::default_workers(), Arc::clone(&cache));
         let events = scheduler.events();
@@ -361,7 +437,8 @@ impl MapView {
                 unreachable!("sync_pipeline builds a pipeline for a ready source");
             };
             // The frame's paint list (T19): enabled, offered layers in
-            // stack order — bottom first — each with its paint opacity.
+            // stack order — bottom first — each with its paint opacity,
+            // all at the fine step the view resolves.
             let zoom = {
                 let view = state.view();
                 let step = view.tile_step(state.resolution_step());
@@ -384,21 +461,62 @@ impl MapView {
                     )
                 })
                 .collect();
-            let subjects: Vec<TileSubject> =
-                paint_layers.iter().map(|(subject, _)| *subject).collect();
-            let request = (!subjects.is_empty())
-                .then(|| frame_tiles(state.view(), subjects, pipeline.world))
+            // T21: at a fine effective step the full-block surface is
+            // requested twice — a coarse fill that covers the viewport
+            // quickly and a fine refine behind it. The coarse tiles are
+            // never painted directly; they exist so the fine tiles'
+            // placeholder crops find a cached parent (T16's level scan
+            // crosses zooms). Every other layer keeps one fine pass.
+            let surface = paint_layers
+                .iter()
+                .find(|(subject, _)| subject.layer == Layer::Surface)
+                .copied();
+            let progressive = surface.is_some() && zoom.step() < SURFACE_COARSE_STEP;
+            let mut passes = Vec::new();
+            let fill_layers: Vec<(TileSubject, f32)> = if progressive {
+                paint_layers
+                    .iter()
+                    .filter(|(subject, _)| subject.layer != Layer::Surface)
+                    .copied()
+                    .collect()
+            } else {
+                paint_layers.clone()
+            };
+            if !fill_layers.is_empty() {
+                passes.push(PassLayers {
+                    layers: fill_layers,
+                    refine: false,
+                });
+            }
+            if let Some((surface_subject, surface_opacity)) = surface
+                && progressive
+            {
+                let coarse_zoom = ZoomLevel::from_step(SURFACE_COARSE_STEP)
+                    .expect("SURFACE_COARSE_STEP is an in-range power of two");
+                passes.push(PassLayers {
+                    layers: vec![(
+                        TileSubject::new(
+                            surface_subject.identity_hash,
+                            surface_subject.generator_seed,
+                            Layer::Surface,
+                            0,
+                            coarse_zoom,
+                        ),
+                        surface_opacity,
+                    )],
+                    refine: false,
+                });
+                passes.push(PassLayers {
+                    layers: vec![(surface_subject, surface_opacity)],
+                    refine: true,
+                });
+            }
+            let request = (!paint_layers.is_empty())
+                .then(|| frame_tiles(state.view(), paint_layers.clone(), passes, pipeline.world))
                 .flatten();
             self.serve(ui.ctx(), &mut pipeline, request.as_ref());
             if let Some(request) = &request {
-                self.paint(
-                    ui.ctx(),
-                    &painter,
-                    request,
-                    &pipeline,
-                    state.view(),
-                    &paint_layers,
-                );
+                self.paint(ui.ctx(), &painter, request, &pipeline, state.view());
                 if self.pending > 0 {
                     // The "generating N tiles" cue: a spinner near the
                     // top; the count itself lives in the status bar.
@@ -532,17 +650,25 @@ impl MapView {
             && pipeline.last.as_ref() != Some(request)
         {
             // New view, zoom or layer set: queue what is missing
-            // nearest-center first, cancel what stopped being served,
-            // and remember the request so an unchanged frame is a no-op.
-            pipeline.scheduler.schedule(
-                &request.subjects,
-                request.visible,
-                request.center,
-                Arc::clone(&pipeline.renderer),
-            );
+            // nearest each pass's center first, cancel what stopped
+            // being served, and remember the request so an unchanged
+            // frame is a no-op. Both APIs take the same pass list, so
+            // the scheduler's notion of "serving" matches exactly what
+            // it was asked for (T21's refine pass included).
+            let tile_passes: Vec<TilePass> = request
+                .passes
+                .iter()
+                .map(|pass| TilePass {
+                    subjects: pass.layers.iter().map(|(subject, _)| *subject).collect(),
+                    visible: pass.visible,
+                    center: pass.center,
+                    refine: pass.refine,
+                })
+                .collect();
             pipeline
                 .scheduler
-                .cancel_not_serving(&request.subjects, &request.visible);
+                .schedule_passes(&tile_passes, Arc::clone(&pipeline.renderer));
+            pipeline.scheduler.cancel_not_serving(&tile_passes);
             pipeline.last = Some(request.clone());
         }
 
@@ -575,16 +701,18 @@ impl MapView {
 
     // -- Painting ---------------------------------------------------------------
 
-    /// Paints each visible tile layer by layer, bottom → top (T19).
+    /// Paints each visible tile layer by layer, bottom → top (T19), all
+    /// at the paint plan's fine step.
     ///
-    /// The base (first) layer carries T16's progressive semantics: its
-    /// exact texture, else the nearest cached coarser tile cropped to
-    /// this tile's world rect, else a subtle pending tint. Every layer
-    /// above draws only its exact texture — a pending overlay stays
-    /// transparent rather than painting a crop that would double the
-    /// base's placeholder. Each texture is tinted with its layer's
-    /// opacity (`from_white_alpha`): egui's vertex blending is
-    /// straight-alpha-over, the same math as
+    /// Every layer may draw its exact texture, else the nearest cached
+    /// coarser tile of *its own* layer cropped to this tile's world rect
+    /// (T21: the progressive coarse pass exists precisely so the fine
+    /// surface tile's `covering_placeholder` finds a parent). Only the
+    /// bottom-most layer (index 0) gets the quiet pending tint, though:
+    /// a tint under an overlay would double the base's placeholder
+    /// rather than tell the user anything new. Each texture is tinted
+    /// with its layer's opacity (`from_white_alpha`): egui's vertex
+    /// blending is straight-alpha-over, the same math as
     /// `map_core::layers::blend_over`, so the screen and a future
     /// export (T32) agree by construction.
     ///
@@ -595,19 +723,20 @@ impl MapView {
         &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
-        request: &FrameTiles,
+        frame: &FrameTiles,
         pipeline: &TilePipeline,
         view: &MapViewState,
-        layers: &[(TileSubject, f32)],
     ) {
-        let step = layers
+        let step = frame
+            .paint
+            .layers
             .first()
-            .expect("the caller only paints with a non-empty layer list")
+            .expect("the caller only paints with a non-empty paint list")
             .0
             .zoom
             .step();
         let ppp = ctx.pixels_per_point();
-        for coord in request.visible.iter() {
+        for coord in frame.paint.visible.iter() {
             // Visible ranges are i64 tile space; keys are i32 — the
             // reachable world sits far inside (T10's bounds analysis).
             let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
@@ -625,42 +754,37 @@ impl MapView {
             let screen =
                 egui::Rect::from_min_max(egui::pos2(min.0, min.1), egui::pos2(max.0, max.1));
 
-            for (index, (subject, opacity)) in layers.iter().enumerate() {
+            for (index, (subject, opacity)) in frame.paint.layers.iter().enumerate() {
                 let key = subject.key_at(tx, ty);
                 // The layer's paint-time blend: white keeps the tile's
                 // own colors, the alpha scales them by the slider.
                 let tint = Color32::from_white_alpha(alpha_byte(*opacity));
                 if let Some(id) = self.textures.texture_id(&key) {
                     painter.image(id, screen, full_uv(), tint);
-                } else if index == 0 {
-                    // Only the base layer gets the progressive
-                    // placeholder; overlays simply are not there yet.
-                    if let Some(placeholder) = covering_placeholder(&pipeline.cache, &key) {
-                        // Instant low detail while the real tile renders. The
-                        // parent may be cached but not yet uploaded — upload it
-                        // on demand; the exact tile's later upload replaces it.
-                        let id = self
-                            .textures
-                            .texture_id(&placeholder.tile.key)
-                            .unwrap_or_else(|| {
-                                self.textures
-                                    .upload(ctx, placeholder.tile.key, &placeholder.tile)
-                            });
-                        let uv = egui::Rect::from_min_max(
-                            egui::pos2(placeholder.uv[0], placeholder.uv[1]),
-                            egui::pos2(placeholder.uv[2], placeholder.uv[3]),
-                        );
-                        painter.image(id, screen, uv, tint);
-                    } else if pipeline.scheduler.is_pending(&key) {
-                        // Pending with no placeholder: a quiet "filling in".
-                        painter.rect_filled(screen, 0.0, pending_tint());
-                        painter.rect_stroke(
-                            screen,
-                            0.0,
-                            pending_stroke(),
-                            egui::StrokeKind::Middle,
-                        );
-                    }
+                } else if let Some(placeholder) = covering_placeholder(&pipeline.cache, &key) {
+                    // Instant low detail while the real tile renders. The
+                    // parent may be cached but not yet uploaded — upload it
+                    // on demand; the exact tile's later upload replaces it.
+                    // Every layer crops its own parent: the surface's coarse
+                    // pass (T21) is what makes a pending fine surface tile
+                    // read as terrain instead of a blank.
+                    let id = self
+                        .textures
+                        .texture_id(&placeholder.tile.key)
+                        .unwrap_or_else(|| {
+                            self.textures
+                                .upload(ctx, placeholder.tile.key, &placeholder.tile)
+                        });
+                    let uv = egui::Rect::from_min_max(
+                        egui::pos2(placeholder.uv[0], placeholder.uv[1]),
+                        egui::pos2(placeholder.uv[2], placeholder.uv[3]),
+                    );
+                    painter.image(id, screen, uv, tint);
+                } else if index == 0 && pipeline.scheduler.is_pending(&key) {
+                    // The base layer pending with no placeholder: a
+                    // quiet "filling in"; overlays stay transparent.
+                    painter.rect_filled(screen, 0.0, pending_tint());
+                    painter.rect_stroke(screen, 0.0, pending_stroke(), egui::StrokeKind::Middle);
                 }
             }
         }
@@ -750,7 +874,9 @@ mod tests {
     use map_core::tiles::covering_placeholder;
     use map_core::types::Rect;
 
-    use super::{FrameTiles, MapView, TilePipeline, TileSubject, frame_tiles, world_rect};
+    use super::{
+        FrameTiles, MapView, PassLayers, TilePipeline, TileSubject, frame_tiles, world_rect,
+    };
     use crate::view_state::MapViewState;
 
     /// A view of `width x height` points at the given continuous zoom,
@@ -777,18 +903,32 @@ mod tests {
     }
 
     /// The frame request for a whole layer set (T19's stack order):
-    /// the exact subject list the widget builds for those checkboxes.
+    /// the exact paint/subject list the widget builds for those
+    /// checkboxes, served by one ordinary fill pass.
     fn request_for_layers(
         pipeline: &TilePipeline,
         view: &MapViewState,
         zoom: ZoomLevel,
         layers: &[Layer],
     ) -> FrameTiles {
-        let subjects: Vec<TileSubject> = layers
+        let paint: Vec<(TileSubject, f32)> = layers
             .iter()
-            .map(|layer| TileSubject::new(pipeline.served.0, pipeline.served.1, *layer, 0, zoom))
+            .map(|layer| {
+                (
+                    TileSubject::new(pipeline.served.0, pipeline.served.1, *layer, 0, zoom),
+                    1.0,
+                )
+            })
             .collect();
-        frame_tiles(view, subjects, pipeline.world)
+        let passes = if paint.is_empty() {
+            Vec::new()
+        } else {
+            vec![PassLayers {
+                layers: paint.clone(),
+                refine: false,
+            }]
+        };
+        frame_tiles(view, paint, passes, pipeline.world)
             .expect("the test views sit inside the representable space")
     }
 
@@ -817,6 +957,15 @@ mod tests {
 
     // -- The frame request (pure) ---------------------------------------------
 
+    /// One ordinary fill pass over `paint` — the shape every layer's
+    /// checkbox builds when no progressive split is in play.
+    fn fill_pass(paint: &[(TileSubject, f32)]) -> Vec<PassLayers> {
+        vec![PassLayers {
+            layers: paint.to_vec(),
+            refine: false,
+        }]
+    }
+
     #[test]
     fn frame_tiles_matches_the_t10_table() {
         // T10's documented view end to end: center (-1203, 455),
@@ -827,10 +976,12 @@ mod tests {
         // Pan to the center: 601.5 points at scale 0.5 = 1203 blocks.
         view.pan_by_screen((601.5, -227.5));
         let subject = TileSubject::new(1, 7, Layer::Biome, 0, ZoomLevel::new(1).expect("in range"));
-        let request = frame_tiles(&view, vec![subject], None).expect("the view resolves");
-        assert_eq!(request.visible.min, TileCoord::new(-6, -2));
-        assert_eq!(request.visible.max, TileCoord::new(0, 3));
-        assert_eq!(request.center, TileCoord::new(-3, 0));
+        let paint = vec![(subject, 1.0)];
+        let request =
+            frame_tiles(&view, paint.clone(), fill_pass(&paint), None).expect("the view resolves");
+        assert_eq!(request.paint.visible.min, TileCoord::new(-6, -2));
+        assert_eq!(request.paint.visible.max, TileCoord::new(0, 3));
+        assert_eq!(request.paint.center, TileCoord::new(-3, 0));
     }
 
     #[test]
@@ -840,18 +991,26 @@ mod tests {
         let view = view(0.0, 1024.0, 768.0);
         let world = Rect::new(-100, -100, 99, 99);
         let subject = TileSubject::new(1, 7, Layer::Biome, 0, ZoomLevel::MIN);
-        let request =
-            frame_tiles(&view, vec![subject], Some(world)).expect("the view overlaps the world");
-        assert_eq!(request.visible.min, TileCoord::new(-1, -1));
-        assert_eq!(request.visible.max, TileCoord::new(0, 0));
+        let paint = vec![(subject, 1.0)];
+        let request = frame_tiles(&view, paint.clone(), fill_pass(&paint), Some(world))
+            .expect("the view overlaps the world");
+        assert_eq!(request.paint.visible.min, TileCoord::new(-1, -1));
+        assert_eq!(request.paint.visible.max, TileCoord::new(0, 0));
         assert!(
-            request.visible.contains(request.center),
+            request.paint.visible.contains(request.paint.center),
             "the priority center clamps into the tiny range"
+        );
+        assert!(
+            request
+                .passes
+                .iter()
+                .all(|pass| pass.visible.contains(pass.center)),
+            "each pass's center clamps into its own range"
         );
 
         // A world entirely outside the view serves nothing.
         let far = Rect::new(100_000, 100_000, 100_200, 100_200);
-        assert!(frame_tiles(&view, vec![subject], Some(far)).is_none());
+        assert!(frame_tiles(&view, paint.clone(), fill_pass(&paint), Some(far)).is_none());
     }
 
     #[test]
@@ -861,10 +1020,102 @@ mod tests {
         // generation witness lives in the pipeline test below).
         let view = view(0.0, 1024.0, 768.0);
         let subject = TileSubject::new(1, 7, Layer::Biome, 0, ZoomLevel::MIN);
+        let paint = vec![(subject, 1.0)];
         assert_eq!(
-            frame_tiles(&view, vec![subject], None),
-            frame_tiles(&view, vec![subject], None)
+            frame_tiles(&view, paint.clone(), fill_pass(&paint), None),
+            frame_tiles(&view, paint.clone(), fill_pass(&paint), None)
         );
+    }
+
+    #[test]
+    fn surface_progressive_frame_splits_coarse_fill_from_fine_refine() {
+        // T21's request shape, pure and headless: at a fine effective
+        // step the surface layer rides two extra passes — a coarse
+        // fill that lands first and a fine refine behind it — while
+        // every other layer keeps one fine fill pass. Paint is still
+        // every enabled layer at the fine step.
+        let view = view(0.0, 600.0, 400.0);
+        let fine = ZoomLevel::MIN;
+        let coarse = ZoomLevel::from_step(4).expect("4 is an in-range step");
+        let build = || {
+            let biome = TileSubject::new(1, 7, Layer::Biome, 0, fine);
+            let surface = TileSubject::new(1, 7, Layer::Surface, 0, fine);
+            let coarse_surface = TileSubject::new(1, 7, Layer::Surface, 0, coarse);
+            let paint = vec![(biome, 1.0), (surface, 1.0)];
+            let passes = vec![
+                PassLayers {
+                    layers: vec![(biome, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(coarse_surface, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(surface, 1.0)],
+                    refine: true,
+                },
+            ];
+            frame_tiles(&view, paint, passes, None).expect("the view resolves")
+        };
+
+        let frame = build();
+        assert_eq!(frame.passes.len(), 3, "fill, coarse fill, refine");
+        assert_eq!(
+            frame.paint.layers,
+            vec![
+                (TileSubject::new(1, 7, Layer::Biome, 0, fine), 1.0),
+                (TileSubject::new(1, 7, Layer::Surface, 0, fine), 1.0),
+            ],
+            "the canvas still draws every enabled layer at the fine step"
+        );
+
+        let fill = &frame.passes[0];
+        assert!(!fill.refine, "the first pass is the ordinary fill");
+        assert_eq!(fill.layers.len(), 1, "the surface left the fine fill");
+        assert_eq!(fill.layers[0].0.layer, Layer::Biome);
+
+        let coarse_pass = &frame.passes[1];
+        assert!(!coarse_pass.refine, "the coarse coverage is a fill pass");
+        assert_eq!(coarse_pass.layers[0].0.layer, Layer::Surface);
+        assert_eq!(
+            coarse_pass.layers[0].0.zoom, coarse,
+            "the coarse pass samples at the step-4 rung"
+        );
+
+        let refine = &frame.passes[2];
+        assert!(refine.refine, "the detail rides the refine pass");
+        assert_eq!(refine.layers[0].0.layer, Layer::Surface);
+        assert_eq!(
+            refine.layers[0].0.zoom, fine,
+            "the refine pass carries the fine surface tile"
+        );
+
+        // The whole frame is the dedup identity: identical inputs never
+        // change the scheduler's request.
+        assert_eq!(frame, build());
+    }
+
+    #[test]
+    fn surface_at_the_coarse_step_rides_the_ordinary_fill_pass() {
+        // At step 4 the coarse rung *is* the fine step: no split, one
+        // fill pass carrying the surface layer, and the paint plan
+        // matches it.
+        let view = view(0.0, 600.0, 400.0);
+        let step4 = ZoomLevel::from_step(4).expect("4 is an in-range step");
+        let biome = TileSubject::new(1, 7, Layer::Biome, 0, step4);
+        let surface = TileSubject::new(1, 7, Layer::Surface, 0, step4);
+        let paint = vec![(biome, 1.0), (surface, 1.0)];
+        let frame =
+            frame_tiles(&view, paint.clone(), fill_pass(&paint), None).expect("the view resolves");
+
+        assert_eq!(frame.passes.len(), 1, "no progressive split at step 4");
+        assert!(!frame.passes[0].refine);
+        assert_eq!(
+            frame.passes[0].layers, paint,
+            "the surface rides the ordinary fill pass"
+        );
+        assert_eq!(frame.paint.layers, paint);
     }
 
     #[test]
@@ -889,11 +1140,11 @@ mod tests {
         settle(&mut map, &ctx, &mut pipeline, &request);
 
         // Every visible tile is cached and uploaded exactly once.
-        for coord in request.visible.iter() {
+        for coord in request.paint.visible.iter() {
             let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
                 continue;
             };
-            let key = request.subjects[0].key_at(tx, ty);
+            let key = request.paint.layers[0].0.key_at(tx, ty);
             assert!(pipeline.cache.contains(&key), "tile {coord:?} is cached");
             assert!(
                 map.textures.texture_id(&key).is_some(),
@@ -903,7 +1154,7 @@ mod tests {
 
         // The fake's 8-block checkerboard paints many distinct colors
         // over one tile, none of them the canvas.
-        let center_key = request.subjects[0].key_at(0, 0);
+        let center_key = request.paint.layers[0].0.key_at(0, 0);
         let tile = pipeline
             .cache
             .get(&center_key)
@@ -955,13 +1206,13 @@ mod tests {
         let first_view = view(0.0, 600.0, 400.0);
         let first = request_for(&pipeline, &first_view, ZoomLevel::MIN, Layer::Biome);
         settle(&mut map, &ctx, &mut pipeline, &first);
-        let first_key = first.subjects[0].key_at(0, 0);
+        let first_key = first.paint.layers[0].0.key_at(0, 0);
 
         let mut far_view = view(0.0, 600.0, 400.0);
         far_view.pan_by_screen((200_000.0, 0.0));
         let second = request_for(&pipeline, &far_view, ZoomLevel::MIN, Layer::Biome);
         assert!(
-            !second.visible.contains(TileCoord::new(0, 0)),
+            !second.paint.visible.contains(TileCoord::new(0, 0)),
             "the two views are disjoint"
         );
 
@@ -994,7 +1245,7 @@ mod tests {
 
         let fine_view = view(0.0, 600.0, 400.0);
         let fine = request_for(&pipeline, &fine_view, ZoomLevel::MIN, Layer::Biome);
-        let child = fine.subjects[0].key_at(0, 0);
+        let child = fine.paint.layers[0].0.key_at(0, 0);
         assert!(
             !pipeline.cache.contains(&child),
             "the fine tile has not been requested"
@@ -1014,6 +1265,97 @@ mod tests {
     }
 
     #[test]
+    fn refinement_coarse_pass_placeholds_the_fine_surface_tiles() {
+        // T21 end to end on the fake pipeline: the coarse fill pass is
+        // served first and is never painted directly — it exists so a
+        // pending fine surface tile finds a cached parent to crop.
+        let ctx = egui::Context::default();
+        let mut map = MapView::new();
+        let mut pipeline = fake_pipeline();
+        let view = view(0.0, 600.0, 400.0);
+        let coarse = ZoomLevel::from_step(4).expect("4 is an in-range step");
+
+        // The app's coarse fill pass, alone: only the surface layer at
+        // the step-4 rung.
+        let coarse_surface = TileSubject::new(
+            pipeline.served.0,
+            pipeline.served.1,
+            Layer::Surface,
+            0,
+            coarse,
+        );
+        let coarse_request = frame_tiles(
+            &view,
+            vec![(coarse_surface, 1.0)],
+            vec![PassLayers {
+                layers: vec![(coarse_surface, 1.0)],
+                refine: false,
+            }],
+            pipeline.world,
+        )
+        .expect("the view resolves");
+        settle(&mut map, &ctx, &mut pipeline, &coarse_request);
+        assert!(
+            pipeline.cache.contains(&coarse_surface.key_at(0, 0)),
+            "the coarse fill is cached"
+        );
+
+        // The full progressive frame the app builds next: biome fill,
+        // coarse surface fill, fine surface refine.
+        let fine_surface = TileSubject::new(
+            pipeline.served.0,
+            pipeline.served.1,
+            Layer::Surface,
+            0,
+            ZoomLevel::MIN,
+        );
+        let biome = TileSubject::new(
+            pipeline.served.0,
+            pipeline.served.1,
+            Layer::Biome,
+            0,
+            ZoomLevel::MIN,
+        );
+        let fine_key = fine_surface.key_at(0, 0);
+        assert!(
+            !pipeline.cache.contains(&fine_key),
+            "the fine tile has not rendered yet"
+        );
+        let placeholder = covering_placeholder(&pipeline.cache, &fine_key)
+            .expect("the coarse fill covers the fine tile");
+        assert_eq!(
+            placeholder.tile.key.zoom, coarse,
+            "the step-4 rung placeholds the fine surface tile"
+        );
+
+        let request = frame_tiles(
+            &view,
+            vec![(biome, 1.0), (fine_surface, 1.0)],
+            vec![
+                PassLayers {
+                    layers: vec![(biome, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(coarse_surface, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(fine_surface, 1.0)],
+                    refine: true,
+                },
+            ],
+            pipeline.world,
+        )
+        .expect("the view resolves");
+        settle(&mut map, &ctx, &mut pipeline, &request);
+        assert!(
+            pipeline.cache.contains(&fine_key),
+            "serving the full frame refines the fine tile"
+        );
+    }
+
+    #[test]
     fn switching_layers_serves_only_the_new_layers_tiles() {
         // The T17 acceptance rule "switching layers does not show stale
         // tiles from the previous layer", at the pipeline level: the
@@ -1028,14 +1370,14 @@ mod tests {
 
         let biomes = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Biome);
         settle(&mut map, &ctx, &mut pipeline, &biomes);
-        let biome_key = biomes.subjects[0].key_at(0, 0);
+        let biome_key = biomes.paint.layers[0].0.key_at(0, 0);
         assert!(pipeline.cache.contains(&biome_key), "biomes served first");
 
         // The same view, the Height checkbox: a different subject, keys
         // the cached biome tile can never satisfy.
         let heights = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Height);
-        assert_eq!(heights.subjects[0].layer, Layer::Height);
-        let height_key = heights.subjects[0].key_at(0, 0);
+        assert_eq!(heights.paint.layers[0].0.layer, Layer::Height);
+        let height_key = heights.paint.layers[0].0.key_at(0, 0);
         assert_ne!(height_key, biome_key, "layers never share a key");
         assert!(
             !pipeline.cache.contains(&height_key),
@@ -1070,10 +1412,10 @@ mod tests {
             &[Layer::Biome, Layer::Fluid],
         );
         settle(&mut map, &ctx, &mut pipeline, &request);
-        assert_eq!(request.subjects.len(), 2);
+        assert_eq!(request.paint.layers.len(), 2);
 
-        let biome_key = request.subjects[0].key_at(0, 0);
-        let fluid_key = request.subjects[1].key_at(0, 0);
+        let biome_key = request.paint.layers[0].0.key_at(0, 0);
+        let fluid_key = request.paint.layers[1].0.key_at(0, 0);
         assert_ne!(biome_key, fluid_key, "layers never share a key");
         assert!(
             pipeline.cache.contains(&biome_key) && pipeline.cache.contains(&fluid_key),
@@ -1111,7 +1453,7 @@ mod tests {
         // Base layer settles; the fluid overlay then joins the frame.
         let biomes = request_for(&pipeline, &view, ZoomLevel::MIN, Layer::Biome);
         settle(&mut map, &ctx, &mut pipeline, &biomes);
-        let biome_key = biomes.subjects[0].key_at(0, 0);
+        let biome_key = biomes.paint.layers[0].0.key_at(0, 0);
 
         let both = request_for_layers(
             &pipeline,
@@ -1120,7 +1462,7 @@ mod tests {
             &[Layer::Biome, Layer::Fluid],
         );
         map.serve(&ctx, &mut pipeline, Some(&both));
-        let fluid_key = both.subjects[1].key_at(0, 0);
+        let fluid_key = both.paint.layers[1].0.key_at(0, 0);
 
         // The fluid checkbox unticks possibly before its tiles finish:
         // the very next frame stops serving them — whichever way the
@@ -1167,14 +1509,14 @@ mod tests {
             Layer::Biome,
         );
         settle(&mut map, &ctx, &mut pipeline, &coarse);
-        let coarse_key = coarse.subjects[0].key_at(0, 0);
+        let coarse_key = coarse.paint.layers[0].0.key_at(0, 0);
         assert!(pipeline.cache.contains(&coarse_key));
 
         // Selecting 1x1 in the top bar maps the frame to the full-block
         // level: different subject zoom, different keys.
         let fine = request_for(&pipeline, &coarse_view, ZoomLevel::MIN, Layer::Biome);
-        assert_ne!(fine.subjects[0].zoom, coarse.subjects[0].zoom);
-        let fine_key = fine.subjects[0].key_at(0, 0);
+        assert_ne!(fine.paint.layers[0].0.zoom, coarse.paint.layers[0].0.zoom);
+        let fine_key = fine.paint.layers[0].0.key_at(0, 0);
         assert_ne!(fine_key, coarse_key, "the resolution rekeys the tile");
         assert!(
             !pipeline.cache.contains(&fine_key),
@@ -1224,9 +1566,9 @@ mod tests {
             ZoomLevel::new(1).expect("in range"),
             Layer::Biome,
         );
-        let center_key = request.subjects[0].key_at(
-            i32::try_from(request.center.x).expect("in i32"),
-            i32::try_from(request.center.z).expect("in i32"),
+        let center_key = request.paint.layers[0].0.key_at(
+            i32::try_from(request.paint.center.x).expect("in i32"),
+            i32::try_from(request.paint.center.z).expect("in i32"),
         );
 
         let ctx = egui::Context::default();

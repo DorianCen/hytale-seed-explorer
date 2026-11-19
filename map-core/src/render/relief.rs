@@ -43,6 +43,36 @@ const VERTICAL: f32 = 3.0;
 const AMBIENT: f32 = 0.4;
 const DIFFUSE: f32 = 0.6;
 
+/// The T17 hillshade factor for one output sample from clamped
+/// neighbour heights (blocks): the Lambert shade
+/// `AMBIENT + DIFFUSE * max(0, dot(normal, LIGHT))` of the surface
+/// normal `(dhdx, VERTICAL, dhdz)`, with the per-block slope
+/// normalized by `step`. Relief and the full-block surface (T21)
+/// share it — one hillshade convention, no drift.
+///
+/// The central-difference slope uses the four neighbours only; the
+/// `center` height is accepted so the argument list reads like the
+/// sample window the caller reads, and the full-block renderer already
+/// has it in hand.
+#[must_use]
+pub fn hillshade(center: i32, east: i32, west: i32, south: i32, north: i32, step: u32) -> f32 {
+    let _ = center;
+    let east = east as f32;
+    let west = west as f32;
+    let south = south as f32;
+    let north = north as f32;
+    // A zoom step (at most 2^20 blocks) is exactly representable in f32.
+    let step = step as f32;
+
+    let dhdx = (east - west) / (2.0 * step);
+    let dhdz = (south - north) / (2.0 * step);
+    // `VERTICAL` is 3, so the normal never has zero length.
+    let normal_len = (dhdx * dhdx + VERTICAL * VERTICAL + dhdz * dhdz).sqrt();
+    let lambert =
+        ((dhdx * LIGHT[0] + VERTICAL * LIGHT[1] + dhdz * LIGHT[2]) / normal_len).clamp(0.0, 1.0);
+    AMBIENT + DIFFUSE * lambert
+}
+
 /// Shades `width × height` output samples out of `grid`: output sample
 /// `(x, z)` reads `grid` at `(x - origin.0)` / `(z - origin.1)` — the
 /// query plan's mapping — and every neighbour read is CLAMPED to the
@@ -58,9 +88,9 @@ const DIFFUSE: f32 = 0.6;
 ///   levels;
 /// - normal = normalize(`(dhdx, VERTICAL, dhdz)`); lambert =
 ///   `dot(normal, LIGHT)` clamped to `0..=1`;
-/// - shade = `AMBIENT + DIFFUSE * lambert`; the pixel is
-///   `height_color(center)` with each channel multiplied by shade
-///   (rounded, clamped `0..=255`), alpha 255.
+/// - shade = `AMBIENT + DIFFUSE * lambert` (the pure [`hillshade`]
+///   function); the pixel is `height_color(center)` with each channel
+///   multiplied by shade (rounded, clamped `0..=255`), alpha 255.
 ///
 /// `cancel` is checked every 16 output rows, returning
 /// [`SourceError::Cancelled`] on a hit.
@@ -77,12 +107,8 @@ pub fn relief_image(
         grid_width > 0 && grid_height > 0,
         "a relief source grid has at least one sample per axis",
     );
-    // The grid dims are u32, so the inclusive max indices fit i64 and
-    // the clamped index fits usize.
     let max_x = i64::from(grid.width) - 1;
     let max_z = i64::from(grid.height) - 1;
-    // A zoom step (at most 2^20 blocks) is exactly representable in f32.
-    let step = grid.step as f32;
     // The clamp is what makes edge shading a "nearest valid height"
     // extrapolation rather than a read of zero.
     let sample = |x: i64, z: i64| -> i32 {
@@ -100,18 +126,14 @@ pub fn relief_image(
         for x in 0..width {
             let gx = i64::from(x) - i64::from(origin.0);
             let center = sample(gx, gz);
-            let east = sample(gx + 1, gz) as f32;
-            let west = sample(gx - 1, gz) as f32;
-            let south = sample(gx, gz + 1) as f32;
-            let north = sample(gx, gz - 1) as f32;
-
-            let dhdx = (east - west) / (2.0 * step);
-            let dhdz = (south - north) / (2.0 * step);
-            // `VERTICAL` is 3, so the normal never has zero length.
-            let normal_len = (dhdx * dhdx + VERTICAL * VERTICAL + dhdz * dhdz).sqrt();
-            let lambert = ((dhdx * LIGHT[0] + VERTICAL * LIGHT[1] + dhdz * LIGHT[2]) / normal_len)
-                .clamp(0.0, 1.0);
-            let shade = AMBIENT + DIFFUSE * lambert;
+            let shade = hillshade(
+                center,
+                sample(gx + 1, gz),
+                sample(gx - 1, gz),
+                sample(gx, gz + 1),
+                sample(gx, gz - 1),
+                grid.step,
+            );
 
             let Rgba([r, g, b, _]) = height_color(center);
             image.put_pixel(
@@ -130,7 +152,7 @@ pub fn relief_image(
 }
 
 /// Applies `shade` to one 8-bit channel: multiply, round, clamp.
-fn shade_channel(channel: u8, shade: f32) -> u8 {
+pub(crate) fn shade_channel(channel: u8, shade: f32) -> u8 {
     // The clamp proves the range before the narrowing cast.
     (f32::from(channel) * shade).round().clamp(0.0, 255.0) as u8
 }
@@ -161,7 +183,7 @@ impl TileRenderer for ReliefTileRenderer {
             cancel,
             self.world,
             1,
-            |source, rect, step| source.height_region(rect, step),
+            |source, rect, step, _cancel| source.height_region(rect, step),
             |grid, query, cancel| {
                 relief_image(grid, query.origin, TILE_SIZE, TILE_SIZE, cancel)
                     .map(|image| (image, (0, 0)))

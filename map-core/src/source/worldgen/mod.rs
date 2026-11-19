@@ -344,6 +344,66 @@ impl WorldgenSource {
             tint: column.tint,
         }
     }
+
+    /// The shared body of [`WorldSource::surface_region`] and its
+    /// cancellable variant: `external` is the caller's per-tile token
+    /// (T21), `None` for the plain region query.
+    fn surface_region_inner(
+        &self,
+        rect: Rect,
+        step: u32,
+        external: Option<&CancelToken>,
+    ) -> SourceResult<SurfaceGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let cancel = self.fresh_cancel();
+
+        // 1) The chunks this rect needs; a rect reaching outside the
+        //    generatable area is a typed error for the whole request
+        //    (documented: the UI clamps its requests, T16).
+        let ordered = self.ordered_covering_chunks(rect)?;
+
+        // 2) Summaries, nearest to the rect's center first, one pool
+        //    command per missing chunk, cancelled between chunks. This
+        //    loop is the expensive path (a chunk generation per miss), so
+        //    both tokens are consulted here: the source's own shared one
+        //    (re-armed above) and the caller's per-tile one.
+        let mut summaries: HashMap<(i32, i32), Arc<ChunkSummary>> = HashMap::new();
+        for (cx, cz) in ordered {
+            let cancelled = cancel.load(Ordering::Relaxed)
+                || external.is_some_and(|token| token.load(Ordering::Relaxed));
+            if cancelled {
+                return Err(SourceError::Cancelled);
+            }
+            let summary = self.summary_for(cx, cz)?;
+            summaries.insert((cx, cz), summary);
+        }
+
+        // 3) The biome of every sample in one cheap batch. It keeps the
+        //    shared token only: the band walk has its own per-row checks
+        //    and costs a fraction of a chunk, so a caller cancellation is
+        //    honoured where it pays — the per-chunk gate above. Re-arming
+        //    here would also lose a shared cancel that landed mid-loop.
+        let biomes = self.pool.biome_region(rect, step, Arc::clone(&cancel))?;
+
+        // 4) Assemble row-major.
+        let mut samples = Vec::with_capacity((width * height) as usize);
+        for z in 0..height {
+            let world_z = rect.min_z + z as i32 * step as i32;
+            for x in 0..width {
+                let world_x = rect.min_x + x as i32 * step as i32;
+                let index = (z * width + x) as usize;
+                let biome = biomes.values[index];
+                let summary = &summaries[&(chunk_of(world_x), chunk_of(world_z))];
+                let column = summary
+                    .column(local_of(world_x), local_of(world_z))
+                    .expect("local coordinates are in range by construction");
+                samples.push(self.surface_sample(world_x, world_z, biome, &column));
+            }
+        }
+        Ok(SurfaceGrid::new(
+            rect.min_x, rect.min_z, step, width, height, samples,
+        ))
+    }
 }
 
 impl WorldSource for WorldgenSource {
@@ -400,47 +460,16 @@ impl WorldSource for WorldgenSource {
     }
 
     fn surface_region(&self, rect: Rect, step: u32) -> SourceResult<SurfaceGrid> {
-        let (width, height) = rect.sample_dims(step);
-        let cancel = self.fresh_cancel();
+        self.surface_region_inner(rect, step, None)
+    }
 
-        // 1) The chunks this rect needs; a rect reaching outside the
-        //    generatable area is a typed error for the whole request
-        //    (documented: the UI clamps its requests, T16).
-        let ordered = self.ordered_covering_chunks(rect)?;
-
-        // 2) Summaries, nearest to the rect's center first, one pool
-        //    command per missing chunk, cancelled between chunks.
-        let mut summaries: HashMap<(i32, i32), Arc<ChunkSummary>> = HashMap::new();
-        for (cx, cz) in ordered {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(SourceError::Cancelled);
-            }
-            let summary = self.summary_for(cx, cz)?;
-            summaries.insert((cx, cz), summary);
-        }
-
-        // 3) The biome of every sample in one cheap batch (same token, no
-        //    re-arming): a tile must never pay one column query per pixel.
-        let biomes = self.pool.biome_region(rect, step, Arc::clone(&cancel))?;
-
-        // 4) Assemble row-major.
-        let mut samples = Vec::with_capacity((width * height) as usize);
-        for z in 0..height {
-            let world_z = rect.min_z + z as i32 * step as i32;
-            for x in 0..width {
-                let world_x = rect.min_x + x as i32 * step as i32;
-                let index = (z * width + x) as usize;
-                let biome = biomes.values[index];
-                let summary = &summaries[&(chunk_of(world_x), chunk_of(world_z))];
-                let column = summary
-                    .column(local_of(world_x), local_of(world_z))
-                    .expect("local coordinates are in range by construction");
-                samples.push(self.surface_sample(world_x, world_z, biome, &column));
-            }
-        }
-        Ok(SurfaceGrid::new(
-            rect.min_x, rect.min_z, step, width, height, samples,
-        ))
+    fn surface_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        cancel: &CancelToken,
+    ) -> SourceResult<SurfaceGrid> {
+        self.surface_region_inner(rect, step, Some(cancel))
     }
 
     fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid> {

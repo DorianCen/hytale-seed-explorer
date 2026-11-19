@@ -300,8 +300,12 @@ impl SeedExplorerApp {
 
     // -- Panels ----------------------------------------------------------------
 
-    /// The plan's top bar: seed field, Go, version, resolution selector.
+    /// The plan's top bar: seed field, Go, version, resolution selector,
+    /// and T21's worker cap.
     fn top_bar(&mut self, ctx: &Context) {
+        // Buffered like the panel toggles: the closure reads a local and
+        // the write lands where the state is mutable again.
+        let mut workers = self.state.workers().unwrap_or(2);
         egui::TopBottomPanel::top(Id::new("top-bar")).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(labels::SEED);
@@ -340,6 +344,19 @@ impl SeedExplorerApp {
                 ui.separator();
                 ui.label(labels::RESOLUTION);
                 self.resolution_combo(ui);
+                // The cap feeds the GENERATOR pool of the NEXT load (T21's
+                // cost control; T33 tunes the default). It cannot resize a
+                // pool that is already generating, so the change is
+                // announced rather than silently applied.
+                ui.separator();
+                ui.label(labels::WORKERS);
+                if ui
+                    .add(egui::DragValue::new(&mut workers).range(1..=16))
+                    .changed()
+                {
+                    self.state.set_workers(Some(workers));
+                    self.state.set_status(labels::STATUS_WORKERS_NEXT_LOAD);
+                }
             });
         });
     }
@@ -415,6 +432,14 @@ impl SeedExplorerApp {
         let scale = self.state.view().scale();
         let step = self.state.resolution_step();
         let effective = self.state.view().tile_step(step);
+        // T21's hint: the full-block layer is only worth its cost when a
+        // sample is one block; at coarser steps it says so instead of
+        // silently sampling blocks together.
+        let surface_enabled = self
+            .state
+            .schedulable_layers()
+            .iter()
+            .any(|(layer, _)| *layer == map_core::render::Layer::Surface);
         let mut copied = false;
 
         // The layer stack's edits, buffered while the panel closure
@@ -450,7 +475,14 @@ impl SeedExplorerApp {
                         });
                     }
                 }
-                ui.label(RichText::new(labels::MAP_PLACEHOLDER_SURFACE).weak());
+                if surface_enabled && effective > 1 {
+                    // The plan's "auto-select step 1 only when visible"
+                    // note: full-block detail at 4×4 is a deliberate
+                    // zoom-out, not a rendering bug.
+                    let hint = labels::LAYER_HINT_SURFACE
+                        .replace("{n}×{n}", &format!("{effective}×{effective}"));
+                    ui.label(RichText::new(hint).weak());
+                }
                 ui.label(RichText::new(labels::MAP_PLACEHOLDER_CAVES).weak());
                 // The plan's climate debug layers: only if the
                 // generator exposes a per-column query — it does not,

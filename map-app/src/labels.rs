@@ -30,6 +30,10 @@ pub const VERSION: &str = "Version";
 /// The resolution selector label.
 pub const RESOLUTION: &str = "Resolution";
 
+/// The worker-cap control's label (T21): the generator pool size the
+/// NEXT load uses.
+pub const WORKERS: &str = "workers";
+
 // -- Left panel --------------------------------------------------------------
 
 pub const GROUP_LAYERS: &str = "Layers";
@@ -46,6 +50,10 @@ pub const LAYER_CAVES: &str = "Caves";
 pub const LAYER_ZONE: &str = "Zones";
 /// The word before a layer's opacity slider.
 pub const OPACITY: &str = "opacity";
+/// The hint under the layer list when the full-block layer samples
+/// coarser than one block (T21's "auto-select step 1 only when visible"
+/// note). `{n}×{n}` is the effective step.
+pub const LAYER_HINT_SURFACE: &str = "full-block samples {n}×{n} — zoom in for every block";
 /// What the status bar says when no renderable layer is enabled.
 pub const LAYERS_NONE: &str = "none";
 
@@ -64,9 +72,6 @@ pub const MAP_PLACEHOLDER_NO_SOURCE: &str = "load a seed to explore";
 
 /// Shown while a background load runs.
 pub const MAP_PLACEHOLDER_LOADING: &str = "loading world…";
-
-/// Shown when the Surface layer is selected (its renderer is T20/T21's).
-pub const MAP_PLACEHOLDER_SURFACE: &str = "surface blocks arrive with T20/T21";
 
 /// Shown when a Caves layer is selected (its renderer is T28's).
 pub const MAP_PLACEHOLDER_CAVES: &str = "cave layers arrive with T28";
@@ -155,6 +160,9 @@ pub const STATUS_COPIED: &str = "copied";
 pub const STATUS_EFFECTIVE: &str = "effective";
 /// Prefix of the go-to feedback (the coordinates follow).
 pub const STATUS_WENT_TO: &str = "went to";
+/// Feedback after changing the worker cap: it applies to the next load,
+/// not the running generator pool (T21).
+pub const STATUS_WORKERS_NEXT_LOAD: &str = "worker cap applies on the next load";
 
 pub const STATUS_SOURCE_IDLE: &str = "no source";
 pub const STATUS_SOURCE_LOADING: &str = "loading";

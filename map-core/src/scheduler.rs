@@ -2,14 +2,16 @@
 //! cancellation and result streaming.
 //!
 //! The scheduler computes no pixels itself. Each frame the app calls
-//! [`TileScheduler::schedule`] with the visible tile range (T10's
-//! `visible_tiles`) and the viewport's center tile; the scheduler queues
-//! every tile that is neither cached ([`TileCache`], T14) nor already
+//! [`TileScheduler::schedule_passes`] with one [`TilePass`] per sampling
+//! step (T21's progressive refinement: a coarse fill, then the finer
+//! detail) plus the viewport's center tiles; the scheduler queues every
+//! tile that is neither cached ([`TileCache`], T14) nor already
 //! queued/in-flight, **nearest the center first**. Plain worker threads
 //! pop the highest-priority job, run a [`TileRenderer`] with a
 //! [`CancelToken`], insert the finished tile into the cache and send a
-//! [`TileEvent`] — so [`TileScheduler::schedule`] and the app's event
-//! drain never block a frame.
+//! [`TileEvent`] — so scheduling and the app's event drain never block a
+//! frame. [`TileScheduler::schedule`] stays as the single-fill-pass
+//! shorthand for callers with one step.
 //!
 //! # Contract
 //!
@@ -18,17 +20,25 @@
 //!   cache when its `Ready` event arrives, and [`TileScheduler::stats`]
 //!   / [`TileScheduler::is_pending`] expose what is cached-side for T16's
 //!   placeholder painting.
-//! - **Dedup is exact.** `schedule` skips cached, queued and in-flight
+//! - **Dedup is exact.** Scheduling skips cached, queued and in-flight
 //!   tiles, so no tile is rendered twice concurrently. A queued job
 //!   whose tile scrolled away and came back is *revived* (its token is
 //!   cleared) rather than duplicated.
+//! - **Refinement never starves the fill (T21).** A pass marked
+//!   [`TilePass::refine`] queues every job at
+//!   `chebyshev(coord, center) + REFINE_PENALTY` ([`REFINE_PENALTY`]), far
+//!   above any distance a real viewport produces, so every fill job pops
+//!   before every refine job. The coarse pass therefore covers the view
+//!   first and the detail only starts afterwards — on any worker count.
 //! - **Cancellation is aggressive (v1).** [`TileScheduler::cancel_outside`]
 //!   sets the token of every queued/in-flight tile outside the view;
-//!   renderers check tokens between work units and return
-//!   [`SourceError::Cancelled`]. A tile that finishes despite its token
-//!   is cached (its pixels are valid and keyed) but reported as
-//!   `Cancelled`, so the app does not upload a texture for a view that
-//!   moved on. T33 revisits the "almost done, keep it" policy.
+//!   [`TileScheduler::cancel_not_serving`] does the same for tiles no
+//!   pass claims (subject or position). Renderers check tokens between
+//!   work units and return [`SourceError::Cancelled`]. A tile that
+//!   finishes despite its token is cached (its pixels are valid and
+//!   keyed) but reported as `Cancelled`, so the app does not upload a
+//!   texture for a view that moved on. T33 revisits the "almost done,
+//!   keep it" policy.
 //! - **Panic containment.** A renderer panic is caught at the worker
 //!   boundary and reported as `Failed(key, SourceError::Generation)`;
 //!   the worker lives on. Like the worldgen loader boundary (T08), this
@@ -73,8 +83,8 @@ pub fn cancel_token() -> CancelToken {
 // ---------------------------------------------------------------------------
 
 /// The "what" of a tile request: every key field except the tile's
-/// position. [`TileScheduler::schedule`] copies it across the visible
-/// range, filling in `(tx, ty)` per tile.
+/// position. A [`TilePass`] copies it across that pass's visible range,
+/// filling in `(tx, ty)` per tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileSubject {
     /// Stable hash of the generator identity (T07/T14).
@@ -132,6 +142,58 @@ impl TileSubject {
             tx,
             ty,
         }
+    }
+}
+
+/// How far a refinement job sits behind the fill jobs of its frame:
+/// comfortably above any Chebyshev distance a viewport can produce
+/// (the visible range spans tens of tiles), so EVERY fill job pops
+/// before EVERY refine job regardless of position.
+pub const REFINE_PENALTY: u64 = 1_000_000_000;
+
+/// One pass of a frame's tile request (T21's progressive refinement):
+/// the enabled layers' subjects at ONE sampling step, over that step's
+/// visible range. A `refine` pass queues behind the fill passes — its
+/// tiles are the progressive detail, not the first coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TilePass {
+    /// The layers to render at this pass's step, bottom → top paint order.
+    pub subjects: Vec<TileSubject>,
+    /// The pass's visible tile range, in the subjects' zoom step.
+    pub visible: TileRect,
+    /// Priority origin for this pass (its viewport center tile).
+    pub center: TileCoord,
+    /// True for a refinement pass (priority-penalized).
+    pub refine: bool,
+}
+
+impl TilePass {
+    /// A fill pass at its natural nearest-first priority.
+    #[must_use]
+    pub fn fill(subjects: Vec<TileSubject>, visible: TileRect, center: TileCoord) -> Self {
+        Self {
+            subjects,
+            visible,
+            center,
+            refine: false,
+        }
+    }
+
+    /// A refinement pass: same shape, flagged for the priority penalty.
+    #[must_use]
+    pub fn refine(subjects: Vec<TileSubject>, visible: TileRect, center: TileCoord) -> Self {
+        Self {
+            subjects,
+            visible,
+            center,
+            refine: true,
+        }
+    }
+
+    /// The heap penalty this pass's jobs carry: the refine offset for
+    /// progressive detail, zero for fill.
+    fn penalty(&self) -> u64 {
+        if self.refine { REFINE_PENALTY } else { 0 }
     }
 }
 
@@ -203,7 +265,8 @@ pub struct SchedulerStats {
 /// exact dedup and aggressive cancellation.
 ///
 /// Construct with [`TileScheduler::new`] (workers + the shared
-/// [`TileCache`]); call [`TileScheduler::schedule`] each frame and drain
+/// [`TileCache`]); call [`TileScheduler::schedule_passes`] each frame
+/// (or [`TileScheduler::schedule`] for a single fill pass) and drain
 /// [`TileScheduler::events`] non-blockingly. `Drop` shuts the workers
 /// down and joins them.
 pub struct TileScheduler {
@@ -234,8 +297,9 @@ struct Shared {
     generation: u64,
     /// Monotonic job sequence (FIFO tie-breaker in the heap).
     next_seq: u64,
-    /// The last request, for change detection.
-    last_request: Option<(Vec<TileSubject>, TileRect, TileCoord)>,
+    /// The last request — every pass the frame asked for — for change
+    /// detection.
+    last_request: Option<Vec<TilePass>>,
     completed: u64,
     cancelled: u64,
     failed: u64,
@@ -342,73 +406,80 @@ impl TileScheduler {
             .min(4)
     }
 
-    /// Queues every visible tile of every subject that is neither cached
-    /// nor pending, nearest `center` first. Cheap by construction: heap
-    /// inserts under one short lock, never a render.
+    /// Queues every visible tile of every subject of every pass that is
+    /// neither cached nor pending, nearest each pass's `center` first.
+    /// Cheap by construction: heap inserts under one short lock, never a
+    /// render.
     ///
-    /// `subjects` is the frame's enabled layer set, bottom → top paint
-    /// order (T19); every subject shares `visible` (one step serves all
-    /// layers) and the priority `center`. `visible` must be tile-space
-    /// of the subjects' zoom step (T10's `visible_tiles`). The latest
+    /// T21's contract: a frame asks for several sampling steps at once —
+    /// typically a coarse [`TilePass::fill`] that covers the viewport
+    /// immediately and a finer [`TilePass::refine`] that paints the
+    /// detail. Each pass carries its own `subjects`, `visible` (tile-space
+    /// of *that* pass's zoom step, T10's `visible_tiles`) and `center`;
+    /// layers inside a pass share the pass's range and priority origin.
+    /// Refine jobs queue [`REFINE_PENALTY`] behind fill jobs, so coarse
+    /// coverage always lands before any detail work is popped. The latest
     /// `renderer` wins (one renderer per source in practice).
     ///
     /// Returns the request generation: 1 for the first request, bumped
-    /// whenever the `(subjects, visible, center)` triple changes; events
-    /// carry their job's generation so the app can drop stale ones.
-    /// Repeating an unchanged request re-dedups against the cache and
-    /// revives queued-but-cancelled tiles without new jobs.
-    pub fn schedule(
-        &self,
-        subjects: &[TileSubject],
-        visible: TileRect,
-        center: TileCoord,
-        renderer: Arc<dyn TileRenderer>,
-    ) -> u64 {
+    /// whenever the pass list changes (order included — passes carry the
+    /// paint-relevant subject order); events carry their job's generation
+    /// so the app can drop stale ones. Repeating an unchanged request
+    /// re-dedups against the cache and revives queued-but-cancelled tiles
+    /// without new jobs.
+    pub fn schedule_passes(&self, passes: &[TilePass], renderer: Arc<dyn TileRenderer>) -> u64 {
         let mut guard = lock(&self.shared);
         guard.renderer = Some(renderer);
         let changed = guard
             .last_request
             .as_ref()
-            .is_none_or(|(s, v, c)| s.as_slice() != subjects || *v != visible || *c != center);
+            .is_none_or(|last| last.as_slice() != passes);
         if changed {
             guard.generation += 1;
         }
-        guard.last_request = Some((subjects.to_vec(), visible, center));
+        guard.last_request = Some(passes.to_vec());
         let generation = guard.generation;
 
-        for subject in subjects {
-            for coord in visible.iter() {
-                // Tile keys carry i32 indices; a visible range beyond them
-                // cannot be keyed, so those coordinates are skipped (the
-                // reachable world is far inside, per T10's bounds analysis).
-                let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
-                    continue;
-                };
-                let key = subject.key_at(tx, ty);
-                if self.cache.contains(&key) {
-                    continue;
+        for pass in passes {
+            let penalty = pass.penalty();
+            for subject in &pass.subjects {
+                for coord in pass.visible.iter() {
+                    // Tile keys carry i32 indices; a visible range beyond
+                    // them cannot be keyed, so those coordinates are
+                    // skipped (the reachable world is far inside, per
+                    // T10's bounds analysis).
+                    let (Ok(tx), Ok(ty)) = (i32::try_from(coord.x), i32::try_from(coord.z)) else {
+                        continue;
+                    };
+                    let key = subject.key_at(tx, ty);
+                    if self.cache.contains(&key) {
+                        continue;
+                    }
+                    if let Some(token) = guard.queued.get(&key) {
+                        // Already queued: revive it if it was cancelled (the
+                        // tile scrolled away and came back) instead of piling
+                        // a second job on. Its stale generation rides along;
+                        // the cache is the truth when the event lands.
+                        token.store(false, Relaxed);
+                        continue;
+                    }
+                    if guard.in_flight.contains_key(&key) {
+                        continue;
+                    }
+                    // Saturating: only an absurd center could sit near
+                    // `u64::MAX` away, and wrapping there would let a
+                    // refine job outrank fill jobs.
+                    let request = TileRequest {
+                        key,
+                        priority: chebyshev(coord, pass.center).saturating_add(penalty),
+                        seq: guard.next_seq,
+                        generation,
+                        cancel: cancel_token(),
+                    };
+                    guard.next_seq += 1;
+                    guard.queued.insert(key, Arc::clone(&request.cancel));
+                    guard.queue.push(request);
                 }
-                if let Some(token) = guard.queued.get(&key) {
-                    // Already queued: revive it if it was cancelled (the
-                    // tile scrolled away and came back) instead of piling a
-                    // second job on. Its stale generation rides along; the
-                    // cache is the truth when the event lands.
-                    token.store(false, Relaxed);
-                    continue;
-                }
-                if guard.in_flight.contains_key(&key) {
-                    continue;
-                }
-                let request = TileRequest {
-                    key,
-                    priority: chebyshev(coord, center),
-                    seq: guard.next_seq,
-                    generation,
-                    cancel: cancel_token(),
-                };
-                guard.next_seq += 1;
-                guard.queued.insert(key, Arc::clone(&request.cancel));
-                guard.queue.push(request);
             }
         }
         drop(guard);
@@ -416,23 +487,43 @@ impl TileScheduler {
         generation
     }
 
-    /// Cancels every queued and in-flight tile the frame no longer
-    /// serves: a position outside `visible`, or a subject that left the
-    /// request (T19's disabled layers — their pending work stops instead
-    /// of rendering on unasked). Cheap: token writes only.
+    /// Single-fill-pass shorthand for [`TileScheduler::schedule_passes`]:
+    /// one [`TilePass::fill`] over `subjects`, `visible` and `center`.
     ///
-    /// Subsumes [`TileScheduler::cancel_outside`]: an empty `subjects`
-    /// cancels everything pending. A tile that returns to the request
-    /// is *revived* by the next [`TileScheduler::schedule`]; a tile that
-    /// finishes despite its token stays cached, so a re-enabled layer
-    /// serves instantly.
-    pub fn cancel_not_serving(&self, subjects: &[TileSubject], visible: &TileRect) {
+    /// `subjects` is the frame's enabled layer set, bottom → top paint
+    /// order (T19); every subject shares `visible` (one step serves all
+    /// layers). Callers with progressive steps use
+    /// [`TileScheduler::schedule_passes`] instead.
+    pub fn schedule(
+        &self,
+        subjects: &[TileSubject],
+        visible: TileRect,
+        center: TileCoord,
+        renderer: Arc<dyn TileRenderer>,
+    ) -> u64 {
+        let pass = TilePass::fill(subjects.to_vec(), visible, center);
+        self.schedule_passes(&[pass], renderer)
+    }
+
+    /// Cancels every queued and in-flight tile the frame no longer
+    /// serves: no pass claims it — either its subject left every
+    /// request, or its position is outside every pass's visible range
+    /// (each pass steps the visible range differently, so the union is
+    /// the serving set). T19's disabled layers and T21's dropped
+    /// refinement both stop this way. Cheap: token writes only.
+    ///
+    /// Subsumes [`TileScheduler::cancel_outside`]: empty `passes` cancels
+    /// everything pending. A tile that returns to the request is
+    /// *revived* by the next schedule; a tile that finishes despite its
+    /// token stays cached, so a re-enabled layer serves instantly.
+    pub fn cancel_not_serving(&self, passes: &[TilePass]) {
         let guard = lock(&self.shared);
         let serving = |key: &TileKey| {
-            visible.contains(key_coord(key))
-                && subjects
-                    .iter()
-                    .any(|subject| *subject == TileSubject::from_key(key))
+            let coord = key_coord(key);
+            let subject = TileSubject::from_key(key);
+            passes
+                .iter()
+                .any(|pass| pass.visible.contains(coord) && pass.subjects.contains(&subject))
         };
         for (key, token) in &guard.queued {
             if !serving(key) {

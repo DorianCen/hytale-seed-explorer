@@ -5,12 +5,12 @@
 //! a dedicated relief layer instead). [`image`] owns the pixel-buffer
 //! contract and the deterministic PNG encoder. The later layers —
 //! height, relief, fluids ([`height`], [`relief`], [`fluid`], T17),
-//! zone regions ([`zone`], T19), surface blocks (T20/T21), caves (T28) —
-//! plug into the [`LayerRenderer`] shape and, for the tile pipeline, the
-//! shared per-tile skeleton in [`tiles`]. Everything here is headless: pure
-//! functions over map-core's own grid types, testable without a GPU
-//! (the golden test `tests/render_golden.rs` runs the real generator
-//! and hashes the PNG).
+//! zone regions ([`zone`], T19), full-block surface colors ([`surface`],
+//! T20/T21), caves (T28) — plug into the [`LayerRenderer`] shape and,
+//! for the tile pipeline, the shared per-tile skeleton in [`tiles`].
+//! Everything here is headless: pure functions over map-core's own grid
+//! types, testable without a GPU (the golden test
+//! `tests/render_golden.rs` runs the real generator and hashes the PNG).
 //!
 //! Color rules for the biome layer (the plan's first golden, kept flat
 //! on purpose — the hillshade hook is opt-in):
@@ -27,6 +27,7 @@ pub mod fluid;
 pub mod height;
 pub mod image;
 pub mod relief;
+pub mod surface;
 pub mod tiles;
 pub mod zone;
 
@@ -37,6 +38,7 @@ use crate::error::{SourceError, SourceResult};
 
 pub use biome::{BiomeRenderer, UNKNOWN_BIOME_COLOR, biome_pixel, render_biome_rgba};
 pub use image::{RgbaImage, encode_png};
+pub use surface::{SurfaceOptions, SurfaceTileRenderer, surface_color, surface_image, tint_rgb};
 pub use tiles::{TileQuery, blit_patch, tile_query};
 pub use zone::{ZoneTileRenderer, zone_color};
 
@@ -45,9 +47,10 @@ pub use zone::{ZoneTileRenderer, zone_color};
 ///
 /// The full planned set exists already so tile identity (and, later, T31
 /// share strings) is frozen before the renderers arrive: [`Layer::Biome`]
-/// plus height/relief/fluid (T17) and zone (T19) have renderers; T20/T28
-/// wire the rest. Parsing a name succeeds for every variant; a
-/// renderer-less one is rejected where it is used, not where it is named.
+/// plus height/relief/fluid (T17), zone (T19) and surface (T21) have
+/// renderers; T28 wires the caves. Parsing a name succeeds for every
+/// variant; a renderer-less one is rejected where it is used, not where
+/// it is named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Layer {
     /// The flat biome map color layer.

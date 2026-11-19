@@ -105,7 +105,7 @@ impl TileRenderer for HeightTileRenderer {
             cancel,
             self.world,
             0,
-            |source, rect, step| source.height_region(rect, step),
+            |source, rect, step, _cancel| source.height_region(rect, step),
             |grid, query, cancel| height_image(grid, cancel).map(|image| (image, query.origin)),
         )
     }

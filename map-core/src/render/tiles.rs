@@ -28,6 +28,7 @@ use crate::render::biome::BiomeTileRenderer;
 use crate::render::fluid::FluidTileRenderer;
 use crate::render::height::HeightTileRenderer;
 use crate::render::relief::ReliefTileRenderer;
+use crate::render::surface::{SurfaceOptions, SurfaceTileRenderer};
 use crate::render::zone::ZoneTileRenderer;
 use crate::scheduler::{CancelToken, TileRenderer};
 use crate::source::WorldSource;
@@ -159,7 +160,9 @@ pub fn blit_patch(canvas: &mut RgbaImage, patch: &RgbaImage, origin: (i32, i32))
 /// the final tile. The layer supplies only its two steps.
 ///
 /// - `fetch` asks the source for the layer's grid over the planned
-///   rect (one batched region call — never one query per pixel);
+///   rect (one batched region call — never one query per pixel); it
+///   receives the tile's token so the expensive layers can pass it down
+///   to a cancellable source query;
 /// - `paint` colors that grid into a patch and says where the patch's
 ///   `(0,0)` sits in tile-canvas samples (the query's [`TileQuery`]
 ///   carries the offset; a border-aware layer may instead return a
@@ -176,7 +179,7 @@ pub(crate) fn render_layer_tile<G>(
     cancel: &CancelToken,
     world: Option<Rect>,
     border: u32,
-    fetch: impl FnOnce(&dyn WorldSource, Rect, u32) -> SourceResult<G>,
+    fetch: impl FnOnce(&dyn WorldSource, Rect, u32, &CancelToken) -> SourceResult<G>,
     paint: impl FnOnce(&G, &TileQuery, &CancelToken) -> SourceResult<(RgbaImage, (i32, i32))>,
 ) -> SourceResult<Tile> {
     // A cancelled tile never begins its work unit (the region query);
@@ -199,7 +202,7 @@ pub(crate) fn render_layer_tile<G>(
     // app's canvas rather than fabricated data.
     let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
     if let Some(plan) = tile_query(rect, world, step, border) {
-        let grid = fetch(source, plan.rect, step)?;
+        let grid = fetch(source, plan.rect, step, cancel)?;
         let (patch, origin) = paint(&grid, &plan, cancel)?;
         blit_patch(&mut canvas, &patch, origin);
     }
@@ -218,29 +221,37 @@ pub(crate) fn render_layer_tile<G>(
 /// which layer renders — the scheduler and the cache stay layer-agnostic
 /// while the keys stay per-layer.
 ///
-/// Layers without a renderer yet (surface blocks, caves) answer with
-/// [`SourceError::Unsupported`]; the app never schedules them (its
-/// radios map them to "arrives with T20/T28"), so this is the defensive
-/// answer, not a flow.
+/// The cave layers have no renderer yet (T28) and answer with
+/// [`SourceError::Unsupported`]; the app never schedules them (its radios
+/// map them to "arrives with T28"), so this is the defensive answer, not
+/// a flow.
 pub struct LayeredTileRenderer {
     biome: BiomeTileRenderer,
     height: HeightTileRenderer,
     relief: ReliefTileRenderer,
     fluid: FluidTileRenderer,
     zone: ZoneTileRenderer,
+    surface: SurfaceTileRenderer,
 }
 
 impl LayeredTileRenderer {
     /// Creates the dispatcher; `fluid_opacity` is the fluid layer's
-    /// blend setting (T19's UI writes it later).
+    /// blend setting (T19's UI writes it later) and `surface` is the
+    /// full-block layer's palette/hillshade knobs (T21).
     #[must_use]
-    pub fn new(source: Arc<dyn WorldSource>, world: Option<Rect>, fluid_opacity: f32) -> Self {
+    pub fn new(
+        source: Arc<dyn WorldSource>,
+        world: Option<Rect>,
+        fluid_opacity: f32,
+        surface: SurfaceOptions,
+    ) -> Self {
         Self {
             biome: BiomeTileRenderer::new(Arc::clone(&source), world),
             height: HeightTileRenderer::new(Arc::clone(&source), world),
             relief: ReliefTileRenderer::new(Arc::clone(&source), world),
             fluid: FluidTileRenderer::new(Arc::clone(&source), world, fluid_opacity),
-            zone: ZoneTileRenderer::new(source, world),
+            zone: ZoneTileRenderer::new(Arc::clone(&source), world),
+            surface: SurfaceTileRenderer::new(source, world, surface),
         }
     }
 }
@@ -253,11 +264,10 @@ impl TileRenderer for LayeredTileRenderer {
             Layer::Relief => TileRenderer::render(&self.relief, key, cancel),
             Layer::Fluid => TileRenderer::render(&self.fluid, key, cancel),
             Layer::Zone => TileRenderer::render(&self.zone, key, cancel),
-            Layer::Surface | Layer::CaveSlice | Layer::CaveDensity => {
-                Err(SourceError::Unsupported(
-                    "this layer has no renderer yet (surface: T20/T21, caves: T28)",
-                ))
-            }
+            Layer::Surface => TileRenderer::render(&self.surface, key, cancel),
+            Layer::CaveSlice | Layer::CaveDensity => Err(SourceError::Unsupported(
+                "this layer has no renderer yet (caves: T28)",
+            )),
         }
     }
 }

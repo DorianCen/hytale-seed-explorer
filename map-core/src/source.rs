@@ -51,6 +51,22 @@ pub trait WorldSource: Send + Sync {
     /// A surface grid covering `rect`, one sample per `step` blocks.
     fn surface_region(&self, rect: Rect, step: u32) -> SourceResult<SurfaceGrid>;
 
+    /// `surface_region` with caller-owned cancellation (the expensive
+    /// chunk-summary path, T21): the source checks `cancel` between the
+    /// chunk generations so a tile whose token fired stops early instead of
+    /// paying for every chunk first. The default ignores the token — cheap
+    /// sources never need it; `WorldgenSource` overrides with the real
+    /// per-chunk check.
+    fn surface_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        cancel: &crate::scheduler::CancelToken,
+    ) -> SourceResult<SurfaceGrid> {
+        let _ = cancel;
+        self.surface_region(rect, step)
+    }
+
     /// A horizontal slice at altitude `y` covering `rect`.
     fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid>;
 

@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use map_core::coords::{TileCoord, TileRect, ZoomLevel};
 use map_core::error::SourceError;
 use map_core::render::Layer;
-use map_core::scheduler::{CancelToken, TileEvent, TileRenderer, TileScheduler, TileSubject};
+use map_core::scheduler::{
+    CancelToken, TileEvent, TilePass, TileRenderer, TileScheduler, TileSubject,
+};
 use map_core::tiles::{Tile, TileCache, TileKey};
 
 /// One recorded fake render: when it started and ended.
@@ -399,7 +401,11 @@ fn scheduler_cancel_not_serving_stops_a_disabled_layer_only() {
     std::thread::sleep(Duration::from_millis(30));
 
     // The height layer's checkbox unticks: only biome tiles are served.
-    scheduler.cancel_not_serving(&[biome], &view(0, 0, 3));
+    scheduler.cancel_not_serving(&[TilePass::fill(
+        vec![biome],
+        view(0, 0, 3),
+        TileCoord::new(0, 0),
+    )]);
 
     assert!(
         wait_until(30_000, || idle(&scheduler)),

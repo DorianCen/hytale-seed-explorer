@@ -35,23 +35,13 @@ pub const FLUID_COLOR: [u8; 3] = [50, 108, 200];
 /// takes it as a constructor knob).
 pub const DEFAULT_FLUID_OPACITY: f32 = 0.65;
 
-/// One surface sample's color: the column's biome map color, blended
-/// toward [`FLUID_COLOR`] when the column is wet.
-///
-/// The blend is `opacity * depth / (depth + 2)`: zero at depth 0 (a
-/// barely-wet column keeps its surface color), strictly increasing in
-/// depth, and asymptotic to `opacity` — the cap that keeps deep water
-/// from going black. Dry columns pass through untouched. Alpha 255.
+/// T17's depth blend toward the fluid color over an arbitrary base:
+/// `base` mixed with [`FLUID_COLOR`] by `opacity * depth / (depth + 2)`
+/// per channel — zero at depth 0, strictly increasing, asymptotic to
+/// `opacity`. The fluid layer and the full-block surface (T21) share it.
 #[must_use]
-pub fn fluid_color(sample: &SurfaceSample, catalog: &BiomeCatalog, opacity: f32) -> Rgba<u8> {
-    let Rgba([r, g, b, _]) = biome_pixel(sample.biome, catalog);
-    // Dry columns never tint; the same early return covers the
-    // degenerate depth-0 wet column the formula resolves to zero.
-    let Some(_fluid) = sample.fluid else {
-        return Rgba([r, g, b, 255]);
-    };
-
-    let depth = f32::from(sample.fluid_depth);
+pub fn fluid_blend(base: [u8; 3], depth: u16, opacity: f32) -> [u8; 3] {
+    let depth = f32::from(depth);
     // The clamp keeps a stray out-of-range setting inside the blend's
     // meaningful domain instead of pushing a channel negative.
     let blend = opacity.clamp(0.0, 1.0) * depth / (depth + 2.0);
@@ -61,12 +51,32 @@ pub fn fluid_color(sample: &SurfaceSample, catalog: &BiomeCatalog, opacity: f32)
             .round()
             .clamp(0.0, 255.0) as u8
     };
-    Rgba([
-        mix(r, FLUID_COLOR[0]),
-        mix(g, FLUID_COLOR[1]),
-        mix(b, FLUID_COLOR[2]),
-        255,
-    ])
+    [
+        mix(base[0], FLUID_COLOR[0]),
+        mix(base[1], FLUID_COLOR[1]),
+        mix(base[2], FLUID_COLOR[2]),
+    ]
+}
+
+/// One surface sample's color: the column's biome map color, blended
+/// toward [`FLUID_COLOR`] when the column is wet.
+///
+/// The blend is [`fluid_blend`]'s `opacity * depth / (depth + 2)`: zero at
+/// depth 0 (a barely-wet column keeps its surface color), strictly
+/// increasing in depth, and asymptotic to `opacity` — the cap that keeps
+/// deep water from going black. Dry columns pass through untouched.
+/// Alpha 255.
+#[must_use]
+pub fn fluid_color(sample: &SurfaceSample, catalog: &BiomeCatalog, opacity: f32) -> Rgba<u8> {
+    let Rgba([r, g, b, _]) = biome_pixel(sample.biome, catalog);
+    // Dry columns never tint; the same early return covers the
+    // degenerate depth-0 wet column the formula resolves to zero.
+    let Some(_fluid) = sample.fluid else {
+        return Rgba([r, g, b, 255]);
+    };
+
+    let [r, g, b] = fluid_blend([r, g, b], sample.fluid_depth, opacity);
+    Rgba([r, g, b, 255])
 }
 
 /// Colors `grid` (one pixel per sample, row-major), `cancel` checked
@@ -126,7 +136,7 @@ impl TileRenderer for FluidTileRenderer {
             cancel,
             self.world,
             0,
-            |source, rect, step| source.surface_region(rect, step),
+            |source, rect, step, _cancel| source.surface_region(rect, step),
             |grid, query, cancel| {
                 fluid_image(grid, self.source.biome_catalog(), self.opacity, cancel)
                     .map(|image| (image, query.origin))

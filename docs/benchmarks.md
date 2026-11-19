@@ -166,6 +166,42 @@ What the numbers say:
   step 4 (height/relief ≈ 0.4 s debug, under the cache) and a 128-block
   window at step 2 for fluids (16 chunks ≈ 30 s debug cold).
 
+## Full-block tiles (T21)
+
+The plan's most expensive mode end to end: one full-block surface tile —
+256×256 samples @ step 1 (a 256-block tile, **64 chunks** cold) through
+`SurfaceTileRenderer` with the fallback palette, seed 0, no hillshade.
+Run with:
+
+```sh
+cargo test -p map-core --features test-support --release --test surface_render \
+  -- --ignored surface_bench --nocapture
+```
+
+| Workers | Cold (s) | Warm repeat (s) | Chunks |
+|---:|---:|---:|---:|
+| 1 | **24.40** | 1.276 | 64 |
+| 4 | **14.25** | 0.464 | 64 |
+| 12 | **21.69** | 0.136 | 64 |
+
+What the numbers say (T21's design consequences):
+
+- **The coarse placeholder must be the default experience**, exactly as
+  the task's risk note demands: a cold 1×1 tile is 14–24 s regardless of
+  workers, while the warm repeat over cached summaries is 0.03–1.3 s.
+  The progressive schedule (fill @ step 4, refine @ step 1) front-loads
+  chunk generation into the coarse pass; the fine tiles then ride the
+  warm summaries at a fraction of the cold cost.
+- **4 workers beats 12 cold** on a single 64-chunk tile: 64 chunks /
+  12 workers ≈ 5 chunks each, inside the "<32 chunks per worker
+  regresses" warm-up finding already recorded for the T04 grid runs.
+  The worker cap's default (T33 tunes it) should sit near 4 for
+  tile-shaped work; 12 only wins when many tiles are queued at once.
+- **Against T04/T09:** the 64-chunk cold cost matches the chunk path's
+  ~0.34 s/chunk (2-worker) throughput; the warm 0.136 s (12 workers)
+  reproduces T09's "surface region @ step 2, summaries cached: 0.21 s"
+  scale — the summary cache, not the renderer, owns the performance.
+
 ## Feature enumeration (10,000×10,000)
 
 **Blocked on T22** (no public `features_in` query exists yet — T01 audit §2).
@@ -270,6 +306,8 @@ Only release runs on the environment above (or note the change).
 | 2026-11-19 | height tile 65,536 cols @ step 2 (map-cli render, 2 workers) | 20.38 s median / 20.40 p95 | `cargo run --release -p map-cli -- render --seed 0 --center 0,0 --size 256 --step 2 --layer height ...` | T17 |
 | 2026-11-19 | relief tile (bordered query + hillshade, same setup) | 20.63 s median / 20.86 p95 | `... --layer relief ...` | T17 |
 | 2026-11-19 | fluid tile (256 chunk summaries cold, 2 workers) | 86.23 s (n=1) | `... --layer fluid ...` | T17 |
+| 2026-11-19 | full-block surface tile 65,536 @ step 1 (64 chunks cold), 1 / 4 / 12 workers | 24.40 s / 14.25 s / 21.69 s | `cargo test -p map-core --features test-support --release --test surface_render -- --ignored surface_bench --nocapture` | T21 |
+| 2026-11-19 | same tile, warm (summaries cached), 1 / 4 / 12 workers | 1.276 s / 0.464 s / 0.136 s | as above | T21 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

@@ -247,7 +247,7 @@ impl TileRenderer for BiomeTileRenderer {
             cancel,
             self.world,
             0,
-            |source, rect, step| source.biome_region(rect, step),
+            |source, rect, step, _cancel| source.biome_region(rect, step),
             |grid, query, _cancel| {
                 let patch = render_biome_rgba(grid, self.source.biome_catalog());
                 Ok((patch, query.origin))

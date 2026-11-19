@@ -154,7 +154,7 @@ impl TileRenderer for ZoneTileRenderer {
             cancel,
             self.world,
             0,
-            |source, rect, step| source.zone_region(rect, step),
+            |source, rect, step, _cancel| source.zone_region(rect, step),
             |grid, query, cancel| {
                 zone_image(grid, self.source.zone_catalog(), cancel)
                     .map(|image| (image, query.origin))

@@ -1,6 +1,35 @@
 # T21 — Full block mode and progressive refinement
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/render/surface.rs` — the
+full-block tile renderer: `surface_color` = T20's palette formula over
+the sample's block id and the column's runtime `TintContainer` tint
+(`tint_rgb`, map_image parity), wet columns blended with T17's exact
+`fluid_blend` curve, the optional hillshade reusing T17's extracted
+`hillshade` factor (border 1 only when on), every pixel alpha 255
+(unknown blocks are the palette's visible fallbacks; true void is the
+skeleton's margin) — plus `WorldSource::surface_region_cancelled`
+(default: ignore; the worldgen override checks the caller's token
+between chunk generations so a cancelled tile stops paying for chunks),
+and the scheduler's `TilePass`/`schedule_passes` with `REFINE_PENALTY`
+(refine jobs queue behind every fill job; `cancel_not_serving` takes
+the pass union). The app: `Surface` joins the checkboxes, the frame
+request splits into a step-4 coarse FILL + fine REFINE pass for the
+surface when the effective step is finer than 4 (other layers ride one
+fine pass; coarse tiles exist only as `covering_placeholder` parents,
+never painted), paint allows placeholder crops for every layer, a
+worker-cap DragValue feeds the next load's generator pool, and the
+full-block hint names the current sampling. Acceptance green:
+`cargo test -p map-core surface_render` (7 + the gated fixture test at
+seed 0 — `Soil_Gravel_Sand_White`/`Water_Source`, pixel-exact — and
+per-chunk cancellation, both RAN), `cargo test -p map-core refinement`
+(fill-before-refine order, key separation + placeholder bridge,
+refinement-only cancellation), map-core 213 / map-app 71 / map-cli 4
+passed with `--features test-support`; the release benchmark is
+recorded in `docs/benchmarks.md`'s T21 section: 64-chunk step-1 tile
+cold 24.40/14.25/21.69 s at 1/4/12 workers, warm 1.276/0.464/0.136 s —
+the coarse placeholder as the default experience, exactly as the risk
+note demands.)
+
 **Milestone:** 5 — Full block mode
 **Depends on:** T17, T19, T20
 **Blocks:** T28, T32, T33
