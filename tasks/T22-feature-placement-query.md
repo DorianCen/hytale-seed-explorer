@@ -1,6 +1,16 @@
 # T22 — Feature placement query API in worldgen
 
-**Status:** proposed
+**Status:** done (deliverable: worldgen repo commits `7f512f7`/`459d3af`/`6f5cc1c` —
+`crates/worldgen-hytale/src/query/` (`features_in`, `FeaturePlacement`,
+`PlacementFilter`, `PlacementKind` with the T27 cave-entrance hook), the
+`PrefabPopulator` refactor into the shared
+`prefab_placement_pass.rs` (golden chunks byte-identical),
+`tests/feature_query.rs` + the parity unit test (query == actual paste list
+on golden chunks), the `feature_query_bench` probe (linear in area from 512
+blocks up; 10,000² ≈ 6,400 s extrapolated, ring-search budget recorded in
+`docs/benchmarks.md`), and `QUERY.md`. Explorer side: no code — the
+generator API is the deliverable; numbers and T24 sizing rules are in
+`docs/benchmarks.md` §"Feature enumeration (T22)".)
 **Milestone:** 6 — Feature overlay
 **Depends on:** T01, T05, T08
 **Blocks:** T23, T24, T27

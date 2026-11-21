@@ -202,17 +202,50 @@ What the numbers say (T21's design consequences):
   reproduces T09's "surface region @ step 2, summaries cached: 0.21 s"
   scale — the summary cache, not the renderer, owns the performance.
 
-## Feature enumeration (10,000×10,000)
+## Feature enumeration (T22)
 
-**Blocked on T22** (no public `features_in` query exists yet — T01 audit §2).
-Substitute measurement recorded now so T24 can size ring search:
+**Task:** [T22](../tasks/T22-feature-placement-query.md) — the measured
+replacement for the substitute numbers recorded before the query existed.
+Harness: the committed probe `feature_query_bench`
+(`crates/worldgen-cli/src/bin/feature_query_bench.rs`, worldgen repo commit
+`6f5cc1c`), release build, Default fixture, seed 0, one `features_in` call per
+square rect centred on the origin (nested rects, so later runs re-cover
+earlier ground):
 
-- unique prefabs + spawn points for one seed: **26 ms cold, ~3-6 µs warm**
-  (probe above); a whole-seed unique-prefab catalogue is effectively free.
-- the placement pass is the dominant chunk stage (prefabs 0.042 of 0.111 s
-  steady-state per chunk; 0.123 of 0.165 s cold), so T22's query cost will
-  scale with candidate density over the rect — its 10k×10k benchmark is the
-  number to record here.
+| Rect | Seconds | Placements | Growth vs previous |
+|---|---:|---:|---|
+| 256×256 | 10.4 | 586 | — |
+| 512×512 | 20.1 | 1,311 | 1.93× per 4× area |
+| 1024×1024 | 73.3 | 6,015 | 3.64× |
+| 2048×2048 | 326.3 | 35,378 (2 unique, 1 spawn) | 4.45× |
+| 5000×5000 | 1,599.5 | 262,608 | 4.90× per 5.96× area |
+| 10,000×10,000 | **≈6,400 (extrapolated)** | — | linear fit from 5000 |
+
+Peak RSS of the probe process: **~5.0 GiB at the 5000 leg** (the killed
+10,000 leg pushed VmHWM to ~7.5 GiB) — dominated by the generator's unbounded
+prefab-store buffer cache and the query-lifetime zone-biome memo, not by
+candidates (candidates hold a 24-byte footprint since the perf pass).
+
+What changed vs the first measurement: the query originally grew ~cubic
+(2048 was 871 s and 10,000 extrapolated to a day). Three fixes
+(worldgen `6f5cc1c`) — footprint candidates, a per-query zone-biome memo,
+and clone-free buckets with an x-sweep — made the cost **linear in area
+from 512 blocks up**.
+
+**T24 ring-search budget (the number the acceptance gate asked for):** ring
+rects in the low hundreds of blocks cost **seconds each** (256: ~10 s cold
+incl. asset warm-up, faster warm; 512: ~20 s). A search to a 10,000-block
+radius as 40 concentric 256-wide rings is minutes of work, not hours — ring
+search is viable. Two rules for T24/T26:
+
+- Query the smallest rect that answers the step; a smaller rect's result is
+  exactly a subset of a larger one's (the per-window invalidation makes
+  this structural, not empirical), so filter client-side instead of
+  re-querying nested rects.
+- Never issue a single bulk rect larger than ~2048 per call in the UI path
+  (~5 min, multi-GiB); a 10,000² bulk query is a ~1.8 h batch job with
+  multi-GiB memory — the follow-up lever (bounded prefab-store cache,
+  LRU memo) belongs to T33.
 
 ## What this means for the explorer
 
@@ -247,12 +280,15 @@ Substitute measurement recorded now so T24 can size ring search:
    nearest-to-center first, (c) treat height/hillshade as derived from
    summaries, not as column queries.
 5. **Feature search:** unique-prefab catalogues are free (26 ms per seed);
-   T24's ring-search viability hangs on T22's query benchmark, to be recorded
-   here when it lands.
+   ring rects in the low hundreds of blocks cost seconds each through
+   `features_in` (T22, measured above) — ring search is viable at the
+   10,000-block-radius scale in minutes.
 
 ## Known gaps
 
-- **Feature enumeration over a rect: blocked on T22** (substitute row above).
+- ~~**Feature enumeration over a rect: blocked on T22**~~ — landed: measured
+  table above. Remaining lever for bulk (>2048) rects is memory, not time
+  (T33: bounded prefab-store cache / LRU memo).
 - **Full-block render cost end to end: blocked on T09/T21** (the probe
   measures generation + extraction; palette lookup and texture upload are not
   yet implemented — T21 appends).

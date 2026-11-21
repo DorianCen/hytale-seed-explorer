@@ -31,7 +31,7 @@ it owns, and the acceptance gate.
 | [T19](T19-layer-compositing-debug.md) | Layer compositing and debug layers | 4 | T13, T17, T18 | done |
 | [T20](T20-surface-block-palette.md) | Surface block palette data | 5 | T03, T09 | done |
 | [T21](T21-full-block-mode.md) | Full block mode and progressive refinement | 5 | T17, T19, T20 | done |
-| [T22](T22-feature-placement-query.md) | Feature placement query API in worldgen | 6 | T01, T05, T08 | proposed |
+| [T22](T22-feature-placement-query.md) | Feature placement query API in worldgen | 6 | T01, T05, T08 | done |
 | [T23](T23-feature-catalog-overlay.md) | Feature catalog, source adapter and overlay | 6 | T16, T22 | proposed |
 | [T24](T24-feature-search.md) | Feature search engine and streaming | 7 | T22, T23 | proposed |
 | [T25](T25-biome-search.md) | Biome search | 7 | T08, T24 | proposed |
