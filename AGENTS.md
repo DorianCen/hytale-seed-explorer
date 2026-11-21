@@ -13,6 +13,13 @@ and this file gets fixed.
   semantics change THERE, never in a duplicated explorer implementation,
   and only with a `GENERATOR_VERSION` bump — a bump is a
   cache-invalidation action recorded in the commit message.
+- Feature enumeration goes through the generator's public
+  `ChunkGenerator::features_in` (T22; contract and cost in the worldgen
+  repo's `QUERY.md`, measured budgets in `docs/benchmarks.md`
+  §"Feature enumeration (T22)"). Never duplicate the placement
+  predicates explorer-side; query cost is linear in rect area from 512
+  blocks up, and bulk rects beyond ~2048 are batch jobs (memory lever
+  deferred to T33).
 - `map-core` pins `GENERATOR_VERSION` itself (`map-core/src/lib.rs`).
   The generator's own tag is not yet on its public `main`, so CI's
   cross-check step compares the two whenever the tag appears; keep them
