@@ -41,13 +41,14 @@
 //! same transform, which is what keeps the coordinates honest.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui::{Color32, PointerButton, Response};
 
 use map_core::coords::{TileCoord, TileRect, ZoomLevel, floor_div, tiles_in};
+use map_core::features::{ClusterItem, FeatureOverlayState as CoreFeatureOverlayState};
 use map_core::render::fluid::DEFAULT_FLUID_OPACITY;
 use map_core::render::tiles::LayeredTileRenderer;
 use map_core::render::{Layer, SurfaceOptions};
@@ -57,6 +58,7 @@ use map_core::tiles::{TileCache, TileKey, covering_placeholder};
 use map_core::types::Rect;
 
 use crate::labels;
+use crate::overlays::features as feature_overlay;
 use crate::state::AppState;
 use crate::texture::TextureCache;
 use crate::view_state::{MapViewState, expand_to_pixels, tile_screen_rect};
@@ -536,12 +538,19 @@ impl MapView {
             // No source (yet): canvas plus a message, no tile traffic.
             self.placeholder(ui, &painter, state);
         }
+
+        // T23's vector layer: after the tiles, before anything else reads
+        // the frame (the cursor readout is the status bar's next frame).
+        // With no catalog this is a cheap no-op.
+        self.paint_feature_overlay(ui, &painter, &response, state);
     }
 
     // -- Input --------------------------------------------------------------
 
-    /// Pointer input into the headless view: hover readout, drag pan,
-    /// wheel zoom at the cursor, click-to-copy coordinates.
+    /// Pointer input into the headless view: hover readout, drag pan and
+    /// wheel zoom. The click-to-copy decision runs after painting, where the
+    /// feature overlay's markers are known (T23's click-to-select must win
+    /// over the plain coordinate copy).
     fn input(&mut self, response: &Response, state: &mut AppState) {
         let rect = self.rect;
 
@@ -579,16 +588,6 @@ impl MapView {
                     .view_mut()
                     .zoom_at_screen(cursor, -scroll / SCROLL_POINTS_PER_LEVEL + pinch_levels);
             }
-        }
-
-        // A primary click without a drag copies the block coordinates
-        // (egui separates clicks from drags for us). The exact string is
-        // T18/T31's decision; "x z" is the working placeholder.
-        if response.clicked_by(PointerButton::Primary)
-            && let Some((x, z)) = state.cursor()
-        {
-            response.ctx.copy_text(format!("{x} {z}"));
-            state.set_status(format!("{} X:{x} Z:{z}", labels::STATUS_COPIED));
         }
     }
 
@@ -786,6 +785,114 @@ impl MapView {
                     painter.rect_filled(screen, 0.0, pending_tint());
                     painter.rect_stroke(screen, 0.0, pending_stroke(), egui::StrokeKind::Middle);
                 }
+            }
+        }
+    }
+
+    // -- The feature overlay (T23) --------------------------------------------
+
+    /// Draws the catalog's markers over the tiles, then applies the pointer's
+    /// hover tooltip and click action.
+    ///
+    /// The draw list ([`feature_overlay::marker_list`]) is computed once per
+    /// frame and reused for hit-testing, so what the user clicks is exactly
+    /// what was drawn. A single marker's click copies its coordinates and
+    /// selects it; a cluster's click zooms one level centred on the cluster
+    /// (T23's "clicking a cluster zooms in or splits it"); anything else
+    /// falls through to the plain block-coordinate copy.
+    fn paint_feature_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        response: &Response,
+        state: &mut AppState,
+    ) {
+        let Some(catalog) = state.features().catalog().cloned() else {
+            return;
+        };
+        let view = *state.view();
+        let mask = feature_overlay::toggle_mask(state.overlays());
+        let viewport = (self.rect.width(), self.rect.height());
+        let items = feature_overlay::marker_list(
+            &catalog,
+            mask,
+            &view,
+            viewport,
+            CoreFeatureOverlayState::DEFAULT_CLUSTER_CELL_PX,
+        );
+        let now = Instant::now();
+        let selected = state.features().selected_key().cloned();
+        let flashing = state.features().is_flashing(now);
+        feature_overlay::paint_items(
+            painter,
+            &items,
+            &catalog,
+            self.rect.min,
+            selected.as_ref(),
+            flashing,
+        );
+
+        let pointer = response
+            .hover_pos()
+            .map(|pos| (pos.x - self.rect.min.x, pos.y - self.rect.min.y));
+        if let Some(hit) = pointer.and_then(|pointer| feature_overlay::hit_test(&items, pointer)) {
+            let tooltip = match hit {
+                feature_overlay::FeatureHit::Single { feature, .. } => catalog
+                    .features()
+                    .get(feature)
+                    .map(|feature| feature_overlay::tooltip_text(feature, &view)),
+                feature_overlay::FeatureHit::Cluster { item } => match items.get(item) {
+                    Some(ClusterItem::Cluster { count, .. }) => {
+                        Some(format!("{count} {}", labels::FEATURE_CLUSTER))
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(tooltip) = tooltip {
+                response.clone().on_hover_ui_at_pointer(|ui| {
+                    ui.label(tooltip);
+                });
+            }
+        }
+
+        if response.clicked_by(PointerButton::Primary) {
+            if let Some(hit) =
+                pointer.and_then(|pointer| feature_overlay::hit_test(&items, pointer))
+            {
+                match hit {
+                    feature_overlay::FeatureHit::Single { feature, .. } => {
+                        let Some(feature) = catalog.features().get(feature) else {
+                            return;
+                        };
+                        let (x, _, z) = feature.position;
+                        // Exactly the go-to dialog's copy string (T31
+                        // formalizes sharing it).
+                        ui.ctx().copy_text(format!("X:{x} Z:{z}"));
+                        state.set_status(format!(
+                            "{} {} X:{x} Z:{z}",
+                            labels::STATUS_COPIED,
+                            feature.name,
+                        ));
+                        state.features_mut().select(feature, now);
+                    }
+                    feature_overlay::FeatureHit::Cluster { item } => {
+                        if let Some(ClusterItem::Cluster { center, .. }) = items.get(item)
+                            && let Some(block) = view.screen_to_block(*center)
+                        {
+                            state
+                                .view_mut()
+                                .set_center(f64::from(block.x), f64::from(block.z));
+                            state.view_mut().zoom_at_center(-1.0);
+                        }
+                    }
+                }
+                return;
+            }
+            // Not a feature: the map's plain click-copy (T16's working
+            // placeholder, unchanged by T23).
+            if let Some((x, z)) = state.cursor() {
+                response.ctx.copy_text(format!("{x} {z}"));
+                state.set_status(format!("{} X:{x} Z:{z}", labels::STATUS_COPIED));
             }
         }
     }

@@ -16,6 +16,10 @@
 //! - **Single-point queries** (`biome_at`/`height_at`/`zone_at`) ride the
 //!   shared command channel: a free worker picks the command up. They exist
 //!   for hover and search, never for tiles.
+//! - **Feature placement queries** (T23) are one command, not band-split:
+//!   the generator's window-based query keeps one worker's column cache
+//!   contiguous, and translating its `Rc`-holding placements happens on that
+//!   worker before only plain `Feature` values cross the thread boundary.
 //! - **Cancellation** is checked every `CANCEL_CHECK_ROWS` sample rows so a
 //!   worker is never held hostage by a scrolled-away tile.
 //!
@@ -31,7 +35,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::error::{SourceError, SourceResult};
-use crate::types::{Rect, SpawnPoint, ZoneId};
+use crate::types::{Feature, FeatureFilter, Rect, SpawnPoint, ZoneId};
 
 /// Everything a worker needs to load its own generator. `Send` by
 /// construction (plain data); the `Rc<ChunkGenerator>` it produces never
@@ -84,6 +88,13 @@ pub(crate) enum Command {
     },
     SpawnPoints {
         reply: Reply<Vec<SpawnPoint>>,
+    },
+    /// One feature-placement query over a rect (T22/T23). The worker
+    /// translates placements into plain [`Feature`] values before replying.
+    FeatureQuery {
+        rect: Rect,
+        filter: FeatureFilter,
+        reply: Reply<Vec<Feature>>,
     },
     ZoneAt {
         x: i32,
@@ -434,6 +445,26 @@ impl GeneratorPool {
         })?
     }
 
+    /// Sends one feature-placement query and blocks for its reply. Feature
+    /// queries are one command (not band-split): the generator's query is
+    /// internally window-based and a single worker keeps its column cache
+    /// contiguous. The caller is expected to be a background thread; the
+    /// overlay never calls this from the UI thread.
+    pub fn features_in(
+        &self,
+        rect: Rect,
+        filter: FeatureFilter,
+    ) -> SourceResult<Vec<crate::types::Feature>> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Command::FeatureQuery {
+            rect,
+            filter,
+            reply: tx,
+        })?;
+        rx.recv()
+            .map_err(|_| SourceError::Internal("the feature reply channel closed".to_string()))?
+    }
+
     pub fn zone_at(&self, x: i32, z: i32) -> SourceResult<Option<ZoneId>> {
         let (tx, rx) = mpsc::channel();
         self.send(Command::ZoneAt { x, z, reply: tx })?;
@@ -592,6 +623,15 @@ fn worker_main(
             }
             Command::SpawnPoints { reply } => {
                 let result = crate::source::worldgen::spawn_points(&generator, seed);
+                let _ = send_reply(reply, result);
+            }
+            Command::FeatureQuery {
+                rect,
+                filter,
+                reply,
+            } => {
+                let result =
+                    crate::source::worldgen::feature_query(&generator, seed, rect, &filter);
                 let _ = send_reply(reply, result);
             }
             Command::ZoneAt { x, z, reply } => {

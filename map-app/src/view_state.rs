@@ -194,6 +194,19 @@ impl Default for MapViewState {
     }
 }
 
+/// The viewport-local screen point of a block column's origin corner:
+/// `block_to_screen(x, z)`, the exact inverse of [`MapViewState::screen_to_block`]'s
+/// floor (T23's overlay projection).
+///
+/// [`None`] when the projected point is non-finite. The conversion itself
+/// stays in [`map_core::coords::Viewport`]; this is the view state's
+/// borrowed door to it, so the overlay never re-derives the transform.
+#[must_use]
+pub fn block_to_screen(view: &MapViewState, x: i32, z: i32) -> Option<(f32, f32)> {
+    let screen = view.viewport().block_to_screen(BlockPos::new(x, z));
+    (screen.x.is_finite() && screen.y.is_finite()).then_some((screen.x, screen.y))
+}
+
 /// The viewport-local screen rect `(x0, y0, x1, y1)` of the tile at
 /// `coord`/`step`, in points: the tile's min corner and its
 /// (inclusive max + one block) corner mapped through the viewport.

@@ -1,6 +1,22 @@
 # T23 — Feature catalog, source adapter and overlay
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/features.rs` — categories,
+catalog with (kind, name, position) dedupe, `FeatureOverlayState`,
+screen-space clustering, `FeatureCache`; `FeatureSource` adapter over the
+T22 worker query (`Command::FeatureQuery` + `translate_placement`, the
+one documented worldgen-typed parity seam); `map-app/src/overlays/features.rs`
+— fetch planner (150 ms debounce, margin rect clamped under the
+2048-block fetch cap), background fetch thread, clustered vector markers,
+tooltip/click-copy (`X:{x} Z:{z}`), per-group panel toggles wired to the
+`structures`/`prefabs`/`spawn`/`poi` checkboxes. Gates:
+`cargo test -p map-core features` 15/15 (adapters verified against a
+directly loaded generator on the fixture),
+`cargo test -p map-app features` 9/9, full suites 119/80,
+`cargo build -p map-app`, clippy/fmt clean. Remaining manual step:
+the visual `cargo run -p map-app` checklist in the packet-B report
+(first marker fetch at the default view is capped near 2048 blocks and
+takes minutes per the recorded T22 numbers; pan/zoom stays responsive
+while it runs).)
 **Milestone:** 6 — Feature overlay
 **Depends on:** T16, T22
 **Blocks:** T24, T26, T27, T29, T32

@@ -59,6 +59,8 @@ pub const LAYERS_NONE: &str = "none";
 
 pub const OVERLAY_STRUCTURES: &str = "Structures";
 pub const OVERLAY_PREFABS: &str = "Prefabs";
+pub const OVERLAY_SPAWN: &str = "Spawn";
+pub const OVERLAY_POI: &str = "POI";
 pub const OVERLAY_CAVE_ENTRANCES: &str = "Cave ent.";
 pub const OVERLAY_CHUNK_GRID: &str = "Chunk grid";
 
@@ -156,6 +158,14 @@ pub const STATUS_ZOOM: &str = "zoom";
 pub const STATUS_PT_PER_BLOCK: &str = "pt/blk";
 /// Prefix of the click-copy feedback (the coordinates follow).
 pub const STATUS_COPIED: &str = "copied";
+/// Prefix of the feature-query failure toast (the error follows).
+pub const STATUS_FEATURE_ERROR: &str = "feature query failed";
+/// The feature-query worker vanished without a result (T23).
+pub const STATUS_FEATURE_WORKER_DIED: &str = "the feature worker stopped without reporting";
+/// The unit in a feature tooltip's distance line.
+pub const FEATURE_BLOCKS: &str = "blocks";
+/// The word after a cluster marker's count in its tooltip.
+pub const FEATURE_CLUSTER: &str = "features";
 /// Precedes the zoom-forced step in the resolution readout.
 pub const STATUS_EFFECTIVE: &str = "effective";
 /// Prefix of the go-to feedback (the coordinates follow).

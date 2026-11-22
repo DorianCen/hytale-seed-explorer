@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Vec2};
 
+use map_core::source::FeatureSource;
 use map_core::source::WorldSource;
 use map_core::source::worldgen::default_world_path;
 
 use crate::inspector::{self, HoverKnowledge, HoverReply, Readout};
 use crate::labels;
 use crate::map_view::MapView;
+use crate::overlays::features::FeatureReplyOutcome;
 use crate::state::{
     self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, layer_label, offers_layer,
 };
@@ -37,6 +39,11 @@ const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often to wake the UI while a hover sample is in flight, so its
 /// reply lands on the very next frame instead of at the next input.
 const HOVER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How often to wake the UI while a feature query is in flight (T23). The
+/// query itself runs for seconds-to-minutes on its worker; this only makes
+/// the reply land promptly instead of at the next input event.
+const FEATURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The egui app: headless state plus the UI wiring.
 pub struct SeedExplorerApp {
@@ -92,8 +99,10 @@ impl SeedExplorerApp {
             });
 
         // The map widget just refreshed the cursor: this is where the
-        // frame's hover decision runs (T18).
+        // frame's hover decision runs (T18) and where the feature overlay
+        // notes the settled viewport and polls its query (T23).
         self.drive_hover_sampling(ctx);
+        self.drive_feature_overlay(ctx);
 
         if self.state.go_to().is_some() {
             self.go_to_dialog(ctx);
@@ -233,6 +242,65 @@ impl SeedExplorerApp {
             });
         });
         ctx.request_repaint_after(HOVER_POLL_INTERVAL);
+    }
+
+    // -- Feature overlay (T23) ------------------------------------------------
+
+    /// Polls a finished feature query, then plans and spawns at most one new
+    /// query for the settled viewport. `features_in` is synchronous and can
+    /// block a worker for minutes on a large rect, so the UI thread only ever
+    /// sees the channel.
+    fn drive_feature_overlay(&mut self, ctx: &Context) {
+        self.poll_feature_reply();
+        let now = Instant::now();
+        if let Some(source) = self.state.source_arc() {
+            // Copy the view and settings out before the mutable borrows: the
+            // planner is pure and the state machine does the rest.
+            let view = *self.state.view();
+            let settings = *self.state.overlays();
+            self.state.features_mut().observe(now, &view);
+            if let Some(request) = self.state.features_mut().plan_fetch(now, &view, &settings) {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let filter = request.filter.clone();
+                let rect = request.rect;
+                self.state.features_mut().begin_fetch(request, receiver);
+                // The thread owns one Arc<WorldgenSource>; if the UI drops
+                // the receiver (source change), its send fails and the Arc
+                // drops HERE, off the UI thread — the retirement pattern.
+                std::thread::spawn(move || {
+                    let result = source.features_in(rect, &filter);
+                    let _ = sender.send(result);
+                });
+            }
+        } else {
+            // No world: a query cannot be wanted, and its reply (were one
+            // still in flight) must never reach the next source.
+            self.state.features_mut().cancel_fetch();
+        }
+        if self.state.features().has_fetch_in_flight() {
+            ctx.request_repaint_after(FEATURE_POLL_INTERVAL);
+        }
+    }
+
+    /// Applies one reply from the in-flight feature query, keeping the last
+    /// catalog on failure. A stale reply is dropped silently (the next frame
+    /// re-plans for the current view).
+    fn poll_feature_reply(&mut self) {
+        let now = Instant::now();
+        let view = *self.state.view();
+        match self.state.features_mut().poll(now, &view) {
+            FeatureReplyOutcome::Failed(message) => {
+                self.state
+                    .set_status(format!("{}: {message}", labels::STATUS_FEATURE_ERROR));
+            }
+            FeatureReplyOutcome::WorkerDied => {
+                self.state.set_status(labels::STATUS_FEATURE_WORKER_DIED);
+            }
+            FeatureReplyOutcome::Idle
+            | FeatureReplyOutcome::Pending
+            | FeatureReplyOutcome::Stale
+            | FeatureReplyOutcome::Applied(_) => {}
+        }
     }
 
     /// The inspector's knowledge rendered for the status bar: sample ids
@@ -495,6 +563,10 @@ impl SeedExplorerApp {
                 let overlays = self.state.overlays_mut();
                 ui.checkbox(&mut overlays.structures, labels::OVERLAY_STRUCTURES);
                 ui.checkbox(&mut overlays.prefabs, labels::OVERLAY_PREFABS);
+                ui.checkbox(&mut overlays.spawn, labels::OVERLAY_SPAWN);
+                ui.checkbox(&mut overlays.poi, labels::OVERLAY_POI);
+                // Maps to the cave group now; still a no-op until T27
+                // actually emits cave entrances.
                 ui.checkbox(&mut overlays.cave_entrances, labels::OVERLAY_CAVE_ENTRANCES);
                 ui.checkbox(&mut overlays.chunk_grid, labels::OVERLAY_CHUNK_GRID);
 

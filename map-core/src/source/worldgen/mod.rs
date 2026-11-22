@@ -4,8 +4,14 @@
 //! Cheap queries only: biome, height, zone and spawn-point data served from
 //! a pool of generator worker threads (see [`pool`]). Chunk-dependent
 //! queries — surface blocks, fluid depths, slices — return
-//! [`SourceError::Unsupported`] until T09 adds chunk summaries. Feature
-//! placement ([`crate::source::FeatureSource`]) is T22/T23's.
+//! [`SourceError::Unsupported`] until T09 adds chunk summaries.
+//!
+//! Feature placement ([`crate::source::FeatureSource`], T22/T23) also runs
+//! here: a rect query is sent to a worker, the worker calls the generator's
+//! public `ChunkGenerator::features_in` and translates every placement into
+//! a plain map-core [`Feature`] before it crosses the thread boundary
+//! (placements hold `Rc`s and cannot be sent). The worldgen query is the
+//! single filter authority; the adapter only maps the kind mask.
 //!
 //! This module is the only place where worldgen types cross into map-core
 //! (the T07 acceptance rule): the public API exposes plain map-core ids and
@@ -22,20 +28,24 @@ use std::sync::atomic::Ordering;
 use worldgen_hytale::chunk::chunk_generator::ChunkGenerator;
 use worldgen_hytale::chunk::chunk_generator_resource::ChunkGeneratorResource;
 use worldgen_hytale::loader::chunk_generator_json_loader::ChunkGeneratorJsonLoader;
+use worldgen_hytale::query::{
+    BlockRect, FeaturePlacement, PlacementFilter, PlacementKind, PlacementKindMask,
+};
 use worldgen_hytale::world_gen::{WorldGenError, WorldGenRequest, generate_chunk};
 use worldgen_hytale::world_gen_config::WorldGenConfig;
 use worldgen_hytale::world_gen_provider::{HytaleWorldGenProvider, Semver};
 
 use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCatalog, ZoneInfo};
 use crate::error::{SourceError, SourceResult, panic_message};
-use crate::source::WorldSource;
 use crate::source::chunks::{
     self, ChunkKey, ChunkSlice, ChunkSummary, DEFAULT_SLICE_CACHE_ENTRIES,
     DEFAULT_SUMMARY_BUDGET_BYTES, SliceCache, SliceKey, SummaryCache, SummaryColumn, chunk_of,
     column_index, local_of,
 };
+use crate::source::{FeatureSource, WorldSource};
 use crate::types::{
-    BiomeGrid, BiomeId, BlockId, FluidId, GeneratorIdentity, HeightGrid, Rect, Seed, SliceGrid,
+    BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureKindMask,
+    FeatureMetadata, FluidId, GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid,
     SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
@@ -542,6 +552,25 @@ impl WorldSource for WorldgenSource {
     }
 }
 
+impl FeatureSource for WorldgenSource {
+    /// Sends one feature query to a generator worker and **blocks** until the
+    /// reply arrives.
+    ///
+    /// The caller must be a background thread: the overlay fetches from a
+    /// worker so panning and zooming stay responsive (the T23 acceptance
+    /// bullet), and the UI thread must never call this. The worldgen query is
+    /// expensive for large rects (see `docs/benchmarks.md`), so callers use a
+    /// margin-expanded, cached rect rather than the raw viewport.
+    ///
+    /// A closed command or reply channel maps to [`SourceError::Internal`],
+    /// exactly like the region path.
+    fn features_in(&self, rect: Rect, filter: &FeatureFilter) -> SourceResult<Vec<Feature>> {
+        // The filter is cloned onto the command: `FeatureFilter` is plain data
+        // and the worker owns it for the duration of the query.
+        self.pool.features_in(rect, filter.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Worker-side functions: these run ON a worker thread with that thread's
 // own `Rc<ChunkGenerator>`. Nothing here may be called from the main
@@ -795,6 +824,155 @@ pub(crate) fn zone_at(
 }
 
 // ---------------------------------------------------------------------------
+// Feature placement (T22 query, T23 adapter). Runs on a worker thread with
+// that thread's generator; `FeaturePlacement` holds `Rc`s, so translation
+// happens here and only plain `Feature` values cross the thread boundary.
+// ---------------------------------------------------------------------------
+
+/// Serves one feature-placement query (worker thread).
+///
+/// The caller's [`FeatureFilter`] is mapped to the generator's
+/// [`PlacementFilter`] and passed through unchanged otherwise. The worldgen
+/// query is the single **placement** filter authority (its post-placement
+/// filter has the same documented semantics as [`FeatureFilter::matches`]),
+/// so the adapter never re-applies the category/name/size predicates.
+///
+/// The one map-core pass is the translated *kind*: [`FeatureKind::Poi`] and
+/// [`FeatureKind::UniquePrefab`] are both slices of the worldgen
+/// `UNIQUE_PREFAB` kind (`show_on_map` decides), so a query for only one of
+/// them would otherwise leak the other. Dropping by the requested
+/// [`FeatureKindMask`] is not a placement predicate and cannot drift from the
+/// generator.
+///
+/// A [`FeatureKind::CaveEntrance`] request contributes no worldgen kind yet
+/// (T27 reserves it); a filter that asks for nothing else returns an empty
+/// list without running the placement pass.
+pub(crate) fn feature_query(
+    generator: &Rc<ChunkGenerator>,
+    seed: i32,
+    rect: Rect,
+    filter: &FeatureFilter,
+) -> SourceResult<Vec<Feature>> {
+    catch_query_panics(|| {
+        let Some(kinds) = placement_kinds(filter.kinds) else {
+            return Ok(Vec::new());
+        };
+        let block_rect = BlockRect {
+            min_x: rect.min_x,
+            min_z: rect.min_z,
+            max_x: rect.max_x,
+            max_z: rect.max_z,
+        };
+        let placement_filter = PlacementFilter {
+            kinds,
+            categories: filter.categories.clone(),
+            name_contains: filter.name_contains.clone(),
+            min_size: filter.min_size,
+        };
+        Ok(generator
+            .features_in(seed, block_rect, &placement_filter)
+            .iter()
+            .filter_map(translate_placement)
+            .filter(|feature| filter.kinds.contains(feature.kind))
+            .collect())
+    })
+}
+
+/// Maps a map-core kind mask onto the generator's placement mask.
+///
+/// Returns [`None`] when no worldgen kind is requested (e.g. only cave
+/// entrances, which the query does not emit until T27): the caller then
+/// skips the query entirely instead of running it just to filter everything
+/// out.
+fn placement_kinds(mask: FeatureKindMask) -> Option<PlacementKindMask> {
+    let mut kinds: Option<PlacementKindMask> = None;
+    let mut add = |kind: PlacementKindMask| {
+        kinds = Some(match kinds {
+            Some(current) => current | kind,
+            None => kind,
+        });
+    };
+    // `Poi` is a map-core split of `UniquePrefab`, so it needs the same
+    // worldgen kind collected; the translation below applies the split.
+    if mask.contains(FeatureKind::UniquePrefab) || mask.contains(FeatureKind::Poi) {
+        add(PlacementKindMask::UNIQUE_PREFAB);
+    }
+    if mask.contains(FeatureKind::BiomePrefab) {
+        add(PlacementKindMask::BIOME_PREFAB);
+    }
+    if mask.contains(FeatureKind::Spawn) {
+        add(PlacementKindMask::SPAWN);
+    }
+    // `CaveEntrance` has no worldgen placement kind yet (reserved for T27).
+    kinds
+}
+
+/// Translates one worldgen placement into a plain map-core [`Feature`].
+///
+/// The mapping:
+///
+/// - `Spawn` → [`FeatureKind::Spawn`];
+/// - `UniquePrefab` with `show_on_map` → [`FeatureKind::Poi`] (the
+///   chunkbase-style map pin; unique prefabs are otherwise hidden landmarks);
+/// - `UniquePrefab` without `show_on_map` → [`FeatureKind::UniquePrefab`];
+/// - `BiomePrefab` → [`FeatureKind::BiomePrefab`];
+/// - any unknown/future kind (T27's cave entrance) → [`None`], skipped.
+///
+/// `metadata.source` records which generator list produced the feature
+/// (`"unique-prefab"`, `"biome-prefab"` or `"spawn"`), so same-named
+/// features from different sources stay distinguishable. `metadata.size` is
+/// the larger horizontal footprint when bounds exist. `bounds` maps straight
+/// through: both sides use inclusive block bounds, and the y span a unique
+/// prefab reports is its placement origin (the worldgen query's documented
+/// contract).
+///
+/// Public so the adapter parity test can run the same translation over a
+/// directly loaded generator's query result. It is the only worldgen-typed
+/// function this module exposes; everything else speaks map-core types.
+#[must_use]
+pub fn translate_placement(placement: &FeaturePlacement) -> Option<Feature> {
+    let (kind, source) = match placement.kind {
+        PlacementKind::Spawn => (FeatureKind::Spawn, "spawn"),
+        PlacementKind::UniquePrefab if placement.show_on_map => (FeatureKind::Poi, "unique-prefab"),
+        PlacementKind::UniquePrefab => (FeatureKind::UniquePrefab, "unique-prefab"),
+        PlacementKind::BiomePrefab => (FeatureKind::BiomePrefab, "biome-prefab"),
+        // `PlacementKind` is `#[non_exhaustive]`: a future cave-entrance kind
+        // maps to nothing until T27 defines its map-core identity.
+        _ => return None,
+    };
+
+    let bounds = placement.bounds.map(|bounds| {
+        Rect3::new(
+            bounds.min_x,
+            bounds.min_y,
+            bounds.min_z,
+            bounds.max_x,
+            bounds.max_y,
+            bounds.max_z,
+        )
+    });
+    let size = placement.bounds.map(|bounds| {
+        let size_x = i64::from(bounds.max_x) - i64::from(bounds.min_x) + 1;
+        let size_z = i64::from(bounds.max_z) - i64::from(bounds.min_z) + 1;
+        i32::try_from(size_x.max(size_z)).unwrap_or(i32::MAX)
+    });
+
+    Some(Feature {
+        kind,
+        name: placement.name.clone(),
+        category: placement.category.clone(),
+        position: placement.position,
+        bounds,
+        metadata: FeatureMetadata {
+            // Reserved: the query reports no variant string yet.
+            variant: None,
+            size,
+            source: Some(source.to_string()),
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Chunk generation (T09): summaries and slices. Runs on the worker thread
 // with that thread's generator + resource; the GeneratedChunk is dropped
 // when the extraction finishes.
@@ -896,5 +1074,43 @@ fn catch_query_panics<T>(work: impl FnOnce() -> SourceResult<T>) -> SourceResult
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
         Ok(result) => result,
         Err(payload) => Err(SourceError::Generation(panic_message(payload))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlacementKind, PlacementKindMask, placement_kinds};
+    use crate::types::{FeatureKind, FeatureKindMask};
+
+    #[test]
+    fn features_placement_kinds_map_poi_to_unique_and_skip_cave() {
+        // Poi is the show_on_map slice of the worldgen unique kind.
+        let poi = FeatureKindMask::from_kind(FeatureKind::Poi);
+        let kinds = placement_kinds(poi).expect("Poi asks the generator for unique prefabs");
+        assert!(kinds.contains(PlacementKind::UniquePrefab));
+        assert!(!kinds.contains(PlacementKind::BiomePrefab));
+        assert!(!kinds.contains(PlacementKind::Spawn));
+
+        // Unique and Poi together still request one worldgen kind.
+        let both = poi.union(FeatureKindMask::from_kind(FeatureKind::UniquePrefab));
+        assert_eq!(
+            placement_kinds(both),
+            placement_kinds(poi),
+            "the split kinds collapse to the same worldgen kind",
+        );
+
+        let spawn = placement_kinds(FeatureKindMask::from_kind(FeatureKind::Spawn))
+            .expect("Spawn asks for spawn points");
+        assert!(spawn.contains(PlacementKind::Spawn));
+        assert!(!spawn.contains(PlacementKind::UniquePrefab));
+
+        // Cave entrances (T27) and an empty mask request no worldgen kind,
+        // so the query is skipped instead of running and dropping all.
+        assert!(placement_kinds(FeatureKindMask::from_kind(FeatureKind::CaveEntrance)).is_none());
+        assert!(placement_kinds(FeatureKindMask(0)).is_none());
+
+        // Every worldgen kind can be requested by the matching map-core kind.
+        let all = placement_kinds(FeatureKindMask::ALL).expect("at least one kind maps");
+        assert_eq!(all, PlacementKindMask::all());
     }
 }

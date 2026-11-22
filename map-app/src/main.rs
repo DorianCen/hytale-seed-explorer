@@ -11,12 +11,14 @@
 //! All logic is testable without this binary: [`app`] is the egui skin,
 //! [`state`] the headless state machine, [`inspector`] the hover sampling
 //! and go-to machinery (T18), [`view_state`] the pan/zoom math,
-//! [`map_view`] the interactive map widget, [`labels`] the UI strings.
+//! [`map_view`] the interactive map widget, [`overlays`] the feature
+//! overlay's fetch/draw machinery (T23), [`labels`] the UI strings.
 
 mod app;
 mod inspector;
 mod labels;
 mod map_view;
+mod overlays;
 mod state;
 mod texture;
 mod view_state;

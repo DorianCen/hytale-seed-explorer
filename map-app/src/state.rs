@@ -29,11 +29,13 @@ use std::sync::Arc;
 use map_core::error::SourceResult;
 use map_core::layers::LayerStack;
 use map_core::render::Layer;
+use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
 use map_core::types::{Rect, Seed, SeedError};
 
 use crate::inspector::{GoToDialog, InspectorState, parse_go_to};
 use crate::labels;
+use crate::overlays::features::FeatureOverlayState;
 use crate::view_state::MapViewState;
 
 /// The resolution steps the top-bar selector offers (blocks per sample).
@@ -67,23 +69,30 @@ pub fn layer_label(layer: Layer) -> &'static str {
     }
 }
 
-/// The overlay checkboxes of the left panel. Placeholder booleans until
-/// T23/T27/T29 render real overlays; the panel writes here either way.
+/// The overlay checkboxes of the left panel. The feature groups (T23) are
+/// draw-time filters first and the next fetch's kind mask second; the chunk
+/// grid stays a debug placeholder. `cave_entrances` maps to the cave group
+/// now but stays a no-op until T27 starts emitting entrances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlaySettings {
     pub structures: bool,
     pub prefabs: bool,
+    pub spawn: bool,
+    pub poi: bool,
     pub cave_entrances: bool,
     pub chunk_grid: bool,
 }
 
 impl Default for OverlaySettings {
     fn default() -> Self {
-        // The plan's layout ships with structures, prefabs and cave
-        // entrances checked, the debug chunk grid off.
+        // The plan's layout ships with structures, prefabs, spawn, POI and
+        // cave entrances checked (matching `FeatureToggleMask::all()`), the
+        // debug chunk grid off.
         OverlaySettings {
             structures: true,
             prefabs: true,
+            spawn: true,
+            poi: true,
             cave_entrances: true,
             chunk_grid: false,
         }
@@ -196,8 +205,12 @@ pub struct AppState {
     /// touches it, so settings survive; serialization arrives with T31.
     layers: LayerStack,
 
-    /// The overlay checkboxes of the left panel (placeholders).
+    /// The overlay checkboxes of the left panel (T23's feature groups).
     overlays: OverlaySettings,
+
+    /// The feature overlay's fetch/draw state (T23): active catalog, query
+    /// cache, in-flight channel and selection. Reset with the source.
+    features: FeatureOverlayState,
 
     /// Cursor block coordinates once the map widget exists (T16).
     cursor: Option<(i32, i32)>,
@@ -239,6 +252,7 @@ impl Default for AppState {
             view: MapViewState::new(),
             layers: LayerStack::new(),
             overlays: OverlaySettings::default(),
+            features: FeatureOverlayState::new(),
             cursor: None,
             inspector: InspectorState::new(),
             status: String::new(),
@@ -354,8 +368,11 @@ impl AppState {
         self.next_generation += 1;
 
         // A re-load over a ready source retires the old one; dropping
-        // happens off the UI thread (see the module docs).
+        // happens off the UI thread (see the module docs). Its feature
+        // catalog retires with it: markers of the world being replaced
+        // must not outlive the source, even while the new one loads.
         self.retire_ready_source();
+        self.features.reset();
         self.source = SourceState::Loading { generation };
         self.loaded_seed_input = Some(self.seed_text.clone());
         self.status.clear();
@@ -395,8 +412,10 @@ impl AppState {
                 self.status = format!("{} {}", labels::STATUS_SOURCE_READY, self.seed_text);
                 // A new source means new biome ids, new surfaces: the
                 // inspector's cached samples and pending readout belong
-                // to the source that just left.
+                // to the source that just left. The feature overlay is
+                // bound to the same identity for exactly the same reason.
                 self.inspector.reset();
+                self.features.set_source(source.identity());
                 self.source = SourceState::Ready(Arc::new(source));
             }
             Err(error) => {
@@ -435,6 +454,10 @@ impl AppState {
         // Samples and pending reads belong to the dead source; a hover
         // reply still in flight will find the state reset here and drop.
         self.inspector.reset();
+        // Feature placements belong to the dead world too: drop the
+        // in-flight query (the worker's send then fails and it exits),
+        // the cached catalogs and the active markers.
+        self.features.reset();
     }
 
     /// True while a load is in flight (drives the Go button and spinner).
@@ -576,6 +599,24 @@ impl AppState {
     /// The overlay checkboxes (mutable so the panel writes them directly).
     pub fn overlays_mut(&mut self) -> &mut OverlaySettings {
         &mut self.overlays
+    }
+
+    /// The overlay checkboxes read-only (the feature draw/fetch filter).
+    #[must_use]
+    pub fn overlays(&self) -> &OverlaySettings {
+        &self.overlays
+    }
+
+    /// The feature overlay's fetch/draw state (T23).
+    #[must_use]
+    pub fn features(&self) -> &FeatureOverlayState {
+        &self.features
+    }
+
+    /// The feature overlay's state, for the per-frame fetch drive and
+    /// click selection.
+    pub fn features_mut(&mut self) -> &mut FeatureOverlayState {
+        &mut self.features
     }
 
     /// Cursor block coordinates for the status bar, once the map widget
