@@ -202,6 +202,59 @@ What the numbers say (T21's design consequences):
   reproduces T09's "surface region @ step 2, summaries cached: 0.21 s"
   scale — the summary cache, not the renderer, owns the performance.
 
+## Zoom-out pooling, tiered icons, surface-only fills (perf push)
+
+**Origin:** user-reported slowness vs chunkbase-style explorers + the
+request that unzooming reuse what was already generated ("pooling layer")
+instead of blanking. Three levers landed; numbers below.
+
+### Surface-only coarse fills (`SummaryFidelity`)
+
+Fill passes at steps **coarser than the user's effective step** now request
+`SummaryFidelity::SurfaceOnly` chunks (tint → environment → blocks → water;
+cave/prefab populators skipped — an opt-in worldgen request mode, default
+pipeline byte-identical, golden-guarded; worldgen commit `40dec05`).
+Refine passes and the user's own step stay `Full`. Fidelity rides the
+`TilePass`, is a separate summary-cache key (a SurfaceOnly summary can never
+serve a Full request), and tile provenance re-renders weaker cache hits
+(placeholders stay fidelity-blind stand-ins). Measured probe
+(`crates/worldgen-cli/src/bin/surface_only_probe.rs`, release, 64 chunks,
+single generator, seed 0):
+
+| Mode | Region (s) | Per chunk (s) |
+|---|---:|---:|
+| Full pipeline | 20.6–21.2 | 0.32–0.33 |
+| Surface-only | **3.82–3.84** | **0.060** |
+| Speedup | **5.4× cold / 5.5× warm rerun** | |
+
+**Consequence for the T21 row above:** the cold coarse fill of a 64-chunk
+region drops from ~21 s (1 worker) to **~4 s**; the refine pass regenerates
+its chunks Full (by design — placeholders are cheap, detail is exact). On
+the fixture chunk (seed 0, chunk (0,0)), 177/1024 top-block columns differ
+between the modes — every one is the chunk's biome prefab, resolved when
+the refine pass lands.
+
+### Zoom-out pooling (`pooled_placeholder`)
+
+Unzooming no longer blanks: a missing coarse tile is derived instantly by
+box-averaging the cached finer tiles covering it (factor = step ratio,
+capped at 8; alpha-0 = no-data). The reverse direction (a missing fine tile
+showing a cached coarser one) already existed — now both zoom directions
+keep content on screen while real tiles generate. Pure map-core, 10
+`pooling_` tests + 5 map-app paint/texture-bridge tests (one upload per
+key, retired on real-tile arrival).
+
+### Tiered feature icons
+
+Overlay fetches are two tiers: cheap kinds (spawn/unique/POI — the T22 kind
+mask skips the placement pass entirely) fire immediately at source-ready
+over the visible rect (**milliseconds**, see the T22 probe: 26 ms cold for
+the per-seed lists); the full biome-prefab fetch stays debounced
+(150 ms settle, margin rect, 2048-block cap) and a one-shot 64×64 prewarm
+query loads the prefab buffers (~8 s of asset loads) before it. The status
+bar shows `features: generating…` while any tier is in flight. 15 overlay
+tests.
+
 ## Feature enumeration (T22)
 
 **Task:** [T22](../tasks/T22-feature-placement-query.md) — the measured

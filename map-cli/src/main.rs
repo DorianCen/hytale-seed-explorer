@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use map_core::render::{Layer, encode_png, render_biome_rgba};
-use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig, default_world_path};
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::types::Rect;
 
 #[derive(Parser)]
@@ -219,7 +219,7 @@ fn render(args: RenderArgs) -> Result<(), String> {
         }
         Layer::Fluid => {
             let grid = source
-                .surface_region(rect, args.step)
+                .surface_region(rect, args.step, SummaryFidelity::Full)
                 .map_err(|error| error.to_string())?;
             map_core::render::fluid::fluid_image(
                 &grid,

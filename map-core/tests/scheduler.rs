@@ -16,12 +16,14 @@ use map_core::render::Layer;
 use map_core::scheduler::{
     CancelToken, TileEvent, TilePass, TileRenderer, TileScheduler, TileSubject,
 };
+use map_core::source::SummaryFidelity;
 use map_core::tiles::{Tile, TileCache, TileKey};
 
-/// One recorded fake render: when it started and ended.
+/// One recorded fake render: when it started and ended, at what fidelity.
 #[derive(Debug, Clone, Copy)]
 struct RenderRecord {
     key: TileKey,
+    fidelity: SummaryFidelity,
     start: Instant,
     end: Instant,
 }
@@ -68,7 +70,12 @@ impl FakeRenderer {
 }
 
 impl TileRenderer for FakeRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> Result<Tile, SourceError> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> Result<Tile, SourceError> {
         let start = Instant::now();
         if self.panic_keys.contains(key) {
             panic!("fake renderer panic at {key:?}");
@@ -86,11 +93,14 @@ impl TileRenderer for FakeRenderer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(RenderRecord {
                 key: *key,
+                fidelity,
                 start,
                 end,
             });
         let byte = key.tx.rem_euclid(i32::from(u8::MAX)) as u8;
-        Ok(Tile::new(*key, 2, 2, vec![byte; 16]).expect("the buffer matches 2x2 RGBA"))
+        Ok(Tile::new(*key, 2, 2, vec![byte; 16])
+            .expect("the buffer matches 2x2 RGBA")
+            .with_fidelity(fidelity))
     }
 }
 
@@ -301,6 +311,115 @@ fn scheduler_cached_tiles_are_not_requested_again() {
     );
     // The cache still serves the pre-existing tile, not a replacement.
     let tile = cache.get(&center).expect("the center tile is cached");
+    assert_eq!(
+        tile.pixel(0, 0),
+        Some([42, 42, 42, 42]),
+        "the original pixels survive"
+    );
+}
+
+/// T29: a cached surface-only placeholder must not short-circuit an
+/// authoritative full pass. The pass re-renders and overwrites the entry
+/// with the stronger provenance.
+#[test]
+fn fidelity_weaker_cached_tile_does_not_satisfy_a_full_pass() {
+    let cache = Arc::new(TileCache::new(1024 * 1024));
+    let scheduler = TileScheduler::new(1, Arc::clone(&cache));
+    let renderer = Arc::new(FakeRenderer::new(0));
+    let subject = subject();
+    let center = subject.key_at(0, 0);
+
+    // A placeholder-quality tile already sits in the cache.
+    let weak = Tile::new(center, 2, 2, vec![42u8; 16])
+        .expect("the buffer matches")
+        .with_fidelity(SummaryFidelity::SurfaceOnly);
+    cache.insert(Arc::new(weak));
+    assert!(
+        !cache.contains_serving(&center, SummaryFidelity::Full),
+        "a surface-only tile is a miss for a full pass"
+    );
+
+    let pass = TilePass::fill(
+        vec![subject],
+        TileRect::new(TileCoord::new(0, 0), TileCoord::new(0, 0)),
+        TileCoord::new(0, 0),
+    )
+    .with_fidelity(SummaryFidelity::Full);
+    scheduler.schedule_passes(&[pass], Arc::clone(&renderer) as Arc<dyn TileRenderer>);
+    assert!(
+        wait_until(30_000, || {
+            let stats = scheduler.stats();
+            stats.completed == 1 && idle(&scheduler)
+        }),
+        "the weak cache hit re-renders: {:?}",
+        scheduler.stats()
+    );
+
+    let records = renderer.start_order();
+    assert_eq!(records.len(), 1, "exactly one re-render");
+    assert_eq!(
+        records[0].fidelity,
+        SummaryFidelity::Full,
+        "the re-render runs at the pass's full fidelity"
+    );
+    let tile = cache
+        .get(&center)
+        .expect("the re-render overwrote the entry");
+    assert_eq!(
+        tile.fidelity,
+        SummaryFidelity::Full,
+        "the entry now carries the stronger provenance"
+    );
+    assert_eq!(
+        tile.pixel(0, 0),
+        Some([0, 0, 0, 0]),
+        "the placeholder pixels were replaced by the full render"
+    );
+    assert!(
+        cache.contains_serving(&center, SummaryFidelity::Full),
+        "the upgraded entry serves later full passes"
+    );
+}
+
+/// T29: the converse — a full-fidelity cached tile is at least as good as
+/// a surface-only pass, so it serves it without re-rendering.
+#[test]
+fn fidelity_full_cached_tile_satisfies_a_surface_only_pass() {
+    let cache = Arc::new(TileCache::new(1024 * 1024));
+    let scheduler = TileScheduler::new(1, Arc::clone(&cache));
+    let renderer = Arc::new(FakeRenderer::new(0));
+    let subject = subject();
+    let center = subject.key_at(0, 0);
+
+    let strong = Tile::new(center, 2, 2, vec![42u8; 16]).expect("the buffer matches");
+    assert_eq!(
+        strong.fidelity,
+        SummaryFidelity::Full,
+        "Tile::new defaults to full provenance"
+    );
+    cache.insert(Arc::new(strong));
+    assert!(
+        cache.contains_serving(&center, SummaryFidelity::SurfaceOnly),
+        "full fidelity serves a surface-only pass"
+    );
+
+    let pass = TilePass::fill(
+        vec![subject],
+        TileRect::new(TileCoord::new(0, 0), TileCoord::new(0, 0)),
+        TileCoord::new(0, 0),
+    )
+    .with_fidelity(SummaryFidelity::SurfaceOnly);
+    scheduler.schedule_passes(&[pass], Arc::clone(&renderer) as Arc<dyn TileRenderer>);
+    assert!(idle(&scheduler), "a serving cache hit queues nothing");
+
+    // No renderer call can arrive later: the job was never queued.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        renderer.start_order().is_empty(),
+        "a full tile satisfies the surface-only pass without re-rendering"
+    );
+    let tile = cache.get(&center).expect("the original entry stays cached");
+    assert_eq!(tile.fidelity, SummaryFidelity::Full);
     assert_eq!(
         tile.pixel(0, 0),
         Some([42, 42, 42, 42]),

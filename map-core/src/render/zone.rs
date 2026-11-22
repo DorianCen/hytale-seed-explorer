@@ -21,7 +21,7 @@ use crate::catalog::ZoneCatalog;
 use crate::error::{SourceError, SourceResult};
 use crate::render::tiles::render_layer_tile;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{Rect, ZoneGrid};
 
@@ -146,12 +146,20 @@ impl ZoneTileRenderer {
 }
 
 impl TileRenderer for ZoneTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
-        // Border 0: a zone sample is independent of its neighbours.
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
+        // Border 0: a zone sample is independent of its neighbours. Zone
+        // is a direct column query, not a chunk summary, so the pass
+        // fidelity does not apply.
         render_layer_tile(
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             0,
             |source, rect, step, _cancel| source.zone_region(rect, step),

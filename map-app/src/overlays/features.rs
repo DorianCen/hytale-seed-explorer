@@ -7,11 +7,12 @@
 //!    large a rectangle to ask for, and whether a reply is still wanted. No
 //!    source, no egui, so the debounce/cap rules are unit-tested directly.
 //! 2. [`FeatureOverlayState`] — the app-side state an [`crate::state::AppState`]
-//!    owns: the active catalog, the `map-core` query cache, the single
-//!    in-flight query, the viewport signature the last query served, and the
-//!    selected/flashing feature. One `std::thread` per query calls the
-//!    synchronous `FeatureSource::features_in`; the UI thread only polls the
-//!    reply channel.
+//!    owns: the two catalogs (quick and full), the `map-core` query cache, one
+//!    in-flight query per tier plus the prewarm, the viewport signature the
+//!    last full query served, and the selected/flashing feature. One
+//!    `std::thread` per query calls the synchronous
+//!    `FeatureSource::features_in`; the UI thread only polls the reply
+//!    channels.
 //! 3. Drawing and interaction helpers — [`marker_list`] projects, filters and
 //!    clusters; [`paint_items`] draws; [`hit_test`] and [`tooltip_text`] feed
 //!    the map widget. These are in this module so `map_view.rs` stays thin.
@@ -35,6 +36,30 @@
 //! cache-only view: the last catalog keeps drawing (and clustering), and no
 //! new query is issued until the user zooms back in. See
 //! [`MAX_FETCH_SIDE_BLOCKS`].
+//!
+//! # Two fetch tiers (why icons appear within a second)
+//!
+//! The same T22 table says the *placement* pass dominates that cost, and that
+//! three kinds — `Spawn`, `Poi`, `UniquePrefab` — are answered without it
+//! (asset/table lookups, milliseconds even over a huge rect). The overlay
+//! therefore fetches twice:
+//!
+//! - **Tier 1 (quick, no debounce):** the moment a source becomes ready, one
+//!   query over the *visible* rect for [`cheap_kind_mask`] only. Its catalog
+//!   is kept apart ([`FeatureOverlayState::quick_catalog`]) and drawn with the
+//!   full one, so the spawn cross, unique houses and POI stars are on screen
+//!   immediately.
+//! - **Tier 2 (full, debounced):** the existing margin-expanded, cap-clamped,
+//!   all-enabled-kinds fetch. Its catalog supersedes the quick one as soon as
+//!   its rect **covers** the quick rect — the T22 subset property (a smaller
+//!   rect's placements are exactly a subset of a larger one's) makes the drop
+//!   lossless.
+//!
+//! A third, invisible query fires with tier 1: the [`PREWARM_SIDE_BLOCKS`]
+//! biome-prefab prewarm, whose result is only cached, never drawn. It warms
+//! the generator's prefab buffers so the eventual tier-2 biome-prefab
+//! placements do not pay that asset load mid-fetch (the recorded T22
+//! finding).
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -49,7 +74,9 @@ use map_core::features::{
     ClusterItem, FeatureCatalog, FeatureIcon, FeatureOverlayState as CoreOverlayState,
     FeatureToggleGroup, FeatureToggleMask, category_for, cluster, group_for,
 };
-use map_core::types::{Feature, FeatureFilter, FeatureKind, GeneratorIdentity, Rect};
+use map_core::types::{
+    Feature, FeatureFilter, FeatureKind, FeatureKindMask, GeneratorIdentity, Rect,
+};
 
 use crate::labels;
 use crate::state::OverlaySettings;
@@ -73,6 +100,17 @@ pub const MAX_FETCH_SIDE_BLOCKS: i32 = 2048;
 /// keeps the single count far below this; the cap is the "thousands of
 /// features" guard T23's risk note asks for. T33 profiles the real number.
 pub const MAX_DRAWN_SINGLES: usize = 1500;
+
+/// The side, in blocks, of the tier-1 prewarm query centred on the view.
+///
+/// `docs/benchmarks.md` §"Feature enumeration (T22)" attributes the first
+/// biome-prefab query's minutes-scale wall clock mostly to the generator
+/// loading its prefab buffers (~8 s of asset work) before any placement runs;
+/// later queries over the same world are far cheaper. One tiny query fired the
+/// moment a source becomes ready pays that load while the user is still
+/// orienting instead of inside the tier-2 fetch, and 64×64 blocks is small
+/// enough that the placement pass over it is noise (T22: seconds even cold).
+pub const PREWARM_SIDE_BLOCKS: i32 = 64;
 
 /// Marker geometry: icon radius, cluster disc radius and pointer hit radius
 /// (all in egui points).
@@ -101,22 +139,25 @@ pub type ViewSignature = (f64, f64, f32, f32);
 /// `(kind, name, position)` exactly as `FeatureCatalog::build` dedupes.
 pub type FeatureKey = (FeatureKind, String, (i32, i32, i32));
 
-/// A settled query the app should issue: the rect and the kind filter.
+/// A query the app should issue: the rect and the kind filter. Both tiers and
+/// the prewarm share this shape; which slot a request belongs to is the
+/// planner method's business.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeatureFetch {
     pub rect: Rect,
     pub filter: FeatureFilter,
 }
 
-/// What one poll of the in-flight channel produced.
+/// What one poll of an in-flight channel produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeatureReplyOutcome {
-    /// No query is in flight.
+    /// No query is in flight in that tier.
     Idle,
     /// The worker has not replied yet.
     Pending,
     /// A reply arrived for a rect that no longer covers the visible view; it
-    /// was dropped (never cached, never drawn).
+    /// was dropped (never cached, never drawn). Only tier 2 uses this:
+    /// tier 1's cheap reply is accepted and left to the draw list's culling.
     Stale,
     /// A reply was built into a catalog and cached. Carries its feature count.
     Applied(usize),
@@ -251,10 +292,21 @@ impl FeatureFetchPlanner {
     /// currently sees (an in-flight reply is wanted only then).
     #[must_use]
     pub fn wants_reply(reply_rect: Rect, visible_rect: Rect) -> bool {
-        visible_rect.min_x >= reply_rect.min_x
-            && visible_rect.max_x <= reply_rect.max_x
-            && visible_rect.min_z >= reply_rect.min_z
-            && visible_rect.max_z <= reply_rect.max_z
+        Self::covers(reply_rect, visible_rect)
+    }
+
+    /// True when `outer` contains every block of `inner` (inclusive bounds).
+    ///
+    /// The tier-1 → tier-2 handoff rule: once the full catalog's rect covers
+    /// the quick one, the quick catalog is a subset and can be dropped
+    /// (`docs/benchmarks.md` §"Feature enumeration (T22)": a smaller rect's
+    /// placements are exactly a subset of a larger one's).
+    #[must_use]
+    pub fn covers(outer: Rect, inner: Rect) -> bool {
+        inner.min_x >= outer.min_x
+            && inner.max_x <= outer.max_x
+            && inner.min_z >= outer.min_z
+            && inner.max_z <= outer.max_z
     }
 }
 
@@ -316,6 +368,21 @@ pub fn fetch_filter(settings: &OverlaySettings) -> FeatureFilter {
     }
 }
 
+/// The kinds whose enumeration skips the generator's placement pass — the
+/// tier-1 mask.
+///
+/// `docs/benchmarks.md` §"Feature enumeration (T22)": `Spawn`, `Poi` and
+/// `UniquePrefab` come from asset tables, so they answer in milliseconds over
+/// rects whose placement pass would cost minutes; `BiomePrefab` (the expensive
+/// one) and the reserved `CaveEntrance` stay in tier 2 only. Cave entrances
+/// have no placement kind yet (T27), so their absence costs nothing today.
+#[must_use]
+pub fn cheap_kind_mask() -> FeatureKindMask {
+    FeatureKindMask::from_kind(FeatureKind::Spawn)
+        .union(FeatureKindMask::from_kind(FeatureKind::Poi))
+        .union(FeatureKindMask::from_kind(FeatureKind::UniquePrefab))
+}
+
 /// The feature's selection key.
 #[must_use]
 pub fn feature_key(feature: &Feature) -> FeatureKey {
@@ -334,24 +401,82 @@ fn placeholder_identity() -> GeneratorIdentity {
     }
 }
 
-/// The app-side overlay state: active catalog, cache, one in-flight query and
-/// the selection.
+/// One background query: its reply channel and what was asked for.
+///
+/// Dropping it detaches the worker: its send fails and the thread (which owns
+/// the source `Arc`) exits on its own — the app's retirement pattern.
+struct InFlight {
+    receiver: Receiver<SourceResult<Vec<Feature>>>,
+    rect: Rect,
+    filter: FeatureFilter,
+}
+
+/// What one non-blocking poll of an [`InFlight`] slot produced.
+enum SlotPoll {
+    /// No query in that tier.
+    Idle,
+    /// The worker has not replied yet.
+    Empty,
+    /// The worker vanished without sending; the slot is free again.
+    Gone,
+    /// A reply arrived (the slot is free again).
+    Reply {
+        rect: Rect,
+        filter: FeatureFilter,
+        result: SourceResult<Vec<Feature>>,
+    },
+}
+
+/// The memoized union of the two catalogs for one toggle mask.
+struct DrawCache {
+    mask: FeatureToggleMask,
+    quick: Option<Arc<FeatureCatalog>>,
+    full: Option<Arc<FeatureCatalog>>,
+    catalog: Arc<FeatureCatalog>,
+}
+
+/// The app-side overlay state: the two active catalogs (quick + full), the
+/// query cache, one in-flight query per tier plus the prewarm, and the
+/// selection.
+///
+/// # Tier state machine
+///
+/// ```text
+/// source ready   -> plan_quick_fetch   (no debounce, cheap kinds, visible rect)
+///                -> plan_prewarm_fetch (once; 64x64 BiomePrefab, cached only)
+/// view settles   -> plan_fetch         (debounced, margin, cap, all kinds)
+/// plan_fetch hit -> adopt full + drop quick when the full rect covers it
+/// source change  -> reset(): both catalogs, every slot, cache, selection
+/// ```
+///
+/// `catalog` is the full (tier 2) catalog and keeps its T23 meaning for
+/// callers; `quick` is tier 1 ([`Self::quick_catalog`]). The draw list is
+/// their union ([`Self::draw_catalog`]).
 pub struct FeatureOverlayState {
     /// Monotonic origin for the planner's millisecond clock.
     epoch: Instant,
     cache: map_core::features::FeatureCache,
+    /// Tier 2: the full, debounced catalog and the rect it covers.
     catalog: Option<Arc<FeatureCatalog>>,
     catalog_rect: Option<Rect>,
-    /// The single in-flight query. Dropping it detaches the worker: its send
-    /// fails and the thread (which owns the source `Arc`) exits on its own.
-    in_flight: Option<Receiver<SourceResult<Vec<Feature>>>>,
-    in_flight_rect: Option<Rect>,
-    in_flight_filter: Option<FeatureFilter>,
+    /// Tier 1: the cheap-kinds catalog over the visible rect it was
+    /// planned for, until a full catalog covering it arrives.
+    quick: Option<Arc<FeatureCatalog>>,
+    quick_rect: Option<Rect>,
+    /// The in-flight query of each tier (plus the invisible prewarm).
+    full_in_flight: Option<InFlight>,
+    quick_in_flight: Option<InFlight>,
+    prewarm_in_flight: Option<InFlight>,
+    /// Tier 1 and the prewarm fire once per source; `reset` re-arms both.
+    quick_requested: bool,
+    prewarm_requested: bool,
     deadline_ms: Option<u64>,
     observed_signature: Option<ViewSignature>,
     fetched_signature: Option<ViewSignature>,
     selected: Option<FeatureKey>,
     flash_until: Option<Instant>,
+    /// The memoized two-tier draw catalog (see [`Self::draw_catalog`]).
+    draw: Option<DrawCache>,
 }
 
 impl Default for FeatureOverlayState {
@@ -369,14 +494,19 @@ impl FeatureOverlayState {
             cache: map_core::features::FeatureCache::new(placeholder_identity()),
             catalog: None,
             catalog_rect: None,
-            in_flight: None,
-            in_flight_rect: None,
-            in_flight_filter: None,
+            quick: None,
+            quick_rect: None,
+            full_in_flight: None,
+            quick_in_flight: None,
+            prewarm_in_flight: None,
+            quick_requested: false,
+            prewarm_requested: false,
             deadline_ms: None,
             observed_signature: None,
             fetched_signature: None,
             selected: None,
             flash_until: None,
+            draw: None,
         }
     }
 
@@ -387,40 +517,76 @@ impl FeatureOverlayState {
         self.reset();
     }
 
-    /// Drops the in-flight query, the cache and the active catalog. The next
-    /// settled frame re-plans from scratch; a reply that arrives after this is
-    /// stale by construction (its receiver is gone).
+    /// Drops every in-flight query, the cache and both active catalogs. The
+    /// next frame re-plans tier 1 and the prewarm from scratch and tier 2
+    /// once the view settles; a reply that arrives after this is stale by
+    /// construction (its receiver is gone).
     pub fn reset(&mut self) {
-        self.in_flight = None;
-        self.in_flight_rect = None;
-        self.in_flight_filter = None;
+        self.full_in_flight = None;
+        self.quick_in_flight = None;
+        self.prewarm_in_flight = None;
+        self.quick_requested = false;
+        self.prewarm_requested = false;
         self.cache.reset();
         self.catalog = None;
         self.catalog_rect = None;
+        self.quick = None;
+        self.quick_rect = None;
         self.deadline_ms = None;
         self.observed_signature = None;
         self.fetched_signature = None;
         self.selected = None;
         self.flash_until = None;
+        self.draw = None;
     }
 
-    /// The active catalog, when a query or cache hit produced one.
+    /// The full (tier 2) catalog, when a query or cache hit produced one.
+    ///
+    /// The map paints the merged union instead ([`Self::draw_catalog`]);
+    /// search (T24/T26) needs this one alone.
+    #[allow(dead_code)] // reserved: T24/T26 search highlighting
     #[must_use]
     pub fn catalog(&self) -> Option<&FeatureCatalog> {
         self.catalog.as_deref()
     }
 
-    /// The rect the active catalog covers (`None` before the first query).
+    /// The quick (tier 1) cheap-kinds catalog, while it has not been
+    /// superseded by a covering full catalog.
+    #[allow(dead_code)] // reserved: T24/T26 search highlighting and diagnostics
+    #[must_use]
+    pub fn quick_catalog(&self) -> Option<&FeatureCatalog> {
+        self.quick.as_deref()
+    }
+
+    /// The rect the full catalog covers (`None` before the first query).
     #[allow(dead_code)] // reserved: T24/T26 search highlighting
     #[must_use]
     pub fn catalog_rect(&self) -> Option<Rect> {
         self.catalog_rect
     }
 
-    /// Whether a query is in flight.
+    /// The rect the quick catalog covers (`None` before it lands or after a
+    /// covering full catalog replaced it).
+    #[allow(dead_code)] // reserved: T24/T26 search highlighting
+    #[must_use]
+    pub fn quick_rect(&self) -> Option<Rect> {
+        self.quick_rect
+    }
+
+    /// Whether any overlay query — either tier or the prewarm — is in flight.
     #[must_use]
     pub fn has_fetch_in_flight(&self) -> bool {
-        self.in_flight.is_some()
+        self.full_in_flight.is_some()
+            || self.quick_in_flight.is_some()
+            || self.prewarm_in_flight.is_some()
+    }
+
+    /// The status bar's feature segment while a query runs: a minutes-long
+    /// tier-2 fetch must not look like a dead UI.
+    #[must_use]
+    pub fn status_hint(&self) -> Option<&'static str> {
+        self.has_fetch_in_flight()
+            .then_some(labels::STATUS_FEATURES_GENERATING)
     }
 
     /// The selected feature key, when one was clicked.
@@ -464,13 +630,174 @@ impl FeatureOverlayState {
         )
     }
 
-    /// Plans the frame's query, if one is due:
+    /// Plans tier 1's query, if it has not fired for this source yet.
     ///
-    /// - a query already in flight means wait;
+    /// No debounce and no margin: the cheap kinds skip the generator's
+    /// placement pass, so even a zoomed-out *visible* rect answers in
+    /// milliseconds (T22). The kinds are intersected with the enabled groups,
+    /// keeping the module's toggle contract (a disabled group is never
+    /// queried). Returns [`None`] once fired — [`Self::reset`] re-arms it on a
+    /// source change — when a quick query is still in flight, or when no cheap
+    /// kind is enabled.
+    pub fn plan_quick_fetch(
+        &mut self,
+        view: &MapViewState,
+        settings: &OverlaySettings,
+    ) -> Option<FeatureFetch> {
+        if self.quick_requested || self.quick_in_flight.is_some() {
+            return None;
+        }
+        let kinds = quick_kinds(settings);
+        if kinds.0 == 0 {
+            return None;
+        }
+        self.quick_requested = true;
+        Some(FeatureFetch {
+            rect: FeatureFetchPlanner::visible_rect(view),
+            filter: FeatureFilter {
+                kinds,
+                categories: None,
+                name_contains: None,
+                min_size: None,
+            },
+        })
+    }
+
+    /// Records tier 1's query and its reply channel. The caller has already
+    /// spawned the worker that sends into `receiver`.
+    pub fn begin_quick_fetch(
+        &mut self,
+        request: FeatureFetch,
+        receiver: Receiver<SourceResult<Vec<Feature>>>,
+    ) {
+        self.quick_in_flight = Some(InFlight {
+            receiver,
+            rect: request.rect,
+            filter: request.filter,
+        });
+    }
+
+    /// Polls tier 1's channel without blocking and activates a reply as the
+    /// quick catalog.
+    ///
+    /// No coverage check: the query covers the visible rect it was planned
+    /// for and costs milliseconds, so a view that moved in that window is
+    /// handled by the draw list's culling and by tier 2 superseding it — a
+    /// dropped quick reply would leave the cheap icons waiting on the
+    /// minutes-long full tier. Replies from another source cannot arrive: the
+    /// reset dropped this receiver.
+    pub fn poll_quick(&mut self, _now: Instant, _view: &MapViewState) -> FeatureReplyOutcome {
+        match poll_slot(&mut self.quick_in_flight) {
+            SlotPoll::Idle => FeatureReplyOutcome::Idle,
+            SlotPoll::Empty => FeatureReplyOutcome::Pending,
+            SlotPoll::Gone => FeatureReplyOutcome::WorkerDied,
+            SlotPoll::Reply {
+                rect,
+                filter,
+                result,
+            } => match result {
+                Ok(features) => {
+                    let catalog = Arc::new(FeatureCatalog::build(features));
+                    let count = catalog.len();
+                    self.cache.put(rect, filter, Arc::clone(&catalog));
+                    self.quick = Some(catalog);
+                    self.quick_rect = Some(rect);
+                    self.prune_selection();
+                    FeatureReplyOutcome::Applied(count)
+                }
+                Err(error) => FeatureReplyOutcome::Failed(error.to_string()),
+            },
+        }
+    }
+
+    /// Plans the once-per-source biome-prefab prewarm, if it has not fired.
+    ///
+    /// A tiny rect at the view center with only [`FeatureKind::BiomePrefab`]
+    /// selected. Its *result* is irrelevant — the point is that the generator
+    /// loads its prefab buffers here (the ~8 s asset phase the T22 numbers
+    /// attribute the first biome-prefab query's cost to) instead of inside
+    /// tier 2. The reply is cached under its rect and never adopted or drawn.
+    ///
+    /// Nothing is planned while the Prefabs group is disabled: the prewarm is
+    /// still a biome-prefab query, and the toggle contract says a disabled
+    /// group is never queried. Enabling it later re-arms the prewarm (the
+    /// flag is only set when a query is actually planned).
+    pub fn plan_prewarm_fetch(
+        &mut self,
+        view: &MapViewState,
+        settings: &OverlaySettings,
+    ) -> Option<FeatureFetch> {
+        if self.prewarm_requested || self.prewarm_in_flight.is_some() {
+            return None;
+        }
+        if !toggle_mask(settings).contains(FeatureToggleGroup::Prefabs) {
+            return None;
+        }
+        self.prewarm_requested = true;
+        let half = PREWARM_SIDE_BLOCKS / 2;
+        let center = view.center();
+        let (cx, cz) = (saturate_floor(center.x), saturate_floor(center.z));
+        Some(FeatureFetch {
+            rect: Rect::new(
+                cx.saturating_sub(half),
+                cz.saturating_sub(half),
+                cx.saturating_add(half - 1),
+                cz.saturating_add(half - 1),
+            ),
+            filter: FeatureFilter {
+                kinds: FeatureKindMask::from_kind(FeatureKind::BiomePrefab),
+                categories: None,
+                name_contains: None,
+                min_size: None,
+            },
+        })
+    }
+
+    /// Records the prewarm query and its reply channel.
+    pub fn begin_prewarm_fetch(
+        &mut self,
+        request: FeatureFetch,
+        receiver: Receiver<SourceResult<Vec<Feature>>>,
+    ) {
+        self.prewarm_in_flight = Some(InFlight {
+            receiver,
+            rect: request.rect,
+            filter: request.filter,
+        });
+    }
+
+    /// Drains the prewarm's reply: cached under its own small rect (free, and
+    /// reusable if the user later asks for exactly that rect) and never drawn.
+    pub fn poll_prewarm(&mut self, _now: Instant, _view: &MapViewState) -> FeatureReplyOutcome {
+        match poll_slot(&mut self.prewarm_in_flight) {
+            SlotPoll::Idle => FeatureReplyOutcome::Idle,
+            SlotPoll::Empty => FeatureReplyOutcome::Pending,
+            SlotPoll::Gone => FeatureReplyOutcome::WorkerDied,
+            SlotPoll::Reply {
+                rect,
+                filter,
+                result,
+            } => match result {
+                Ok(features) => {
+                    let catalog = Arc::new(FeatureCatalog::build(features));
+                    let count = catalog.len();
+                    self.cache.put(rect, filter, catalog);
+                    FeatureReplyOutcome::Applied(count)
+                }
+                Err(error) => FeatureReplyOutcome::Failed(error.to_string()),
+            },
+        }
+    }
+
+    /// Plans tier 2's query, if one is due:
+    ///
+    /// - a full query already in flight means wait (tier 1 and the prewarm
+    ///   never block it — they are separate slots);
     /// - an unsettled or already-served view means nothing;
     /// - an oversized desired rect means cache-only (marking the signature
     ///   served so the check does not repeat every frame);
-    /// - a cache hit adopts the cached catalog and counts as served;
+    /// - a cache hit adopts the cached catalog and counts as served (and may
+    ///   retire the quick tier, see [`Self::adopt`]);
     /// - otherwise the rect and kind filter are returned for the app to query.
     pub fn plan_fetch(
         &mut self,
@@ -478,7 +805,7 @@ impl FeatureOverlayState {
         view: &MapViewState,
         settings: &OverlaySettings,
     ) -> Option<FeatureFetch> {
-        if self.in_flight.is_some() {
+        if self.full_in_flight.is_some() {
             return None;
         }
         let signature = FeatureFetchPlanner::viewport_signature(view);
@@ -502,36 +829,42 @@ impl FeatureOverlayState {
         Some(FeatureFetch { rect, filter })
     }
 
-    /// Records `request` and its reply channel as the single in-flight fetch.
-    /// The caller has already spawned the worker that sends into `receiver`.
+    /// Records tier 2's query and its reply channel. The caller has already
+    /// spawned the worker that sends into `receiver`.
     pub fn begin_fetch(
         &mut self,
         request: FeatureFetch,
         receiver: Receiver<SourceResult<Vec<Feature>>>,
     ) {
-        self.in_flight = Some(receiver);
-        self.in_flight_rect = Some(request.rect);
-        self.in_flight_filter = Some(request.filter);
+        self.full_in_flight = Some(InFlight {
+            receiver,
+            rect: request.rect,
+            filter: request.filter,
+        });
     }
 
-    /// Polls the in-flight channel without blocking and applies a wanted reply.
+    /// Polls tier 2's channel without blocking and applies a wanted reply.
     ///
     /// A reply is wanted only while its rect still contains the current
     /// visible rect; otherwise it is [`FeatureReplyOutcome::Stale`] and never
     /// reaches the cache or the screen. `Ok` builds, caches and activates the
-    /// catalog; `Err` keeps the last catalog and reports the message.
+    /// catalog (retiring the quick tier when it covers it); `Err` keeps the
+    /// last catalog and reports the message.
     pub fn poll(&mut self, _now: Instant, view: &MapViewState) -> FeatureReplyOutcome {
-        let Some(receiver) = self.in_flight.as_ref() else {
-            return FeatureReplyOutcome::Idle;
-        };
-        match receiver.try_recv() {
-            Ok(result) => {
-                let rect = self.in_flight_rect.take();
-                let filter = self.in_flight_filter.take();
-                self.in_flight = None;
-                let Some(rect) = rect else {
-                    return FeatureReplyOutcome::Stale;
-                };
+        match poll_slot(&mut self.full_in_flight) {
+            SlotPoll::Idle => FeatureReplyOutcome::Idle,
+            SlotPoll::Empty => FeatureReplyOutcome::Pending,
+            SlotPoll::Gone => {
+                // Do not respawn every frame for a worker that died: treat
+                // this view as served until it moves.
+                self.fetched_signature = Some(FeatureFetchPlanner::viewport_signature(view));
+                FeatureReplyOutcome::WorkerDied
+            }
+            SlotPoll::Reply {
+                rect,
+                filter,
+                result,
+            } => {
                 let visible = FeatureFetchPlanner::visible_rect(view);
                 if !FeatureFetchPlanner::wants_reply(rect, visible) {
                     return FeatureReplyOutcome::Stale;
@@ -540,9 +873,7 @@ impl FeatureOverlayState {
                     Ok(features) => {
                         let catalog = Arc::new(FeatureCatalog::build(features));
                         let count = catalog.len();
-                        if let Some(filter) = filter {
-                            self.cache.put(rect, filter, Arc::clone(&catalog));
-                        }
+                        self.cache.put(rect, filter, Arc::clone(&catalog));
                         self.adopt(catalog, rect);
                         self.fetched_signature =
                             Some(FeatureFetchPlanner::viewport_signature(view));
@@ -559,42 +890,93 @@ impl FeatureOverlayState {
                     }
                 }
             }
-            Err(TryRecvError::Empty) => FeatureReplyOutcome::Pending,
-            Err(TryRecvError::Disconnected) => {
-                self.clear_in_flight();
-                // Do not respawn every frame for a worker that died: treat
-                // this view as served until it moves.
-                self.fetched_signature = Some(FeatureFetchPlanner::viewport_signature(view));
-                FeatureReplyOutcome::WorkerDied
-            }
         }
     }
 
-    /// Frees the in-flight slot without touching the catalog or cache.
+    /// Frees every in-flight slot without touching the catalogs or cache
+    /// (the no-source case: a reply must never reach the next world).
     pub fn cancel_fetch(&mut self) {
-        self.clear_in_flight();
+        self.full_in_flight = None;
+        self.quick_in_flight = None;
+        self.prewarm_in_flight = None;
     }
 
-    fn clear_in_flight(&mut self) {
-        self.in_flight = None;
-        self.in_flight_rect = None;
-        self.in_flight_filter = None;
-    }
-
+    /// Activates a full (tier 2) catalog and retires the quick tier when the
+    /// new rect covers it.
     fn adopt(&mut self, catalog: Arc<FeatureCatalog>, rect: Rect) {
         self.catalog = Some(catalog);
         self.catalog_rect = Some(rect);
+        self.drop_quick_if_covered();
     }
 
-    /// Drops the selection when the new catalog no longer contains it.
+    /// Tier-1 retirement: once the full rect covers the quick rect, the quick
+    /// features are a subset of the full catalog's — the T22 subset property
+    /// (a smaller rect's placements are exactly a subset of a larger one's) —
+    /// so dropping them loses nothing the draw list showed.
+    fn drop_quick_if_covered(&mut self) {
+        let (Some(full), Some(quick)) = (self.catalog_rect, self.quick_rect) else {
+            return;
+        };
+        if FeatureFetchPlanner::covers(full, quick) {
+            self.quick = None;
+            self.quick_rect = None;
+        }
+    }
+
+    /// The frame's draw catalog: both tiers' enabled-group features, deduped
+    /// by `(kind, name, position)` through [`FeatureCatalog::build`] — the
+    /// same identity the selection uses, so a quick marker stays clickable
+    /// after the full tier lands.
+    ///
+    /// Memoized: `map_view` asks once per frame and a tier-2 catalog can hold
+    /// thousands of features, so the union is rebuilt only when one of the
+    /// catalogs or the toggle mask changed. Returns [`None`] while neither
+    /// tier has a catalog.
+    pub fn draw_catalog(&mut self, mask: FeatureToggleMask) -> Option<Arc<FeatureCatalog>> {
+        if self.catalog.is_none() && self.quick.is_none() {
+            return None;
+        }
+        if let Some(draw) = &self.draw
+            && draw.mask == mask
+            && same_catalog(&draw.full, &self.catalog)
+            && same_catalog(&draw.quick, &self.quick)
+        {
+            return Some(Arc::clone(&draw.catalog));
+        }
+        let mut features = Vec::new();
+        // Quick first: `build` keeps the first occurrence, so a cheap
+        // feature's entry survives the merge unchanged.
+        for catalog in [self.quick.as_ref(), self.catalog.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            features.extend(
+                catalog
+                    .features()
+                    .iter()
+                    .filter(|feature| mask.contains(group_for(feature)))
+                    .cloned(),
+            );
+        }
+        let catalog = Arc::new(FeatureCatalog::build(features));
+        self.draw = Some(DrawCache {
+            mask,
+            quick: self.quick.clone(),
+            full: self.catalog.clone(),
+            catalog: Arc::clone(&catalog),
+        });
+        Some(catalog)
+    }
+
+    /// Drops the selection when neither catalog contains it any more.
     fn prune_selection(&mut self) {
         let Some(key) = &self.selected else {
             return;
         };
-        let present = self
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.features().iter().any(|f| key_matches(key, f)));
+        let present = [self.quick.as_ref(), self.catalog.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|catalog| catalog.features().iter().any(|f| key_matches(key, f)));
         if !present {
             self.selected = None;
             self.flash_until = None;
@@ -603,6 +985,55 @@ impl FeatureOverlayState {
 
     fn elapsed_ms(&self, now: Instant) -> u64 {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// The tier-1 mask for `settings`: the cheap kinds whose group is enabled.
+fn quick_kinds(settings: &OverlaySettings) -> FeatureKindMask {
+    let cheap = cheap_kind_mask();
+    let enabled = fetch_filter(settings).kinds;
+    [
+        FeatureKind::Spawn,
+        FeatureKind::Poi,
+        FeatureKind::UniquePrefab,
+    ]
+    .into_iter()
+    .filter(|kind| cheap.contains(*kind) && enabled.contains(*kind))
+    .fold(FeatureKindMask(0), |mask, kind| {
+        mask.union(FeatureKindMask::from_kind(kind))
+    })
+}
+
+/// One non-blocking poll of an in-flight slot, freeing it on a reply or a
+/// dead worker.
+fn poll_slot(slot: &mut Option<InFlight>) -> SlotPoll {
+    let Some(in_flight) = slot.as_ref() else {
+        return SlotPoll::Idle;
+    };
+    match in_flight.receiver.try_recv() {
+        Ok(result) => {
+            let in_flight = slot.take().expect("the slot was checked above");
+            SlotPoll::Reply {
+                rect: in_flight.rect,
+                filter: in_flight.filter,
+                result,
+            }
+        }
+        Err(TryRecvError::Empty) => SlotPoll::Empty,
+        Err(TryRecvError::Disconnected) => {
+            *slot = None;
+            SlotPoll::Gone
+        }
+    }
+}
+
+/// Whether two optional catalog handles are the same catalog. Catalogs are
+/// immutable once built, so pointer identity is the change check.
+fn same_catalog(a: &Option<Arc<FeatureCatalog>>, b: &Option<Arc<FeatureCatalog>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1265,7 +1696,13 @@ mod tests {
         state.cache.put(rect, filter.clone(), Arc::clone(&catalog));
         state.adopt(Arc::clone(&catalog), rect);
         state.select(&catalog.features()[0], Instant::now());
+        // Both tiers and both one-shot flags are live before the change.
+        state.quick = Some(Arc::clone(&catalog));
+        state.quick_rect = Some(rect);
+        state.quick_requested = true;
+        state.prewarm_requested = true;
         assert!(state.catalog().is_some());
+        assert!(state.quick_catalog().is_some());
 
         state.set_source(&GeneratorIdentity {
             generator_version: 2,
@@ -1274,11 +1711,26 @@ mod tests {
         });
         assert!(state.catalog().is_none(), "the old catalog is gone");
         assert_eq!(state.catalog_rect(), None);
+        assert!(
+            state.quick_catalog().is_none(),
+            "the old quick catalog is gone too"
+        );
+        assert_eq!(state.quick_rect(), None);
+        assert!(!state.has_fetch_in_flight(), "every slot was reset");
+        assert!(
+            state.draw_catalog(FeatureToggleMask::all()).is_none(),
+            "no marker survives the source change"
+        );
         assert!(state.selected_key().is_none());
         assert!(
             state.cache.get(rect, &filter).is_none(),
             "the old world's cached query is gone"
         );
+
+        // The new source re-arms both one-shot tiers.
+        let view = view_at((0.0, 0.0), 0.0, 400.0, 300.0);
+        assert!(state.plan_quick_fetch(&view, &all_settings()).is_some());
+        assert!(state.plan_prewarm_fetch(&view, &all_settings()).is_some());
     }
 
     #[test]
@@ -1343,5 +1795,335 @@ mod tests {
                 .is_some(),
             "the moved view fetches once settled"
         );
+    }
+
+    // -- The two tiers (T22's cheap kinds vs the full fetch) -------------------
+
+    #[test]
+    fn features_quick_tier_is_immediate_and_cheap_kinds_over_the_visible_rect() {
+        let mut state = FeatureOverlayState::new();
+        let settings = all_settings();
+        let view = view_at((0.0, 0.0), 0.0, 400.0, 300.0);
+
+        // The first frame of a source fires tier 1 with no debounce at all,
+        // over the visible rect only.
+        let request = state
+            .plan_quick_fetch(&view, &settings)
+            .expect("a fresh source fires tier 1 immediately");
+        assert_eq!(
+            request.rect,
+            FeatureFetchPlanner::visible_rect(&view),
+            "no margin on the quick tier"
+        );
+        assert_eq!(
+            request.filter.kinds,
+            cheap_kind_mask(),
+            "only the kinds whose enumeration skips the placement pass"
+        );
+        assert!(
+            !request.filter.kinds.contains(FeatureKind::BiomePrefab),
+            "biome prefabs are the expensive tier-2 kind"
+        );
+        assert!(!request.filter.kinds.contains(FeatureKind::CaveEntrance));
+
+        // Tier 2 is still inside its settle window at the same instant.
+        assert!(
+            state.plan_fetch(Instant::now(), &view, &settings).is_none(),
+            "the full tier keeps its debounce"
+        );
+        assert!(
+            state.plan_quick_fetch(&view, &settings).is_none(),
+            "tier 1 fires once per source"
+        );
+
+        // A disabled cheap group is never queried, keeping the toggle
+        // contract (draw-time filter first, fetch mask second).
+        let mut spawn_off = settings;
+        spawn_off.spawn = false;
+        let mut filtered = FeatureOverlayState::new();
+        let request = filtered
+            .plan_quick_fetch(&view, &spawn_off)
+            .expect("the other cheap kinds are still enabled");
+        assert!(!request.filter.kinds.contains(FeatureKind::Spawn));
+        assert!(request.filter.kinds.contains(FeatureKind::Poi));
+        assert!(request.filter.kinds.contains(FeatureKind::UniquePrefab));
+    }
+
+    #[test]
+    fn features_full_tier_keeps_the_debounce_margin_and_cap() {
+        let mut state = FeatureOverlayState::new();
+        let settings = all_settings();
+        let view = view_at((0.0, 0.0), 0.0, 800.0, 600.0);
+        let t0 = Instant::now() + Duration::from_secs(1);
+
+        // Tier 1 firing does not move tier 2's settle window.
+        assert!(state.plan_quick_fetch(&view, &settings).is_some());
+        state.observe(t0, &view);
+        assert!(
+            state.plan_fetch(t0, &view, &settings).is_none(),
+            "the full tier waits for the debounce"
+        );
+
+        let settled = t0 + Duration::from_millis(SETTLE_DEBOUNCE_MS + 1);
+        let request = state
+            .plan_fetch(settled, &view, &settings)
+            .expect("the settled view plans the full fetch");
+        assert_eq!(
+            request.rect,
+            FeatureFetchPlanner::desired_rect(&view, FeatureFetchPlanner::margin_blocks(&view)),
+            "the full tier keeps its margin-expanded rect"
+        );
+        let visible = FeatureFetchPlanner::visible_rect(&view);
+        assert!(
+            request.rect.min_x < visible.min_x && request.rect.max_x > visible.max_x,
+            "the margin reaches past the view on both sides"
+        );
+        assert!(
+            !FeatureFetchPlanner::oversized(&request.rect),
+            "the default window's full rect stays under the cap"
+        );
+        assert_eq!(
+            request.filter.kinds,
+            FeatureKindMask::ALL,
+            "the full tier carries every enabled kind"
+        );
+
+        // The zoomed-out view stays cache-only, as T23 shipped it.
+        let far = view_at((0.0, 0.0), 20.0, 800.0, 600.0);
+        let mut far_state = FeatureOverlayState::new();
+        far_state.observe(t0, &far);
+        assert!(
+            far_state
+                .plan_fetch(
+                    t0 + Duration::from_millis(SETTLE_DEBOUNCE_MS + 1),
+                    &far,
+                    &settings
+                )
+                .is_none(),
+            "an oversized full rect is still skipped"
+        );
+    }
+
+    #[test]
+    fn features_full_catalog_drops_the_quick_one_when_it_covers_it() {
+        let mut state = FeatureOverlayState::new();
+        let settings = all_settings();
+        let view = view_at((0.0, 0.0), 0.0, 800.0, 600.0);
+        let spawn = feature(FeatureKind::Spawn, "Spawn", "Spawn", (0, 0, 0));
+
+        // Tier 1 lands: the cheap marker is drawable immediately.
+        let quick_request = state
+            .plan_quick_fetch(&view, &settings)
+            .expect("tier 1 fires");
+        let (sender, receiver) = mpsc::channel();
+        state.begin_quick_fetch(quick_request.clone(), receiver);
+        sender
+            .send(Ok(vec![spawn.clone()]))
+            .expect("the quick receiver is alive");
+        assert_eq!(
+            state.poll_quick(Instant::now(), &view),
+            FeatureReplyOutcome::Applied(1)
+        );
+        assert_eq!(state.quick_catalog().map(FeatureCatalog::len), Some(1));
+        assert_eq!(state.quick_rect(), Some(quick_request.rect));
+
+        // Tier 2 lands for the same view: its margin-expanded rect covers the
+        // quick rect, so the quick catalog is a subset and is dropped.
+        let t0 = Instant::now() + Duration::from_secs(1);
+        state.observe(t0, &view);
+        let settled = t0 + Duration::from_millis(SETTLE_DEBOUNCE_MS + 1);
+        let full_request = state
+            .plan_fetch(settled, &view, &settings)
+            .expect("tier 2 is due");
+        let (sender, receiver) = mpsc::channel();
+        state.begin_fetch(full_request, receiver);
+        sender
+            .send(Ok(vec![
+                spawn,
+                feature(FeatureKind::BiomePrefab, "Hut", "Biome", (10, 0, 10)),
+            ]))
+            .expect("the full receiver is alive");
+        assert_eq!(state.poll(settled, &view), FeatureReplyOutcome::Applied(2));
+        assert_eq!(state.catalog().map(FeatureCatalog::len), Some(2));
+        assert!(
+            state.quick_catalog().is_none(),
+            "the covering full catalog supersedes the quick one"
+        );
+        assert_eq!(state.quick_rect(), None);
+    }
+
+    #[test]
+    fn features_draw_catalog_unions_and_dedupes_both_tiers() {
+        let mut state = FeatureOverlayState::new();
+        let shared = feature(FeatureKind::UniquePrefab, "Temple", "Unique", (0, 0, 0));
+        let hut = feature(FeatureKind::BiomePrefab, "Hut", "Biome", (5, 0, 0));
+        let spawn = feature(FeatureKind::Spawn, "Spawn", "Spawn", (1, 0, 1));
+        let full = Arc::new(FeatureCatalog::build(vec![shared.clone(), hut.clone()]));
+        let quick = Arc::new(FeatureCatalog::build(vec![shared, spawn.clone()]));
+        state.adopt(Arc::clone(&full), Rect::new(-100, -100, 100, 100));
+        state.quick = Some(Arc::clone(&quick));
+        state.quick_rect = Some(Rect::new(-100, -100, 100, 100));
+
+        // The union: three features, `Temple` once (present in both).
+        let drawn = state
+            .draw_catalog(FeatureToggleMask::all())
+            .expect("both tiers contribute");
+        let mut names: Vec<&str> = drawn.features().iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Hut", "Spawn", "Temple"]);
+
+        // Memoized: the same inputs hand back the same catalog handle.
+        let again = state
+            .draw_catalog(FeatureToggleMask::all())
+            .expect("still drawable");
+        assert!(
+            Arc::ptr_eq(&drawn, &again),
+            "an unchanged frame reuses the union"
+        );
+
+        // The mask filters both tiers: spawn only draws the spawn marker.
+        let spawn_only = state
+            .draw_catalog(FeatureToggleMask::from_group(FeatureToggleGroup::Spawn))
+            .expect("the spawn tier still draws");
+        assert_eq!(spawn_only.len(), 1);
+        assert_eq!(spawn_only.features()[0].name, "Spawn");
+
+        // A new full catalog invalidates the memo; the quick tier keeps
+        // contributing until it is dropped.
+        let replacement = Arc::new(FeatureCatalog::build(vec![hut]));
+        state.catalog = Some(replacement);
+        let redrawn = state
+            .draw_catalog(FeatureToggleMask::all())
+            .expect("still drawable");
+        assert!(!Arc::ptr_eq(&drawn, &redrawn), "the union was rebuilt");
+        let mut names: Vec<&str> = redrawn.features().iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Hut", "Spawn", "Temple"]);
+
+        // Retiring the quick tier leaves only the full catalog's features.
+        state.quick = None;
+        state.quick_rect = None;
+        let full_only = state
+            .draw_catalog(FeatureToggleMask::all())
+            .expect("the full tier still draws");
+        assert_eq!(full_only.len(), 1);
+        assert_eq!(full_only.features()[0].name, "Hut");
+    }
+
+    #[test]
+    fn features_prewarm_query_is_issued_once_per_source() {
+        let mut state = FeatureOverlayState::new();
+        let view = view_at((123.0, -456.0), 0.0, 800.0, 600.0);
+
+        let request = state
+            .plan_prewarm_fetch(&view, &all_settings())
+            .expect("the first frame of a source prewarms");
+        assert_eq!(
+            request.rect.max_x - request.rect.min_x + 1,
+            PREWARM_SIDE_BLOCKS,
+            "a tiny centred rect"
+        );
+        assert_eq!(
+            request.rect.max_z - request.rect.min_z + 1,
+            PREWARM_SIDE_BLOCKS
+        );
+        assert!(
+            request.rect.min_x <= 123 && 123 <= request.rect.max_x,
+            "centred on the view"
+        );
+        assert_eq!(
+            request.filter.kinds,
+            FeatureKindMask::from_kind(FeatureKind::BiomePrefab),
+            "the prewarm loads the prefab buffers tier 2 will need"
+        );
+        assert!(
+            state.plan_prewarm_fetch(&view, &all_settings()).is_none(),
+            "once per source ready"
+        );
+
+        // A disabled Prefabs group is never queried, prewarm included; the
+        // flag stays unarmed so enabling it later prewarms lazily.
+        let mut prefabs_off = all_settings();
+        prefabs_off.prefabs = false;
+        assert!(
+            state.plan_prewarm_fetch(&view, &prefabs_off).is_none(),
+            "the toggle contract covers the invisible prewarm"
+        );
+        assert!(
+            state.plan_prewarm_fetch(&view, &all_settings()).is_none(),
+            "a disabled prewarm did not re-arm the flag"
+        );
+        let mut fresh = FeatureOverlayState::new();
+        assert!(fresh.plan_prewarm_fetch(&view, &prefabs_off).is_none());
+        assert!(
+            fresh.plan_prewarm_fetch(&view, &all_settings()).is_some(),
+            "enabling Prefabs arms the prewarm"
+        );
+
+        // Its reply only fills the query cache: nothing is adopted or drawn.
+        let (sender, receiver) = mpsc::channel();
+        state.begin_prewarm_fetch(request.clone(), receiver);
+        sender
+            .send(Ok(vec![feature(
+                FeatureKind::BiomePrefab,
+                "Hut",
+                "Biome",
+                (125, 0, -455),
+            )]))
+            .expect("the prewarm receiver is alive");
+        assert_eq!(
+            state.poll_prewarm(Instant::now(), &view),
+            FeatureReplyOutcome::Applied(1)
+        );
+        assert!(state.catalog().is_none(), "the prewarm is never adopted");
+        assert!(state.quick_catalog().is_none());
+        assert!(
+            state.cache.get(request.rect, &request.filter).is_some(),
+            "its catalog is cached under its own rect"
+        );
+
+        // A source change re-arms it.
+        state.set_source(&GeneratorIdentity {
+            generator_version: 3,
+            world_assets: "Default/0.0.1".to_string(),
+            palette_version: 1,
+        });
+        assert!(
+            state.plan_prewarm_fetch(&view, &all_settings()).is_some(),
+            "the next source prewarms again"
+        );
+    }
+
+    #[test]
+    fn features_status_hint_tracks_every_in_flight_tier() {
+        let mut state = FeatureOverlayState::new();
+        let view = view_at((0.0, 0.0), 0.0, 400.0, 300.0);
+        assert_eq!(state.status_hint(), None, "idle says nothing");
+
+        let request = state
+            .plan_quick_fetch(&view, &all_settings())
+            .expect("tier 1 fires");
+        let (_sender, receiver) = mpsc::channel();
+        state.begin_quick_fetch(request, receiver);
+        assert_eq!(
+            state.status_hint(),
+            Some(labels::STATUS_FEATURES_GENERATING),
+            "the status bar reports the quick fetch too"
+        );
+
+        // A prewarm alone keeps the line up; freeing the slots clears it.
+        let prewarm = state
+            .plan_prewarm_fetch(&view, &all_settings())
+            .expect("the prewarm fires");
+        state.cancel_fetch();
+        let (_sender, receiver) = mpsc::channel();
+        state.begin_prewarm_fetch(prewarm, receiver);
+        assert!(state.has_fetch_in_flight());
+        assert_eq!(
+            state.status_hint(),
+            Some(labels::STATUS_FEATURES_GENERATING)
+        );
+        state.cancel_fetch();
+        assert_eq!(state.status_hint(), None);
     }
 }

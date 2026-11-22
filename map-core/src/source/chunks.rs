@@ -6,8 +6,11 @@
 //! fluids — measured in the T01 audit §1); a 256×256-block tile would retain
 //! ~420 MiB if chunks were kept whole. A [`ChunkSummary`] is ~22 KB and
 //! serves every resolution step (summaries are keyed by chunk, never by
-//! step). Slices are extracted on demand into a separate small cache keyed
-//! by `(chunk, y)`.
+//! step). Caches are namespaced by [`SummaryFidelity`](crate::source::SummaryFidelity)
+//! since T29: a surface-only summary (caves/prefabs skipped) can never
+//! answer a full-fidelity request. Slices are extracted on demand into a
+//! separate small cache keyed by `(chunk, y)` and are always full-fidelity
+//! (T28's cave slices need real caves).
 //!
 //! Extraction definitions (documented so T17/T20/T21 can rely on them):
 //!
@@ -26,6 +29,7 @@ use std::sync::Arc;
 
 use worldgen_model::chunk::GeneratedChunk;
 
+use crate::source::SummaryFidelity;
 use crate::types::{BlockId, FluidId, SliceCell};
 
 /// Chunk edge in blocks (the generator's `ChunkUtil.SIZE`).
@@ -65,6 +69,21 @@ pub struct ChunkKey {
 pub struct SliceKey {
     pub chunk: ChunkKey,
     pub y: i32,
+}
+
+/// Cache key for a chunk summary: the chunk plus the fidelity it was
+/// generated at (T29).
+///
+/// The fidelity is part of the key on purpose: a [`SummaryFidelity::SurfaceOnly`]
+/// summary skips caves and prefabs, so it must never satisfy a
+/// [`SummaryFidelity::Full`] request. Same chunk, two fidelities → two
+/// entries. [`ChunkKey`] keeps its identity-only meaning for the slice
+/// cache; slices are always extracted from a full generation (T28's cave
+/// slices need real caves).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SummaryKey {
+    pub chunk: ChunkKey,
+    pub fidelity: SummaryFidelity,
 }
 
 /// Compact per-chunk surface data; the column layout is row-major
@@ -220,7 +239,7 @@ pub fn extract_slice(chunk: &GeneratedChunk, y: i32) -> ChunkSlice {
 }
 
 /// The summary cache: byte-weighed (capacity is a bytes budget).
-pub type SummaryCache = moka::sync::Cache<ChunkKey, Arc<ChunkSummary>>;
+pub type SummaryCache = moka::sync::Cache<SummaryKey, Arc<ChunkSummary>>;
 
 /// The slice cache: entry-weighed (a small "last few Y values" cache).
 pub type SliceCache = moka::sync::Cache<SliceKey, ChunkSlice>;
@@ -291,5 +310,57 @@ mod tests {
         assert_eq!(local_of(-382), 2);
         assert_eq!(chunk_of(963), 30);
         assert_eq!(local_of(963), 3);
+    }
+
+    fn empty_summary(cx: i32, cz: i32) -> ChunkSummary {
+        ChunkSummary {
+            cx,
+            cz,
+            height: [-1; COLUMNS],
+            block: [BlockId(0); COLUMNS],
+            fluid: [FluidId(0); COLUMNS],
+            fluid_depth: [0; COLUMNS],
+            tint: [0; COLUMNS],
+            environment: [0; COLUMNS],
+            cave_cells: [0; COLUMNS],
+        }
+    }
+
+    /// T29's correctness core: the summary cache namespaces by fidelity, so
+    /// a surface-only entry can never satisfy a full request on the same
+    /// chunk. Same chunk, two fidelities → two entries.
+    #[test]
+    fn fidelity_surface_only_summary_never_serves_a_full_request() {
+        let cache = summary_cache(8 * 1024 * 1024);
+        let chunk = ChunkKey {
+            identity: 0xDEAD_BEEF,
+            generator_seed: 7,
+            cx: 3,
+            cz: -2,
+        };
+        let surface = SummaryKey {
+            chunk: chunk.clone(),
+            fidelity: SummaryFidelity::SurfaceOnly,
+        };
+        let full = SummaryKey {
+            chunk: chunk.clone(),
+            fidelity: SummaryFidelity::Full,
+        };
+
+        cache.insert(surface.clone(), Arc::new(empty_summary(3, -2)));
+        assert!(cache.get(&surface).is_some(), "the surface-only entry hits");
+        assert!(
+            cache.get(&full).is_none(),
+            "a surface-only summary must never satisfy a full request"
+        );
+
+        cache.insert(full.clone(), Arc::new(empty_summary(3, -2)));
+        cache.run_pending_tasks();
+        assert!(cache.get(&full).is_some(), "the full entry hits on its own");
+        assert!(
+            cache.get(&surface).is_some(),
+            "the two fidelities coexist as separate entries"
+        );
+        assert_eq!(cache.entry_count(), 2, "one entry per fidelity");
     }
 }

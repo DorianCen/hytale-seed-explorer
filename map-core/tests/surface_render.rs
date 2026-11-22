@@ -33,8 +33,8 @@ use map_core::error::SourceError;
 use map_core::palette::BlockPalette;
 use map_core::render::{Layer, SurfaceOptions, SurfaceTileRenderer, surface_color};
 use map_core::scheduler::{CancelToken, TileRenderer, TileSubject, cancel_token};
-use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::tiles::TileKey;
 use map_core::types::Rect;
 
@@ -74,7 +74,7 @@ mod fake_surface {
     use map_core::render::tiles::LayeredTileRenderer;
     use map_core::render::{Layer, SurfaceOptions, surface_color, tint_rgb};
     use map_core::scheduler::{CancelToken, TileRenderer, TileSubject};
-    use map_core::source::WorldSource;
+    use map_core::source::{SummaryFidelity, WorldSource};
     use map_core::test_support::FakeWorldSource;
     use map_core::tiles::{Tile, TileKey};
     use map_core::types::{BiomeId, BlockId, Rect, SurfaceGrid, SurfaceSample};
@@ -135,8 +135,13 @@ mod fake_surface {
     }
 
     fn render_surface_tile(renderer: &LayeredTileRenderer) -> Tile {
-        TileRenderer::render(renderer, &key(Layer::Surface, 0, 0), &cancel_token())
-            .expect("the fake renders any tile instantly")
+        TileRenderer::render(
+            renderer,
+            &key(Layer::Surface, 0, 0),
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("the fake renders any tile instantly")
     }
 
     #[test]
@@ -149,7 +154,7 @@ mod fake_surface {
         assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
 
         let grid = fake
-            .surface_region(tile_rect_at(0, 0), 1)
+            .surface_region(tile_rect_at(0, 0), 1, SummaryFidelity::Full)
             .expect("the fake serves any rect");
         let catalog = fake.block_catalog();
         for y in 0..TILE_SIZE {
@@ -192,7 +197,7 @@ mod fake_surface {
         let tile = render_surface_tile(&renderer(&fake, &palette, false));
 
         let grid = fake
-            .surface_region(tile_rect_at(0, 0), 1)
+            .surface_region(tile_rect_at(0, 0), 1, SummaryFidelity::Full)
             .expect("the fake serves any rect");
         let catalog = fake.block_catalog();
         for y in 0..TILE_SIZE {
@@ -232,7 +237,7 @@ mod fake_surface {
         let tile = render_surface_tile(&renderer(&fake, &palette, false));
 
         let grid = fake
-            .surface_region(tile_rect_at(0, 0), 1)
+            .surface_region(tile_rect_at(0, 0), 1, SummaryFidelity::Full)
             .expect("the fake serves any rect");
         let catalog = fake.block_catalog();
         let sample = &grid.samples[0];
@@ -409,12 +414,23 @@ mod fake_surface {
         let renderer = renderer(&fake, &palette, false);
         let cancelled: CancelToken = Arc::new(AtomicBool::new(true));
         assert_eq!(
-            TileRenderer::render(&renderer, &key(Layer::Surface, 0, 0), &cancelled),
+            TileRenderer::render(
+                &renderer,
+                &key(Layer::Surface, 0, 0),
+                &cancelled,
+                SummaryFidelity::Full
+            ),
             Err(SourceError::Cancelled),
             "a cancelled surface tile never begins its work unit",
         );
         assert!(
-            TileRenderer::render(&renderer, &key(Layer::Surface, 0, 0), &cancel_token()).is_ok(),
+            TileRenderer::render(
+                &renderer,
+                &key(Layer::Surface, 0, 0),
+                &cancel_token(),
+                SummaryFidelity::Full
+            )
+            .is_ok(),
             "an uncancelled surface tile renders normally",
         );
     }
@@ -445,11 +461,16 @@ fn surface_render_real_tile_matches_the_fixture_blocks() {
             hillshade: false,
         },
     );
-    let tile = TileRenderer::render(&renderer, &key(Layer::Surface, 0, 0), &cancel_token())
-        .expect("the fixture tile renders");
+    let tile = TileRenderer::render(
+        &renderer,
+        &key(Layer::Surface, 0, 0),
+        &cancel_token(),
+        SummaryFidelity::Full,
+    )
+    .expect("the fixture tile renders");
 
     let grid = source
-        .surface_region(world, 1)
+        .surface_region(world, 1, SummaryFidelity::Full)
         .expect("the fixture surface region succeeds");
     let catalog = source.block_catalog();
     let sample = &grid.samples[0];
@@ -506,7 +527,12 @@ fn surface_region_cancelled_returns_before_generating() {
     // A pre-armed token: the per-chunk gate fires on the first iteration,
     // so even a 256-chunk request returns without generating anything.
     let started = Instant::now();
-    let result = source.surface_region_cancelled(Rect::from_dims(0, 0, 512, 512), 1, &cancel);
+    let result = source.surface_region_cancelled(
+        Rect::from_dims(0, 0, 512, 512),
+        1,
+        &cancel,
+        SummaryFidelity::Full,
+    );
     let elapsed = started.elapsed();
     assert_eq!(
         result,
@@ -521,7 +547,7 @@ fn surface_region_cancelled_returns_before_generating() {
     // The plain query is unaffected by the external token — it re-arms its
     // own and serves normally.
     let grid = source
-        .surface_region(Rect::from_dims(0, 0, 1, 1), 1)
+        .surface_region(Rect::from_dims(0, 0, 1, 1), 1, SummaryFidelity::Full)
         .expect("the source still serves a tiny region after a caller cancel");
     assert_eq!((grid.width, grid.height), (1, 1));
 }
@@ -570,7 +596,8 @@ fn surface_bench_step_one_tiles_cold_warm_and_worker_scaling() {
         // Tile (0, 0) at step 1 covers blocks 0..=255: 8×8 chunks, 64 in
         // total (the border-0 query — hillshade off — adds no ring chunk).
         let cold_started = Instant::now();
-        let cold_result = TileRenderer::render(&renderer, &key, &cancel_token());
+        let cold_result =
+            TileRenderer::render(&renderer, &key, &cancel_token(), SummaryFidelity::Full);
         let cold = cold_started.elapsed().as_secs_f64();
         if let Err(error) = cold_result {
             eprintln!("skipping the full-block benchmark: cold tile failed: {error}");
@@ -579,7 +606,8 @@ fn surface_bench_step_one_tiles_cold_warm_and_worker_scaling() {
 
         // The summary cache is per source, so the immediate repeat is warm.
         let warm_started = Instant::now();
-        let warm_result = TileRenderer::render(&renderer, &key, &cancel_token());
+        let warm_result =
+            TileRenderer::render(&renderer, &key, &cancel_token(), SummaryFidelity::Full);
         let warm = warm_started.elapsed().as_secs_f64();
         if let Err(error) = warm_result {
             eprintln!("skipping the full-block benchmark: warm tile failed: {error}");

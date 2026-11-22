@@ -21,7 +21,7 @@ use crate::error::{SourceError, SourceResult};
 use crate::render::height::height_color;
 use crate::render::tiles::render_layer_tile;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{HeightGrid, Rect};
 
@@ -172,15 +172,22 @@ impl ReliefTileRenderer {
 }
 
 impl TileRenderer for ReliefTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         // Border 1: the shading at the tile edge needs the neighbour
         // sample beyond it, and the plan clips that ring at the world
         // edge. The patch is canvas-true (TILE_SIZE square at (0, 0)):
-        // the ring is read, never painted.
+        // the ring is read, never painted. Relief reads the direct height
+        // query, not summaries, so the pass fidelity does not apply.
         render_layer_tile(
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             1,
             |source, rect, step, _cancel| source.height_region(rect, step),

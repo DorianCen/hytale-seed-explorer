@@ -15,6 +15,7 @@
 //! their scheduler workers. Both retire through lists the app drains
 //! each frame and drops on detached background threads.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -23,12 +24,12 @@ use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, Tex
 
 use map_core::source::FeatureSource;
 use map_core::source::WorldSource;
-use map_core::source::worldgen::default_world_path;
+use map_core::source::worldgen::{WorldgenSource, default_world_path};
 
 use crate::inspector::{self, HoverKnowledge, HoverReply, Readout};
 use crate::labels;
 use crate::map_view::MapView;
-use crate::overlays::features::FeatureReplyOutcome;
+use crate::overlays::features::{FeatureFetch, FeatureReplyOutcome};
 use crate::state::{
     self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, layer_label, offers_layer,
 };
@@ -44,6 +45,15 @@ const HOVER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// query itself runs for seconds-to-minutes on its worker; this only makes
 /// the reply land promptly instead of at the next input event.
 const FEATURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Which overlay slot a spawned query feeds: the immediate cheap tier, the
+/// invisible biome-prefab prewarm, or the debounced full tier.
+#[derive(Debug, Clone, Copy)]
+enum FeatureQuery {
+    Quick,
+    Prewarm,
+    Full,
+}
 
 /// The egui app: headless state plus the UI wiring.
 pub struct SeedExplorerApp {
@@ -246,10 +256,14 @@ impl SeedExplorerApp {
 
     // -- Feature overlay (T23) ------------------------------------------------
 
-    /// Polls a finished feature query, then plans and spawns at most one new
-    /// query for the settled viewport. `features_in` is synchronous and can
-    /// block a worker for minutes on a large rect, so the UI thread only ever
-    /// sees the channel.
+    /// Polls a finished feature query, then plans and spawns the tier queries
+    /// that are due. `features_in` is synchronous and can block a worker for
+    /// minutes on a large rect, so the UI thread only ever sees the channel.
+    ///
+    /// Three independent slots: tier 1 (cheap kinds, immediate, once per
+    /// source), the invisible biome-prefab prewarm (once per source), and
+    /// tier 2 (the debounced full fetch). They never wait on each other; the
+    /// generator pool serializes the actual work.
     fn drive_feature_overlay(&mut self, ctx: &Context) {
         self.poll_feature_reply();
         let now = Instant::now();
@@ -259,18 +273,18 @@ impl SeedExplorerApp {
             let view = *self.state.view();
             let settings = *self.state.overlays();
             self.state.features_mut().observe(now, &view);
+            if let Some(request) = self.state.features_mut().plan_quick_fetch(&view, &settings) {
+                self.spawn_feature_query(Arc::clone(&source), request, FeatureQuery::Quick);
+            }
+            if let Some(request) = self
+                .state
+                .features_mut()
+                .plan_prewarm_fetch(&view, &settings)
+            {
+                self.spawn_feature_query(Arc::clone(&source), request, FeatureQuery::Prewarm);
+            }
             if let Some(request) = self.state.features_mut().plan_fetch(now, &view, &settings) {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                let filter = request.filter.clone();
-                let rect = request.rect;
-                self.state.features_mut().begin_fetch(request, receiver);
-                // The thread owns one Arc<WorldgenSource>; if the UI drops
-                // the receiver (source change), its send fails and the Arc
-                // drops HERE, off the UI thread — the retirement pattern.
-                std::thread::spawn(move || {
-                    let result = source.features_in(rect, &filter);
-                    let _ = sender.send(result);
-                });
+                self.spawn_feature_query(source, request, FeatureQuery::Full);
             }
         } else {
             // No world: a query cannot be wanted, and its reply (were one
@@ -282,24 +296,65 @@ impl SeedExplorerApp {
         }
     }
 
-    /// Applies one reply from the in-flight feature query, keeping the last
-    /// catalog on failure. A stale reply is dropped silently (the next frame
-    /// re-plans for the current view).
+    /// Spawns one feature query on its own thread and records its reply
+    /// channel in the matching tier slot.
+    ///
+    /// The thread owns one `Arc<WorldgenSource>`; if the UI drops the
+    /// receiver (source change), its send fails and the Arc drops HERE, off
+    /// the UI thread — the retirement pattern. The prewarm's result only warms
+    /// the generator's prefab buffers and lands in the query cache.
+    fn spawn_feature_query(
+        &mut self,
+        source: Arc<WorldgenSource>,
+        request: FeatureFetch,
+        query: FeatureQuery,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let filter = request.filter.clone();
+        let rect = request.rect;
+        match query {
+            FeatureQuery::Quick => self
+                .state
+                .features_mut()
+                .begin_quick_fetch(request, receiver),
+            FeatureQuery::Prewarm => {
+                self.state
+                    .features_mut()
+                    .begin_prewarm_fetch(request, receiver);
+            }
+            FeatureQuery::Full => self.state.features_mut().begin_fetch(request, receiver),
+        }
+        std::thread::spawn(move || {
+            let result = source.features_in(rect, &filter);
+            let _ = sender.send(result);
+        });
+    }
+
+    /// Applies one reply from each in-flight feature query, keeping the last
+    /// catalog on failure. A stale tier-2 reply is dropped silently (the next
+    /// frame re-plans for the current view).
     fn poll_feature_reply(&mut self) {
         let now = Instant::now();
         let view = *self.state.view();
-        match self.state.features_mut().poll(now, &view) {
-            FeatureReplyOutcome::Failed(message) => {
-                self.state
-                    .set_status(format!("{}: {message}", labels::STATUS_FEATURE_ERROR));
+        let outcomes = [
+            self.state.features_mut().poll(now, &view),
+            self.state.features_mut().poll_quick(now, &view),
+            self.state.features_mut().poll_prewarm(now, &view),
+        ];
+        for outcome in outcomes {
+            match outcome {
+                FeatureReplyOutcome::Failed(message) => {
+                    self.state
+                        .set_status(format!("{}: {message}", labels::STATUS_FEATURE_ERROR));
+                }
+                FeatureReplyOutcome::WorkerDied => {
+                    self.state.set_status(labels::STATUS_FEATURE_WORKER_DIED);
+                }
+                FeatureReplyOutcome::Idle
+                | FeatureReplyOutcome::Pending
+                | FeatureReplyOutcome::Stale
+                | FeatureReplyOutcome::Applied(_) => {}
             }
-            FeatureReplyOutcome::WorkerDied => {
-                self.state.set_status(labels::STATUS_FEATURE_WORKER_DIED);
-            }
-            FeatureReplyOutcome::Idle
-            | FeatureReplyOutcome::Pending
-            | FeatureReplyOutcome::Stale
-            | FeatureReplyOutcome::Applied(_) => {}
         }
     }
 
@@ -841,6 +896,13 @@ impl SeedExplorerApp {
         if !self.state.status().is_empty() {
             line.push_str(" | ");
             line.push_str(self.state.status());
+        }
+        // The overlay's own progress: a tier-2 fetch runs for minutes, so it
+        // says so instead of leaving an apparently dead map. Appended last so
+        // it never masks a toast.
+        if let Some(hint) = self.state.features().status_hint() {
+            line.push_str(" | ");
+            line.push_str(hint);
         }
         egui::TopBottomPanel::bottom(Id::new("status-bar")).show(ctx, |ui| {
             ui.horizontal(|ui| {

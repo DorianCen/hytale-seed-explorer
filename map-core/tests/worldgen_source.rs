@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use map_core::error::SourceError;
-use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::types::{BiomeGrid, BiomeId, Rect, Seed};
 
 use worldgen_hytale::chunk::chunk_generator::ChunkGenerator;
@@ -327,7 +327,7 @@ fn surface_and_slice_queries_are_implemented_by_t09() {
         "the surface height must be a world y, got {surface:?}"
     );
     let region = source
-        .surface_region(rect, 1)
+        .surface_region(rect, 1, SummaryFidelity::Full)
         .expect("T09 serves surface_region");
     assert_eq!((region.width, region.height), (4, 4));
     let slice = source

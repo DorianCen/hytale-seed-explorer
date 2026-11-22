@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::catalog::BiomeCatalog;
 use crate::error::SourceResult;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{BiomeGrid, BiomeId, HeightGrid, Rect};
 
@@ -236,15 +236,23 @@ impl BiomeTileRenderer {
 }
 
 impl TileRenderer for BiomeTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         // The shared skeleton (see `render::tiles`): cancel check, the
         // aligned in-world query, the transparent canvas, the blit. The
         // biome layer supplies one batched region query and the catalog
-        // colors; border 0 - shading is not this layer's job.
+        // colors; border 0 - shading is not this layer's job. Biome is a
+        // direct column query, not a chunk summary, so fidelity is
+        // ignored.
         render_layer_tile(
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             0,
             |source, rect, step, _cancel| source.biome_region(rect, step),
@@ -270,6 +278,7 @@ mod tests {
     use crate::render::Layer;
     use crate::render::tiles::tile_query;
     use crate::scheduler::cancel_token;
+    use crate::source::SummaryFidelity;
     use crate::types::{
         GeneratorIdentity, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid,
         ZoneId,
@@ -532,7 +541,12 @@ mod tests {
             Err(unused())
         }
 
-        fn surface_region(&self, _rect: Rect, _step: u32) -> SourceResult<SurfaceGrid> {
+        fn surface_region(
+            &self,
+            _rect: Rect,
+            _step: u32,
+            _fidelity: SummaryFidelity,
+        ) -> SourceResult<SurfaceGrid> {
             Err(unused())
         }
 
@@ -621,8 +635,13 @@ mod tests {
     fn biome_tile_renderer_renders_the_full_tile_inside_the_world() {
         let harness = test_harness(None);
         let key = tile_key(0, 0, zoom(0));
-        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
-            .expect("an unbounded source renders every tile");
+        let tile = TileRenderer::render(
+            &harness.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("an unbounded source renders every tile");
 
         assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
         // Tile (0, 0) at step 1 starts at block (0, 0): tile pixel (x, y)
@@ -655,8 +674,13 @@ mod tests {
         // A world that covers the tile is no different from an unbounded
         // source: the full tile is one query and the pixels match.
         let bounded = test_harness(Some(Rect::new(-1_000, -1_000, 1_000, 1_000)));
-        let covered = TileRenderer::render(&bounded.renderer, &key, &cancel_token())
-            .expect("a world covering the tile renders it fully");
+        let covered = TileRenderer::render(
+            &bounded.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("a world covering the tile renders it fully");
         let origin = tile_rect(TileCoord::new(0, 0), 1).expect("tile (0, 0) fits the i32 space");
         assert_eq!(
             recorded_queries(&bounded.queries),
@@ -674,8 +698,13 @@ mod tests {
         let world = Rect::from_dims(64, 64, 128, 128);
         let harness = test_harness(Some(world));
         let key = tile_key(0, 0, zoom(0));
-        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
-            .expect("a partially in-world tile renders");
+        let tile = TileRenderer::render(
+            &harness.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("a partially in-world tile renders");
 
         for (x, y) in [(0, 0), (63, 200), (200, 63), (192, 192), (255, 255)] {
             assert_eq!(
@@ -701,8 +730,13 @@ mod tests {
         let world = Rect::new(65, 65, 254, 254);
         let harness = test_harness(Some(world));
         let key = tile_key(0, 0, zoom(1));
-        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
-            .expect("a step-2 tile inside the world renders");
+        let tile = TileRenderer::render(
+            &harness.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("a step-2 tile inside the world renders");
 
         // Sample 33 starts at block 0 + 33 * 2 = 66 (the first start >= 65);
         // the last fully inside ends at 253, so 94 samples (188 blocks).
@@ -756,8 +790,13 @@ mod tests {
     fn biome_tile_renderer_renders_a_transparent_tile_fully_outside_the_world() {
         let harness = test_harness(Some(Rect::from_dims(10_000, 10_000, 32, 32)));
         let key = tile_key(0, 0, zoom(0));
-        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
-            .expect("a fully out-of-world tile still renders");
+        let tile = TileRenderer::render(
+            &harness.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("a fully out-of-world tile still renders");
 
         assert!(
             tile.rgba
@@ -780,7 +819,7 @@ mod tests {
 
         let cancelled: CancelToken = Arc::new(AtomicBool::new(true));
         assert_eq!(
-            TileRenderer::render(&harness.renderer, &key, &cancelled),
+            TileRenderer::render(&harness.renderer, &key, &cancelled, SummaryFidelity::Full),
             Err(SourceError::Cancelled),
             "a cancelled tile never begins its work unit",
         );
@@ -790,7 +829,13 @@ mod tests {
         );
 
         assert!(
-            TileRenderer::render(&harness.renderer, &key, &cancel_token()).is_ok(),
+            TileRenderer::render(
+                &harness.renderer,
+                &key,
+                &cancel_token(),
+                SummaryFidelity::Full
+            )
+            .is_ok(),
             "an uncancelled tile renders normally",
         );
         assert_eq!(
@@ -804,8 +849,13 @@ mod tests {
     fn biome_tile_renderer_keeps_tile_dimensions_at_coarser_steps() {
         let harness = test_harness(None);
         let key = tile_key(2, -3, zoom(2));
-        let tile = TileRenderer::render(&harness.renderer, &key, &cancel_token())
-            .expect("a coarser tile renders");
+        let tile = TileRenderer::render(
+            &harness.renderer,
+            &key,
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("a coarser tile renders");
 
         assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
         let rect = tile_rect(TileCoord::new(2, -3), 4).expect("the tile fits the i32 block space");

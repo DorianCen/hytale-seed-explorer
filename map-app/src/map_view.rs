@@ -21,8 +21,10 @@
 //! 4. drop GPU textures for CPU-evicted tiles (T14's contract);
 //! 5. paint each visible tile layer by layer, bottom → top at the fine
 //!    step: every layer may crop its own cached coarser parent as a
-//!    placeholder (T21's progressive fill), while the quiet pending
-//!    tint stays exclusive to the base (first) layer. Each texture is
+//!    placeholder (T21's progressive fill), or — with nothing coarser
+//!    cached — pool its cached finer siblings into the missing coarse
+//!    tile (zoom-out continuity), while the quiet pending tint stays
+//!    exclusive to the base (first) layer. Each texture is
 //!    tinted with the layer's opacity (`Color32::from_white_alpha`) —
 //!    egui's blending is exactly `map_core::layers::blend_over`'s math,
 //!    so the screen and a future export (T32) agree by construction.
@@ -53,8 +55,10 @@ use map_core::render::fluid::DEFAULT_FLUID_OPACITY;
 use map_core::render::tiles::LayeredTileRenderer;
 use map_core::render::{Layer, SurfaceOptions};
 use map_core::scheduler::{TileEvent, TilePass, TileRenderer, TileScheduler, TileSubject};
-use map_core::source::WorldSource;
-use map_core::tiles::{TileCache, TileKey, covering_placeholder};
+use map_core::source::{SummaryFidelity, WorldSource};
+use map_core::tiles::{
+    PlaceholderTile, PooledTile, TileCache, TileKey, covering_placeholder, pooled_placeholder,
+};
 use map_core::types::Rect;
 
 use crate::labels;
@@ -126,6 +130,9 @@ pub struct FramePass {
     pub visible: TileRect,
     pub center: TileCoord,
     pub refine: bool,
+    /// The pass's summary fidelity (T29), derived in [`frame_tiles`] from
+    /// the pass step relative to the frame's effective step.
+    pub fidelity: SummaryFidelity,
 }
 
 /// A pass the app wants, before its visible range is computed (the
@@ -196,11 +203,25 @@ pub fn frame_tiles(
         let Some((visible, center)) = visible_and_center(view, first.zoom.step(), world) else {
             continue;
         };
+        // T29's fidelity policy: a pass at the frame's own effective step
+        // (`paint_step`, the user's step folded with the zoom) is
+        // authoritative and must run the full generator pipeline. Only a
+        // fill pass COARSER than it feeds placeholders, so only that one
+        // may skip the cave/prefab stages. Step alone must never decide: a
+        // user-chosen step-4 view makes step 4 the effective step, so its
+        // fill pass stays `Full` even though 4 is the app's coarse rung.
+        // Refinement is always authoritative.
+        let fidelity = if pass.refine || first.zoom.step() <= paint_step {
+            SummaryFidelity::Full
+        } else {
+            SummaryFidelity::SurfaceOnly
+        };
         frame_passes.push(FramePass {
             layers: pass.layers,
             visible,
             center,
             refine: pass.refine,
+            fidelity,
         });
     }
     if frame_passes.is_empty() {
@@ -281,6 +302,51 @@ fn world_rect((min_chunk, max_chunk): (i32, i32)) -> Option<Rect> {
         max(max_chunk).ok()?,
         max(max_chunk).ok()?,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// The pending-tile stand-in (pure decision)
+// ---------------------------------------------------------------------------
+
+/// What the canvas paints for a tile whose exact texture is not uploaded:
+/// the placeholder choice between the two zoom directions.
+#[derive(Debug, Clone)]
+pub enum PendingFill {
+    /// The nearest cached *coarser* tile of the same subject, cropped to
+    /// this tile's world rect ([`covering_placeholder`]) — zoom-in
+    /// continuity from real generated pixels.
+    Covering(PlaceholderTile),
+    /// A coarse tile derived by box-averaging the cached *finer* tiles
+    /// that cover it ([`pooled_placeholder`]) — zoom-out continuity.
+    /// Alpha-0 pixels are the pool's no-data value and show the canvas.
+    Pooled(PooledTile),
+    /// Nothing cached covers the tile in either direction: paint the
+    /// loading tint and wait.
+    Blank,
+}
+
+/// Decides the stand-in for a tile that has no uploaded texture this
+/// frame.
+///
+/// Coarser first: a cached parent is a real generated tile (exact pixels
+/// at lower detail), while a pooled tile is a derived average whose
+/// no-data holes show the canvas — so an existing cover always wins when
+/// both directions have candidates, preserving the T21 progressive-fill
+/// look. Pooling is the fallback the zoom-out path needs, where nothing
+/// coarser was ever generated but the finer detail that *was* on screen a
+/// moment ago is still cached.
+///
+/// Reads go through `TileCache::get`, so both scans refresh LRU recency
+/// and count as hits.
+#[must_use]
+pub fn pending_fill(cache: &TileCache, key: &TileKey) -> PendingFill {
+    if let Some(covering) = covering_placeholder(cache, key) {
+        return PendingFill::Covering(covering);
+    }
+    match pooled_placeholder(cache, key) {
+        Some(pooled) => PendingFill::Pooled(pooled),
+        None => PendingFill::Blank,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +535,9 @@ impl MapView {
             // never painted directly; they exist so the fine tiles'
             // placeholder crops find a cached parent (T16's level scan
             // crosses zooms). Every other layer keeps one fine pass.
+            // T29: `frame_tiles` marks exactly the coarser-than-effective
+            // fill pass SurfaceOnly (speed) and everything at the
+            // effective step Full (authoritative).
             let surface = paint_layers
                 .iter()
                 .find(|(subject, _)| subject.layer == Layer::Surface)
@@ -533,6 +602,11 @@ impl MapView {
                 // same path below): canvas plus a message.
                 self.placeholder(ui, &painter, state);
             }
+            // Derived pooled placeholders are per-frame conveniences, not
+            // cache entries: whatever this frame's paint did not touch (the
+            // real tile landed, the viewport moved) frees its GPU memory
+            // now.
+            self.textures.retire_unused_pooled();
             self.pipeline = Some(pipeline);
         } else {
             // No source (yet): canvas plus a message, no tile traffic.
@@ -662,6 +736,7 @@ impl MapView {
                     visible: pass.visible,
                     center: pass.center,
                     refine: pass.refine,
+                    fidelity: pass.fidelity,
                 })
                 .collect();
             pipeline
@@ -670,6 +745,13 @@ impl MapView {
             pipeline.scheduler.cancel_not_serving(&tile_passes);
             pipeline.last = Some(request.clone());
         }
+
+        // The GPU mirror follows every CPU removal (T14's contract). Do
+        // this BEFORE the event drain: an insert that replaces a key (T29's
+        // weaker→stronger provenance upgrade) notifies its eviction first,
+        // so the old handle must go before the Ready upload installs the
+        // new pixels for that same key.
+        self.textures.drop_evicted(pipeline.evictions.try_iter());
 
         // Events are hints (the cache is the state of record): each
         // key uploads exactly once; failures are logged, not fatal —
@@ -686,8 +768,6 @@ impl MapView {
                 TileEvent::Started(_) | TileEvent::Cancelled(_) => {}
             }
         }
-        // The GPU mirror follows every CPU eviction (T14's contract).
-        self.textures.drop_evicted(pipeline.evictions.try_iter());
 
         let stats = pipeline.scheduler.stats();
         self.pending = stats.queued + stats.in_flight;
@@ -706,14 +786,18 @@ impl MapView {
     /// Every layer may draw its exact texture, else the nearest cached
     /// coarser tile of *its own* layer cropped to this tile's world rect
     /// (T21: the progressive coarse pass exists precisely so the fine
-    /// surface tile's `covering_placeholder` finds a parent). Only the
-    /// bottom-most layer (index 0) gets the quiet pending tint, though:
-    /// a tint under an overlay would double the base's placeholder
-    /// rather than tell the user anything new. Each texture is tinted
-    /// with its layer's opacity (`from_white_alpha`): egui's vertex
-    /// blending is straight-alpha-over, the same math as
-    /// `map_core::layers::blend_over`, so the screen and a future
-    /// export (T32) agree by construction.
+    /// surface tile's `covering_placeholder` finds a parent). With no
+    /// coarser cover, a pending coarse tile pools its cached finer
+    /// siblings ([`pending_fill`]): zooming out shows the detail that was
+    /// just on screen instead of a blank. Only the bottom-most layer
+    /// (index 0) gets the quiet pending tint, and only over a pooled or
+    /// blank stand-in: a tint under an overlay would double the base's
+    /// placeholder rather than tell the user anything new, and a covering
+    /// crop already reads as real terrain. Each texture is tinted with
+    /// its layer's opacity (`from_white_alpha`): egui's vertex blending is
+    /// straight-alpha-over, the same math as
+    /// `map_core::layers::blend_over`, so the screen and a future export
+    /// (T32) agree by construction.
     ///
     /// Adjacent tiles agree on their shared edge because floor/ceil to
     /// physical pixels is a pure function of the shared coordinate — no
@@ -760,28 +844,68 @@ impl MapView {
                 let tint = Color32::from_white_alpha(alpha_byte(*opacity));
                 if let Some(id) = self.textures.texture_id(&key) {
                     painter.image(id, screen, full_uv(), tint);
-                } else if let Some(placeholder) = covering_placeholder(&pipeline.cache, &key) {
-                    // Instant low detail while the real tile renders. The
-                    // parent may be cached but not yet uploaded — upload it
-                    // on demand; the exact tile's later upload replaces it.
-                    // Every layer crops its own parent: the surface's coarse
-                    // pass (T21) is what makes a pending fine surface tile
-                    // read as terrain instead of a blank.
-                    let id = self
-                        .textures
-                        .texture_id(&placeholder.tile.key)
-                        .unwrap_or_else(|| {
-                            self.textures
-                                .upload(ctx, placeholder.tile.key, &placeholder.tile)
-                        });
-                    let uv = egui::Rect::from_min_max(
-                        egui::pos2(placeholder.uv[0], placeholder.uv[1]),
-                        egui::pos2(placeholder.uv[2], placeholder.uv[3]),
-                    );
-                    painter.image(id, screen, uv, tint);
-                } else if index == 0 && pipeline.scheduler.is_pending(&key) {
-                    // The base layer pending with no placeholder: a
-                    // quiet "filling in"; overlays stay transparent.
+                    continue;
+                }
+                // A pooled placeholder uploaded on an earlier frame paints
+                // again without re-deriving: the derivation is keyed by
+                // (tile key, source level), so the frame pays a lookup, not
+                // a box filter. A derived texture is cheap to drop, so the
+                // bridge sweeps whatever the viewport stops touching.
+                //
+                // `cue` tracks whether the base layer's pending tint belongs
+                // on top: pooled and blank stand-ins still need it, a
+                // covering crop and the exact texture do not.
+                let mut cue = false;
+                if let Some(id) = self.textures.pooled_texture_id(&key) {
+                    painter.image(id, screen, full_uv(), tint);
+                    cue = true;
+                } else {
+                    match pending_fill(&pipeline.cache, &key) {
+                        PendingFill::Covering(placeholder) => {
+                            // Instant low detail while the real tile
+                            // renders. The parent may be cached but not yet
+                            // uploaded — upload it on demand; the exact
+                            // tile's later upload replaces it. Every layer
+                            // crops its own parent: the surface's coarse
+                            // pass (T21) is what makes a pending fine
+                            // surface tile read as terrain instead of a
+                            // blank.
+                            let id = self
+                                .textures
+                                .texture_id(&placeholder.tile.key)
+                                .unwrap_or_else(|| {
+                                    self.textures.upload(
+                                        ctx,
+                                        placeholder.tile.key,
+                                        &placeholder.tile,
+                                    )
+                                });
+                            let uv = egui::Rect::from_min_max(
+                                egui::pos2(placeholder.uv[0], placeholder.uv[1]),
+                                egui::pos2(placeholder.uv[2], placeholder.uv[3]),
+                            );
+                            painter.image(id, screen, uv, tint);
+                        }
+                        PendingFill::Pooled(pooled) => {
+                            // Zoom-out stand-in: the coarse tile's pixels are
+                            // box averages of the finer tiles that were on
+                            // screen a moment ago. Full UV — the pool covers
+                            // exactly this tile's rect — and alpha 0 (the
+                            // no-data value) lets the canvas show through
+                            // while the coarse tile generates.
+                            let id = self.textures.upload_pooled(ctx, &pooled);
+                            painter.image(id, screen, full_uv(), tint);
+                            cue = true;
+                        }
+                        PendingFill::Blank => cue = true,
+                    }
+                }
+                // The base layer's in-progress cue stays *on top* of a
+                // pooled/blank stand-in: a pooled tile has no-data holes and
+                // fills in as its finer siblings land, so it must still read
+                // as generating. A covering crop is a real coarser tile and
+                // keeps its bare look, as T21 shipped it.
+                if index == 0 && cue && pipeline.scheduler.is_pending(&key) {
                     painter.rect_filled(screen, 0.0, pending_tint());
                     painter.rect_stroke(screen, 0.0, pending_stroke(), egui::StrokeKind::Middle);
                 }
@@ -791,8 +915,8 @@ impl MapView {
 
     // -- The feature overlay (T23) --------------------------------------------
 
-    /// Draws the catalog's markers over the tiles, then applies the pointer's
-    /// hover tooltip and click action.
+    /// Draws the two catalogs' markers over the tiles, then applies the
+    /// pointer's hover tooltip and click action.
     ///
     /// The draw list ([`feature_overlay::marker_list`]) is computed once per
     /// frame and reused for hit-testing, so what the user clicks is exactly
@@ -807,11 +931,15 @@ impl MapView {
         response: &Response,
         state: &mut AppState,
     ) {
-        let Some(catalog) = state.features().catalog().cloned() else {
-            return;
-        };
         let view = *state.view();
         let mask = feature_overlay::toggle_mask(state.overlays());
+        // Both tiers, deduped and filtered to the enabled groups: the
+        // quick catalog keeps its cheap markers on screen until a covering
+        // full catalog replaces it (the T22 subset property makes that
+        // lossless), and the memoized union costs one build per change.
+        let Some(catalog) = state.features_mut().draw_catalog(mask) else {
+            return;
+        };
         let viewport = (self.rect.width(), self.rect.height());
         let items = feature_overlay::marker_list(
             &catalog,
@@ -976,13 +1104,15 @@ mod tests {
     use map_core::coords::{TILE_SIZE, TileCoord, ZoomLevel};
     use map_core::render::Layer;
     use map_core::render::UNKNOWN_BIOME_COLOR;
+    use map_core::source::SummaryFidelity;
     use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
     use map_core::test_support::FakeWorldSource;
-    use map_core::tiles::covering_placeholder;
+    use map_core::tiles::{Tile, TileCache, TileKey, covering_placeholder};
     use map_core::types::Rect;
 
     use super::{
-        FrameTiles, MapView, PassLayers, TilePipeline, TileSubject, frame_tiles, world_rect,
+        FrameTiles, MapView, PassLayers, PendingFill, TilePipeline, TileSubject, frame_tiles,
+        pending_fill, world_rect,
     };
     use crate::view_state::MapViewState;
 
@@ -1201,6 +1331,75 @@ mod tests {
         // The whole frame is the dedup identity: identical inputs never
         // change the scheduler's request.
         assert_eq!(frame, build());
+    }
+
+    /// T29's app policy: a fill pass below the frame's effective step is a
+    /// placeholder source and may skip caves/prefabs; the pass at the
+    /// user's own effective step — and every refine pass — is authoritative
+    /// and keeps the full pipeline. The step number alone never decides:
+    /// the same step-4 pass is SurfaceOnly at a finer view and Full when
+    /// step 4 is what the user chose.
+    #[test]
+    fn fidelity_fill_pass_is_surface_only_only_below_the_user_step() {
+        let view = view(0.0, 600.0, 400.0);
+        let fine = ZoomLevel::MIN;
+        let step4 = ZoomLevel::from_step(4).expect("4 is an in-range step");
+        let biome = TileSubject::new(1, 7, Layer::Biome, 0, fine);
+        let surface = TileSubject::new(1, 7, Layer::Surface, 0, fine);
+        let coarse_surface = TileSubject::new(1, 7, Layer::Surface, 0, step4);
+
+        // A fine effective step (1): the coarse coverage is a placeholder,
+        // the fine fill and refine are authoritative.
+        let paint = vec![(biome, 1.0), (surface, 1.0)];
+        let frame = frame_tiles(
+            &view,
+            paint,
+            vec![
+                PassLayers {
+                    layers: vec![(biome, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(coarse_surface, 1.0)],
+                    refine: false,
+                },
+                PassLayers {
+                    layers: vec![(surface, 1.0)],
+                    refine: true,
+                },
+            ],
+            None,
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            frame.passes[0].fidelity,
+            SummaryFidelity::Full,
+            "the fill at the effective step is authoritative"
+        );
+        assert_eq!(
+            frame.passes[1].fidelity,
+            SummaryFidelity::SurfaceOnly,
+            "the coarser fill only feeds placeholders"
+        );
+        assert_eq!(
+            frame.passes[2].fidelity,
+            SummaryFidelity::Full,
+            "refinement is always authoritative"
+        );
+
+        // The user's own effective step is 4: the same step-4 pass must
+        // now run the full pipeline, because it is what the canvas paints.
+        let step4_biome = TileSubject::new(1, 7, Layer::Biome, 0, step4);
+        let step4_surface = TileSubject::new(1, 7, Layer::Surface, 0, step4);
+        let paint4 = vec![(step4_biome, 1.0), (step4_surface, 1.0)];
+        let frame4 = frame_tiles(&view, paint4.clone(), fill_pass(&paint4), None)
+            .expect("the view resolves");
+        assert_eq!(frame4.passes.len(), 1);
+        assert_eq!(
+            frame4.passes[0].fidelity,
+            SummaryFidelity::Full,
+            "a user-chosen step-4 view is authoritative, never a placeholder"
+        );
     }
 
     #[test]
@@ -1632,6 +1831,182 @@ mod tests {
         assert!(
             pipeline.cache.contains(&coarse_key),
             "the coarse tile stays cached for the placeholder crop"
+        );
+    }
+
+    // -- Pooled placeholders (zoom-out stand-ins) -------------------------------
+
+    /// A solid small (2×2) tile under `key` — small tiles keep the
+    /// placeholder tests' cache budgets tiny while still exercising the
+    /// real `Tile` grid the pool samples.
+    fn solid_tile(key: TileKey, color: [u8; 4]) -> Arc<Tile> {
+        let rgba: Vec<u8> = color.iter().copied().cycle().take(16).collect();
+        Arc::new(Tile::new(key, 2, 2, rgba).expect("the buffer matches 2x2 RGBA"))
+    }
+
+    /// A biome key at `zoom` for tile `(tx, ty)` under the fake identity.
+    fn biome_key(zoom: ZoomLevel, tx: i32, ty: i32) -> TileKey {
+        TileSubject::new(1, 7, Layer::Biome, 0, zoom).key_at(tx, ty)
+    }
+
+    /// A biome key at `zoom` for tile `(tx, ty)` under `pipeline`'s own
+    /// subject — the keys its frame requests actually carry.
+    fn pipeline_key(pipeline: &TilePipeline, zoom: ZoomLevel, tx: i32, ty: i32) -> TileKey {
+        TileSubject::new(pipeline.served.0, pipeline.served.1, Layer::Biome, 0, zoom).key_at(tx, ty)
+    }
+
+    #[test]
+    fn pooling_pending_fill_pools_cached_fine_children_on_zoom_out() {
+        // The zoom-out path: the step-2 tile is pending and nothing
+        // coarser exists, but its four step-1 children were just on
+        // screen, so the fill is their box average.
+        let cache = TileCache::new(1024 * 1024);
+        let fine = ZoomLevel::MIN;
+        let coarse = ZoomLevel::new(1).expect("step 2 is in range");
+        for (tx, ty) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            cache.insert(solid_tile(biome_key(fine, tx, ty), [30, 60, 90, 255]));
+        }
+
+        let key = biome_key(coarse, 0, 0);
+        match pending_fill(&cache, &key) {
+            PendingFill::Pooled(pooled) => {
+                assert_eq!(pooled.key, key, "the pool answers for the pending tile");
+                assert_eq!(pooled.source_zoom, fine, "pooled from the level just left");
+                assert_eq!((pooled.width, pooled.height), (2, 2));
+                assert!(
+                    pooled
+                        .rgba
+                        .chunks(4)
+                        .all(|pixel| pixel == [30, 60, 90, 255]),
+                    "four identical children average to their color"
+                );
+            }
+            other => panic!("expected a pooled stand-in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pooling_pending_fill_prefers_a_cached_coarser_cover() {
+        // Zoom-in: a cached parent exists, so the covering crop wins even
+        // when finer children are also cached — the pool is the fallback,
+        // not the first choice (a real tile beats a derived average).
+        let cache = TileCache::new(1024 * 1024);
+        let key_zoom = ZoomLevel::new(2).expect("step 4 is in range");
+        let parent = biome_key(ZoomLevel::new(3).expect("step 8 is in range"), 0, 0);
+        cache.insert(solid_tile(parent, [10, 20, 30, 255]));
+        for (tx, ty) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            cache.insert(solid_tile(
+                biome_key(ZoomLevel::new(1).expect("step 2 is in range"), tx, ty),
+                [40, 50, 60, 255],
+            ));
+        }
+
+        let key = biome_key(key_zoom, 0, 0);
+        match pending_fill(&cache, &key) {
+            PendingFill::Covering(covering) => {
+                assert_eq!(covering.tile.key, parent, "the cached parent covers it");
+            }
+            other => panic!("expected a covering stand-in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pooling_pending_fill_blanks_without_any_cached_cover() {
+        let cache = TileCache::new(1024 * 1024);
+        let key = biome_key(ZoomLevel::new(1).expect("step 2 is in range"), 0, 0);
+        assert!(
+            matches!(pending_fill(&cache, &key), PendingFill::Blank),
+            "an empty cache has nothing to stand in with"
+        );
+    }
+
+    #[test]
+    fn pooling_pending_fill_handles_negative_tile_indices() {
+        // Negative indices floor toward the right parent: coarse (-1, -1)
+        // owns the children (-2, -2)..(-1, -1), exactly as
+        // `pooled_placeholder` documents.
+        let cache = TileCache::new(1024 * 1024);
+        let fine = ZoomLevel::MIN;
+        let coarse = ZoomLevel::new(1).expect("step 2 is in range");
+        for (tx, ty) in [(-2, -2), (-1, -2), (-2, -1), (-1, -1)] {
+            cache.insert(solid_tile(biome_key(fine, tx, ty), [1, 2, 3, 255]));
+        }
+        let key = biome_key(coarse, -1, -1);
+        match pending_fill(&cache, &key) {
+            PendingFill::Pooled(pooled) => {
+                assert_eq!(pooled.key, key);
+                assert_eq!(pooled.source_zoom, fine);
+            }
+            other => panic!("expected a pooled stand-in, got {other:?}"),
+        }
+
+        // And a negative parent still covers a negative child.
+        let child = biome_key(ZoomLevel::MIN, -1, -1);
+        let parent = biome_key(ZoomLevel::new(1).expect("step 2 is in range"), -1, -1);
+        cache.insert(solid_tile(parent, [4, 5, 6, 255]));
+        assert!(
+            matches!(pending_fill(&cache, &child), PendingFill::Covering(c) if c.tile.key == parent),
+            "the coarser scan crosses negative indices too"
+        );
+    }
+
+    #[test]
+    fn pooling_zoom_out_paints_and_uploads_the_pooled_tile_once() {
+        // The paint path, headless: a coarse tile with no exact texture and
+        // no coarser cover paints its pooled children and uploads that
+        // derivation once per (tile, source level), not once per frame.
+        let ctx = egui::Context::default();
+        let mut map = MapView::new();
+        map.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let pipeline = fake_pipeline();
+        let (fine, coarse) = (
+            ZoomLevel::MIN,
+            ZoomLevel::new(1).expect("step 2 is in range"),
+        );
+        for (tx, ty) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            pipeline.cache.insert(solid_tile(
+                pipeline_key(&pipeline, fine, tx, ty),
+                [30, 60, 90, 255],
+            ));
+        }
+        let coarse_view = view(1.0, 600.0, 400.0);
+        let request = request_for(&pipeline, &coarse_view, coarse, Layer::Biome);
+        assert!(
+            request.paint.visible.contains(TileCoord::new(0, 0)),
+            "the view paints the tile whose children are cached"
+        );
+        let key = pipeline_key(&pipeline, coarse, 0, 0);
+        assert!(
+            !pipeline.cache.contains(&key),
+            "the coarse tile is still pending"
+        );
+
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), map.rect);
+        map.paint(&ctx, &painter, &request, &pipeline, &coarse_view);
+        assert!(
+            map.textures.texture_id(&key).is_none(),
+            "the derived pixels are never cached under the tile key"
+        );
+        let id = map
+            .textures
+            .pooled_texture_id(&key)
+            .expect("the pending coarse tile pooled its cached children");
+
+        // The next frame reuses the handle: one upload per (tile, level).
+        map.paint(&ctx, &painter, &request, &pipeline, &coarse_view);
+        assert_eq!(
+            map.textures.pooled_texture_id(&key),
+            Some(id),
+            "a painted pooled tile is not re-derived and re-uploaded"
+        );
+
+        // The real tile's arrival retires the derivation under it.
+        map.textures
+            .upload(&ctx, key, &solid_tile(key, [9, 9, 9, 255]));
+        assert_eq!(
+            map.textures.pooled_texture_id(&key),
+            None,
+            "the exact texture replaces the pool"
         );
     }
 

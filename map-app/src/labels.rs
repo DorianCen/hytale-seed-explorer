@@ -160,6 +160,9 @@ pub const STATUS_PT_PER_BLOCK: &str = "pt/blk";
 pub const STATUS_COPIED: &str = "copied";
 /// Prefix of the feature-query failure toast (the error follows).
 pub const STATUS_FEATURE_ERROR: &str = "feature query failed";
+/// While an overlay query (either tier or the prewarm) is in flight. A
+/// tier-2 fetch can run for minutes, so it must never look like a dead UI.
+pub const STATUS_FEATURES_GENERATING: &str = "features: generating…";
 /// The feature-query worker vanished without a result (T23).
 pub const STATUS_FEATURE_WORKER_DIED: &str = "the feature worker stopped without reporting";
 /// The unit in a feature tooltip's distance line.

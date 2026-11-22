@@ -28,7 +28,7 @@ use map_core::render::fluid::{DEFAULT_FLUID_OPACITY, fluid_image};
 use map_core::render::height::height_image;
 use map_core::render::relief::relief_image;
 use map_core::scheduler::cancel_token;
-use map_core::source::WorldSource;
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::types::Rect;
 
 /// The T17 layer-golden case: the shore window at `(272, -192)` — a
@@ -93,7 +93,7 @@ mod fake_layers {
     use map_core::render::tiles::LayeredTileRenderer;
     use map_core::render::zone_color;
     use map_core::scheduler::{TileRenderer, TileSubject};
-    use map_core::source::WorldSource;
+    use map_core::source::{SummaryFidelity, WorldSource};
     use map_core::test_support::FakeWorldSource;
     use map_core::tiles::{Tile, TileKey};
     use map_core::types::SurfaceSample;
@@ -117,8 +117,13 @@ mod fake_layers {
     /// Renders one tile through the dispatcher. The fake is unbounded and
     /// instant, so this cannot fail or cancel.
     fn render_tile(renderer: &LayeredTileRenderer, layer: Layer, tx: i32, ty: i32) -> Tile {
-        TileRenderer::render(renderer, &key(layer, tx, ty), &cancel_token())
-            .expect("the fake renders any tile instantly")
+        TileRenderer::render(
+            renderer,
+            &key(layer, tx, ty),
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("the fake renders any tile instantly")
     }
 
     /// The fake's step-1 tile rect at `(tx, ty)`.
@@ -159,7 +164,12 @@ mod fake_layers {
         let renderer = fake_renderer();
         let cancel: map_core::scheduler::CancelToken =
             Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let result = TileRenderer::render(&renderer, &key(Layer::Height, 0, 0), &cancel);
+        let result = TileRenderer::render(
+            &renderer,
+            &key(Layer::Height, 0, 0),
+            &cancel,
+            SummaryFidelity::Full,
+        );
         assert_eq!(result.err(), Some(SourceError::Cancelled));
     }
 
@@ -234,7 +244,7 @@ mod fake_layers {
         assert_eq!((tile.width, tile.height), (TILE_SIZE, TILE_SIZE));
 
         let grid = fake
-            .surface_region(tile_rect_at(0, 0), 1)
+            .surface_region(tile_rect_at(0, 0), 1, SummaryFidelity::Full)
             .expect("the fake serves any rect");
         let catalog = fake.biome_catalog();
         let expected = fluid_image(&grid, catalog, DEFAULT_FLUID_OPACITY, &cancel_token())
@@ -295,7 +305,12 @@ mod fake_layers {
         // with the typed error rather than rendering wrong pixels.
         let renderer = fake_renderer();
         for layer in [Layer::CaveSlice, Layer::CaveDensity] {
-            let result = TileRenderer::render(&renderer, &key(layer, 0, 0), &cancel_token());
+            let result = TileRenderer::render(
+                &renderer,
+                &key(layer, 0, 0),
+                &cancel_token(),
+                SummaryFidelity::Full,
+            );
             assert_eq!(
                 result.err(),
                 Some(SourceError::Unsupported(
@@ -575,7 +590,11 @@ fn relief_golden_png() -> Vec<u8> {
 fn fluid_golden_png() -> Vec<u8> {
     let source = source();
     let grid = source
-        .surface_region(center_rect(LAYER_GOLDEN_CENTER), GOLDEN_STEP)
+        .surface_region(
+            center_rect(LAYER_GOLDEN_CENTER),
+            GOLDEN_STEP,
+            SummaryFidelity::Full,
+        )
         .expect("the golden surface region succeeds");
     let image = fluid_image(
         &grid,

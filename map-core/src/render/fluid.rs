@@ -21,7 +21,7 @@ use crate::error::{SourceError, SourceResult};
 use crate::render::biome::biome_pixel;
 use crate::render::tiles::render_layer_tile;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{Rect, SurfaceGrid, SurfaceSample};
 
@@ -127,16 +127,23 @@ impl FluidTileRenderer {
 }
 
 impl TileRenderer for FluidTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         // Border 0: the depth comes from the column's own surface
-        // sample; no neighbour ring is needed.
+        // sample; no neighbour ring is needed. Fluid is summary-based, so
+        // the pass fidelity rides through to the source.
         render_layer_tile(
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             0,
-            |source, rect, step, _cancel| source.surface_region(rect, step),
+            |source, rect, step, _cancel| source.surface_region(rect, step, fidelity),
             |grid, query, cancel| {
                 fluid_image(grid, self.source.biome_catalog(), self.opacity, cancel)
                     .map(|image| (image, query.origin))

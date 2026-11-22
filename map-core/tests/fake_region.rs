@@ -3,7 +3,7 @@
 //! and can render a biome grid", including a 7×5 region at step 2 with a
 //! negative origin and correct first/last sample coordinates.
 
-use map_core::source::WorldSource;
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::test_support::FakeWorldSource;
 use map_core::types::{BiomeId, Rect};
 
@@ -33,7 +33,9 @@ fn fake_region_has_expected_metadata_and_sample_coordinates() {
     assert_eq!(heights.sample(2, 1).copied(), Some(64));
     assert_eq!(heights.sample(4, 1), None);
 
-    let surfaces = source.surface_region(rect, 2).expect("fake surface region");
+    let surfaces = source
+        .surface_region(rect, 2, SummaryFidelity::Full)
+        .expect("fake surface region");
     let first = surfaces.sample(-10, -7).expect("first surface sample");
     assert_eq!((first.x, first.z, first.height), (-10, -7, 78));
     assert_eq!(first.fluid, None, "height 78 is above the fake lake line");

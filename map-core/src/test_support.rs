@@ -11,7 +11,7 @@
 
 use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCatalog, ZoneInfo};
 use crate::error::{SourceError, SourceResult};
-use crate::source::{FeatureSource, WorldSource};
+use crate::source::{FeatureSource, SummaryFidelity, WorldSource};
 use crate::types::{
     BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureMetadata, FluidId,
     GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid, SpawnPoint, SurfaceGrid,
@@ -239,7 +239,12 @@ impl WorldSource for FakeWorldSource {
         Ok(Self::surface_for(x, z))
     }
 
-    fn surface_region(&self, rect: Rect, step: u32) -> SourceResult<SurfaceGrid> {
+    fn surface_region(
+        &self,
+        rect: Rect,
+        step: u32,
+        _fidelity: SummaryFidelity,
+    ) -> SourceResult<SurfaceGrid> {
         Ok(self.surface_grid(rect, step))
     }
 

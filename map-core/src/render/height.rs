@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::error::{SourceError, SourceResult};
 use crate::render::tiles::render_layer_tile;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{HeightGrid, Rect};
 
@@ -96,13 +96,21 @@ impl HeightTileRenderer {
 }
 
 impl TileRenderer for HeightTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         // Border 0: the height ramp reads only the tile's own samples —
-        // neighbour differences belong to the relief layer.
+        // neighbour differences belong to the relief layer. Height is a
+        // direct column query, not a chunk summary, so fidelity does not
+        // apply (the height query has no cave/prefab stage to skip).
         render_layer_tile(
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             0,
             |source, rect, step, _cancel| source.height_region(rect, step),

@@ -39,10 +39,10 @@ use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCa
 use crate::error::{SourceError, SourceResult, panic_message};
 use crate::source::chunks::{
     self, ChunkKey, ChunkSlice, ChunkSummary, DEFAULT_SLICE_CACHE_ENTRIES,
-    DEFAULT_SUMMARY_BUDGET_BYTES, SliceCache, SliceKey, SummaryCache, SummaryColumn, chunk_of,
-    column_index, local_of,
+    DEFAULT_SUMMARY_BUDGET_BYTES, SliceCache, SliceKey, SummaryCache, SummaryColumn, SummaryKey,
+    chunk_of, column_index, local_of,
 };
-use crate::source::{FeatureSource, WorldSource};
+use crate::source::{FeatureSource, SummaryFidelity, WorldSource};
 use crate::types::{
     BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureKindMask,
     FeatureMetadata, FluidId, GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid,
@@ -280,10 +280,15 @@ impl WorldgenSource {
         Ok(chunks)
     }
 
-    /// The summary for one chunk: bounds-checked, cached, deduplicated
-    /// across concurrent callers by the cache's in-flight coalescing
-    /// (`try_get_with`), never caching failures.
-    fn summary_for(&self, cx: i32, cz: i32) -> SourceResult<Arc<ChunkSummary>> {
+    /// The summary for one chunk: bounds-checked, cached per fidelity,
+    /// deduplicated across concurrent callers by the cache's in-flight
+    /// coalescing (`try_get_with`), never caching failures.
+    fn summary_for(
+        &self,
+        cx: i32,
+        cz: i32,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Arc<ChunkSummary>> {
         if cx < self.min_chunk || cx > self.max_chunk || cz < self.min_chunk || cz > self.max_chunk
         {
             // The chunk's origin is the representative coordinate.
@@ -292,14 +297,17 @@ impl WorldgenSource {
                 z: cz << 5,
             });
         }
-        let key = ChunkKey {
-            identity: self.identity.stable_hash(),
-            generator_seed: self.seed.generator(),
-            cx,
-            cz,
+        let key = SummaryKey {
+            chunk: ChunkKey {
+                identity: self.identity.stable_hash(),
+                generator_seed: self.seed.generator(),
+                cx,
+                cz,
+            },
+            fidelity,
         };
         self.summary_cache
-            .try_get_with(key, || self.pool.generate_summary(cx, cz))
+            .try_get_with(key, || self.pool.generate_summary(cx, cz, fidelity))
             .map_err(|error: Arc<SourceError>| (*error).clone())
     }
 
@@ -320,13 +328,18 @@ impl WorldgenSource {
         self.slice_cache
             .try_get_with(key, || {
                 let (slice, summary) = self.pool.generate_slice(cx, cz, y)?;
-                // The generation was paid; keep both products.
+                // The generation was paid for a full chunk, so its summary
+                // is authoritative: cache it as `Full` (slices never use a
+                // surface-only generation).
                 self.summary_cache.insert(
-                    ChunkKey {
-                        identity: self.identity.stable_hash(),
-                        generator_seed: self.seed.generator(),
-                        cx,
-                        cz,
+                    SummaryKey {
+                        chunk: ChunkKey {
+                            identity: self.identity.stable_hash(),
+                            generator_seed: self.seed.generator(),
+                            cx,
+                            cz,
+                        },
+                        fidelity: SummaryFidelity::Full,
                     },
                     summary,
                 );
@@ -363,6 +376,7 @@ impl WorldgenSource {
         rect: Rect,
         step: u32,
         external: Option<&CancelToken>,
+        fidelity: SummaryFidelity,
     ) -> SourceResult<SurfaceGrid> {
         let (width, height) = rect.sample_dims(step);
         let cancel = self.fresh_cancel();
@@ -384,7 +398,7 @@ impl WorldgenSource {
             if cancelled {
                 return Err(SourceError::Cancelled);
             }
-            let summary = self.summary_for(cx, cz)?;
+            let summary = self.summary_for(cx, cz, fidelity)?;
             summaries.insert((cx, cz), summary);
         }
 
@@ -461,7 +475,7 @@ impl WorldSource for WorldgenSource {
 
     fn surface_at(&self, x: i32, z: i32) -> SourceResult<SurfaceSample> {
         let (cx, cz) = (chunk_of(x), chunk_of(z));
-        let summary = self.summary_for(cx, cz)?;
+        let summary = self.summary_for(cx, cz, SummaryFidelity::Full)?;
         let column = summary
             .column(local_of(x), local_of(z))
             .expect("local coordinates are in range by construction");
@@ -469,8 +483,13 @@ impl WorldSource for WorldgenSource {
         Ok(self.surface_sample(x, z, biome, &column))
     }
 
-    fn surface_region(&self, rect: Rect, step: u32) -> SourceResult<SurfaceGrid> {
-        self.surface_region_inner(rect, step, None)
+    fn surface_region(
+        &self,
+        rect: Rect,
+        step: u32,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<SurfaceGrid> {
+        self.surface_region_inner(rect, step, None, fidelity)
     }
 
     fn surface_region_cancelled(
@@ -478,8 +497,9 @@ impl WorldSource for WorldgenSource {
         rect: Rect,
         step: u32,
         cancel: &CancelToken,
+        fidelity: SummaryFidelity,
     ) -> SourceResult<SurfaceGrid> {
-        self.surface_region_inner(rect, step, Some(cancel))
+        self.surface_region_inner(rect, step, Some(cancel), fidelity)
     }
 
     fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid> {
@@ -1015,6 +1035,21 @@ fn map_world_gen_error(error: WorldGenError) -> SourceError {
     }
 }
 
+/// Builds the worker-side request for a summary query (T29).
+///
+/// Kept separate so the fidelity → `surface_only` mapping is unit-testable
+/// without a loaded generator; the pool command carries the fidelity, the
+/// worker calls this, and the generator honors the flag.
+pub(crate) fn summary_request(
+    seed: i32,
+    cx: i32,
+    cz: i32,
+    fidelity: SummaryFidelity,
+) -> WorldGenRequest {
+    WorldGenRequest::new(seed, cx, cz)
+        .with_surface_only(matches!(fidelity, SummaryFidelity::SurfaceOnly))
+}
+
 /// Generates one chunk and extracts its compact summary (worker thread).
 /// The `GeneratedChunk` is dropped when this returns; only the ~22 KB
 /// summary crosses the thread boundary. Panics inside the pipeline are
@@ -1027,9 +1062,10 @@ pub(crate) fn generate_summary(
     seed: i32,
     cx: i32,
     cz: i32,
+    fidelity: SummaryFidelity,
 ) -> SourceResult<Arc<ChunkSummary>> {
     catch_query_panics(|| {
-        let request = WorldGenRequest::new(seed, cx, cz);
+        let request = summary_request(seed, cx, cz, fidelity);
         let result = generate_chunk(
             generator,
             Rc::clone(&state.registry),
@@ -1042,7 +1078,9 @@ pub(crate) fn generate_summary(
 }
 
 /// Generates one chunk and extracts both the horizontal slice at `y` and
-/// the compact summary — two products from one generation (worker thread).
+/// the compact summary — two products from one full generation (worker
+/// thread). Slices are Full-only by design (T28's cave slices need real
+/// caves), so they never use the surface-only mode.
 pub(crate) fn generate_slice(
     generator: &Rc<ChunkGenerator>,
     state: &mut GenState,
@@ -1079,8 +1117,33 @@ fn catch_query_panics<T>(work: impl FnOnce() -> SourceResult<T>) -> SourceResult
 
 #[cfg(test)]
 mod tests {
-    use super::{PlacementKind, PlacementKindMask, placement_kinds};
+    use super::{PlacementKind, PlacementKindMask, placement_kinds, summary_request};
+    use crate::source::SummaryFidelity;
     use crate::types::{FeatureKind, FeatureKindMask};
+
+    /// The pool command's fidelity is the only thing that decides the
+    /// generator's surface-only mode: Full stays off, SurfaceOnly turns it
+    /// on, and the seed/chunk coordinates ride through untouched.
+    #[test]
+    fn fidelity_pool_request_carries_the_flag() {
+        let full = summary_request(12345, -3, 7, SummaryFidelity::Full);
+        assert_eq!(full.seed, 12345);
+        assert_eq!((full.chunk_x, full.chunk_z), (-3, 7));
+        assert!(
+            !full.surface_only,
+            "a full summary must run the whole pipeline"
+        );
+
+        let surface = summary_request(12345, -3, 7, SummaryFidelity::SurfaceOnly);
+        assert!(
+            surface.surface_only,
+            "a surface-only summary must skip the cave/prefab stages"
+        );
+        assert!(
+            SummaryFidelity::default() == SummaryFidelity::Full,
+            "the options-struct convention defaults to full fidelity"
+        );
+    }
 
     #[test]
     fn features_placement_kinds_map_poi_to_unique_and_skip_cave() {

@@ -65,6 +65,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crate::coords::{TileCoord, TileRect, ZoomLevel};
 use crate::error::{SourceError, SourceResult, panic_message};
 use crate::render::Layer;
+use crate::source::SummaryFidelity;
 use crate::tiles::{Tile, TileCache, TileKey};
 
 /// A shared cancellation flag. Structurally identical to the worldgen
@@ -165,6 +166,10 @@ pub struct TilePass {
     pub center: TileCoord,
     /// True for a refinement pass (priority-penalized).
     pub refine: bool,
+    /// How much of the generator this pass's summaries ask for (T29).
+    /// Defaults to [`SummaryFidelity::Full`]; only placeholder-level fill
+    /// passes may set [`SummaryFidelity::SurfaceOnly`].
+    pub fidelity: SummaryFidelity,
 }
 
 impl TilePass {
@@ -176,6 +181,7 @@ impl TilePass {
             visible,
             center,
             refine: false,
+            fidelity: SummaryFidelity::Full,
         }
     }
 
@@ -187,7 +193,17 @@ impl TilePass {
             visible,
             center,
             refine: true,
+            fidelity: SummaryFidelity::Full,
         }
+    }
+
+    /// Sets the pass's summary fidelity (builder convention: constructors
+    /// default to [`SummaryFidelity::Full`], callers opt into a coarser
+    /// mode explicitly).
+    #[must_use]
+    pub fn with_fidelity(mut self, fidelity: SummaryFidelity) -> Self {
+        self.fidelity = fidelity;
+        self
     }
 
     /// The heap penalty this pass's jobs carry: the refine offset for
@@ -205,8 +221,15 @@ impl TilePass {
 /// `tile_rect(TileCoord::new(key.tx.into(), key.ty.into()),
 /// key.zoom.step())` (T10), so no rect is passed here.
 pub trait TileRenderer: Send + Sync {
-    /// Renders the tile for `key`, or the typed failure.
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile>;
+    /// Renders the tile for `key`, or the typed failure. `fidelity` comes
+    /// from the requesting pass: summary-based renderers pass it to the
+    /// source, column-query renderers ignore it.
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile>;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +334,8 @@ struct Shared {
 /// from the key at render time, not stored.
 struct TileRequest {
     key: TileKey,
+    /// The summary fidelity the pass that queued this job asked for.
+    fidelity: SummaryFidelity,
     /// Chebyshev tile distance to the viewport center; lower = nearer.
     priority: u64,
     /// Request sequence; FIFO among equal priorities.
@@ -452,7 +477,11 @@ impl TileScheduler {
                         continue;
                     };
                     let key = subject.key_at(tx, ty);
-                    if self.cache.contains(&key) {
+                    // T29: a cached tile serves this pass only when its
+                    // provenance is at least the pass's fidelity. A
+                    // surface-only placeholder must not short-circuit an
+                    // authoritative full re-render.
+                    if self.cache.contains_serving(&key, pass.fidelity) {
                         continue;
                     }
                     if let Some(token) = guard.queued.get(&key) {
@@ -471,6 +500,7 @@ impl TileScheduler {
                     // refine job outrank fill jobs.
                     let request = TileRequest {
                         key,
+                        fidelity: pass.fidelity,
                         priority: chebyshev(coord, pass.center).saturating_add(penalty),
                         seq: guard.next_seq,
                         generation,
@@ -670,7 +700,7 @@ fn worker_main(
         // loader boundary): the renderer is foreign code and must not be
         // allowed to kill the pipeline's worker thread.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            renderer.render(&job.key, &job.cancel)
+            renderer.render(&job.key, &job.cancel, job.fidelity)
         }));
         let render_nanos = u64::try_from(render_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
@@ -769,6 +799,7 @@ mod tests {
             let coord = TileCoord::new(i64::from(tx), i64::from(ty));
             heap.push(TileRequest {
                 key: TileSubject::new(1, 7, Layer::Biome, 0, ZoomLevel::MIN).key_at(tx, ty),
+                fidelity: SummaryFidelity::Full,
                 priority: chebyshev(coord, center),
                 seq,
                 generation: 1,

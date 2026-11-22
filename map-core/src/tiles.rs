@@ -20,11 +20,18 @@
 //!   hands out a channel receiver; the texture bridge (`map-app`) drops
 //!   `TextureHandle`s for exactly those keys, which is what frees GPU
 //!   memory.
-//! - **A missing tile has a stand-in.** [`covering_placeholder`] finds
-//!   the nearest cached coarser tile covering a missing tile's world
-//!   rect, with the exact UV crop that paints only that rect — the
-//!   plan's lower-detail placeholder (§5.1) that the T16 viewport draws
-//!   while a tile is still generating.
+//! - **A missing tile has a stand-in, in both zoom directions.**
+//!   [`covering_placeholder`] covers a missing *fine* tile with the
+//!   nearest cached *coarser* tile, cropped to the missing tile's world
+//!   rect — zoom-in continuity, where the wider view's pixels are
+//!   reused instead of the screen blanking (the plan's lower-detail
+//!   placeholder, §5.1). [`pooled_placeholder`] goes the other way and
+//!   derives a missing *coarse* tile by box-averaging the cached
+//!   *finer* tiles that cover it — zoom-out continuity, where detail
+//!   already generated is pooled in an instant instead of waiting for
+//!   coarse tiles to render. Both are derived stand-ins: they are never
+//!   cached under the key they stand in for, and the real tile replaces
+//!   them when it arrives.
 //!
 //! # Why a custom LRU instead of `moka`
 //!
@@ -49,6 +56,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coords::{TILE_SIZE, TileCoord, ZoomLevel, tile_rect};
 use crate::render::Layer;
+use crate::source::SummaryFidelity;
 
 /// Fixed bytes [`Tile::byte_size`] charges on top of the pixel buffer:
 /// an approximation covering the `Tile` struct itself plus the cache's
@@ -111,6 +119,12 @@ pub struct Tile {
     /// Pixel height.
     pub height: u32,
     pub rgba: Arc<[u8]>,
+    /// The summary fidelity this tile was rendered at (T29). A cached
+    /// tile satisfies a pass only when its provenance is at least the
+    /// pass's fidelity ([`SummaryFidelity::satisfies`]); placeholders are
+    /// deliberately fidelity-blind. Every construction path defaults to
+    /// [`SummaryFidelity::Full`]; renderers set the pass's value.
+    pub fidelity: SummaryFidelity,
     /// When the tile was created. A generation/priority stamp for T15's
     /// scheduling and T33's tuning reports; not part of any key.
     pub created: Instant,
@@ -137,8 +151,18 @@ impl Tile {
             width,
             height,
             rgba,
+            fidelity: SummaryFidelity::Full,
             created: Instant::now(),
         })
+    }
+
+    /// Sets the summary fidelity this tile was rendered at. Builders and
+    /// tests default to [`SummaryFidelity::Full`]; the tile skeleton sets
+    /// the requesting pass's value.
+    #[must_use]
+    pub fn with_fidelity(mut self, fidelity: SummaryFidelity) -> Self {
+        self.fidelity = fidelity;
+        self
     }
 
     /// The RGBA pixel at `(x, y)` (row-major), or [`None`] outside the
@@ -292,9 +316,11 @@ impl TileCache {
     /// possibly the new one, if it alone exceeds the budget — until the
     /// cache is within budget again.
     ///
-    /// Keys are content-addressed, so re-inserting an existing key is a
-    /// refresh of identical pixels: subscribers are notified (moka's
-    /// "replaced" semantics, so the bridge re-uploads) but it does not
+    /// Keys are content-addressed within one fidelity, so re-inserting an
+    /// existing key normally refreshes identical pixels; the T29
+    /// provenance upgrade (surface-only → full) replaces the pixels
+    /// instead. Either way subscribers are notified (moka's "replaced"
+    /// semantics, so the bridge can drop the old upload) but it does not
     /// count as an eviction.
     pub fn insert(&self, tile: Arc<Tile>) {
         let mut inner = lock(&self.inner);
@@ -307,6 +333,20 @@ impl TileCache {
     #[must_use]
     pub fn contains(&self, key: &TileKey) -> bool {
         lock(&self.inner).entries.contains_key(key)
+    }
+
+    /// Whether the cached tile at `key` is at least as authoritative as
+    /// `fidelity` — the scheduler's fidelity-aware cache-hit test (T29).
+    ///
+    /// A weaker cached tile (surface-only where a full pass asks) is a
+    /// miss: the pass must re-render and overwrite the entry. Without
+    /// recency or hit/miss side effects, like [`TileCache::contains`].
+    #[must_use]
+    pub fn contains_serving(&self, key: &TileKey, fidelity: SummaryFidelity) -> bool {
+        lock(&self.inner)
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.tile.fidelity.satisfies(fidelity))
     }
 
     /// Removes one key explicitly. Subscribers are notified (so the
@@ -488,6 +528,12 @@ pub struct PlaceholderTile {
 /// Uses [`TileCache::get`] (not `contains`) so a tile actually used for
 /// painting refreshes its LRU recency and counts as a hit.
 ///
+/// **Fidelity-blind by design (T29):** any cached tile is a valid
+/// stand-in for a missing one, whatever its provenance. A surface-only
+/// parent is a placeholder for a full child, never an authoritative
+/// answer; the scheduler's provenance check governs real hits, not this
+/// helper.
+///
 /// Returns [`None`] when no coarser tile of the same subject is cached,
 /// when the key is already at the coarsest level, or when either rect
 /// falls outside the representable block space (the caller paints its
@@ -552,6 +598,205 @@ pub fn covering_placeholder(cache: &TileCache, key: &TileKey) -> Option<Placehol
         });
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// PooledTile
+// ---------------------------------------------------------------------------
+
+/// The deepest pooling factor [`pooled_placeholder`] uses: three levels
+/// finer than the missing tile.
+///
+/// Pooling one coarse tile reads `width * height * factor^2` fine
+/// samples — 65 536 · `factor^2` at [`TILE_SIZE`] — and every extra level
+/// back quadruples that (factor 16 is ~16.8 M samples per tile). The
+/// zoom-out path asks for the level just left (factor 2) and a two-level
+/// jump for factor 4; past factor 8 the pixels are already a blur the
+/// pending treatment conveys about as well, so the scan stops rather than
+/// walking all the way to [`ZoomLevel::MIN`].
+pub const MAX_POOL_FACTOR: u32 = 8;
+
+/// A coarse tile derived by box-averaging the cached finer tiles that
+/// cover it — the zoom-out complement of [`PlaceholderTile`].
+///
+/// The pixels are *derived*, not generated: callers own the buffer and
+/// must not insert it into the [`TileCache`] under [`PooledTile::key`]
+/// (the real tile replaces it), which is also why this is not a [`Tile`].
+#[derive(Debug, Clone)]
+pub struct PooledTile {
+    /// The key these pixels answer for — the requested coarse tile.
+    pub key: TileKey,
+    /// Pixel width. A pyramid keeps one pixel grid per tile ([`TILE_SIZE`]
+    /// square in production), so this is the fine children's width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Row-major RGBA8, north at row 0 — the [`Tile`] orientation.
+    ///
+    /// **No-data convention:** a coarse pixel with no cached fine sample
+    /// is `[0, 0, 0, 0]`, fully transparent. Transparent means "nothing
+    /// known here"; the app paints its pending treatment there, while
+    /// pooled pixels keep their own alpha and paint untinted like any
+    /// other tile. (A fine tile that was itself fully transparent pools
+    /// to the same value, so the two are indistinguishable by design.)
+    pub rgba: Vec<u8>,
+    /// The zoom level the samples came from, always finer than
+    /// [`PooledTile::key`]'s. The pooling factor is
+    /// `key.zoom.step() / source_zoom.step()`.
+    pub source_zoom: ZoomLevel,
+}
+
+/// Derives a coarse tile by box-averaging the cached finer tiles covering
+/// it — instant content on zoom-out, where [`covering_placeholder`] has
+/// nothing coarser to offer.
+///
+/// Scans finer levels nearest first: the key's step halved, then halved
+/// again, … up to [`MAX_POOL_FACTOR`]. The first level with at least one
+/// covering child cached is pooled and returned; deeper levels are never
+/// consulted even when the nearest level is only partially cached. The
+/// closest finer level dominates the result — a deeper level is blurrier
+/// *and* costs `factor^2` times the reads per pixel, so pooling more of
+/// it buys nothing.
+///
+/// The children of a coarse tile at factor `f` are the `f × f` aligned
+/// fine tiles `coarse * f + 0..f` per axis; `div_euclid` semantics put
+/// negative indices in the right parent too (coarse `-1` owns children
+/// `-2` and `-1` at factor 2). Each coarse pixel covers an `f × f` block
+/// of fine pixels: the coarse tile spans `f` children, hence `width * f`
+/// fine pixels per axis, so coarse pixel `(px, py)` samples fine pixels
+/// `px * f ..= px * f + f - 1` of that combined grid; dividing by
+/// `width`/`height` picks the child and the remainder the pixel inside
+/// it. The pooled value is the truncated average per channel, alpha
+/// included; a coarse pixel whose samples were all missing stays
+/// transparent (see [`PooledTile::rgba`]).
+///
+/// Every child read goes through [`TileCache::get`], so children actually
+/// pooled count as hits and refresh their LRU recency.
+///
+/// **Fidelity-blind by design (T29):** a surface-only child is a valid
+/// stand-in for a missing coarse tile, just as a surface-only parent is
+/// for [`covering_placeholder`]. Stand-ins never satisfy a real cache hit;
+/// the scheduler's provenance check owns that decision.
+///
+/// Returns [`None`] when the key is at [`ZoomLevel::MIN`], when no finer
+/// child of the same subject (identity, seed, layer, mode) is cached, or
+/// when the key's block rect falls outside the representable `i32` space
+/// (such a tile cannot exist).
+#[must_use]
+pub fn pooled_placeholder(cache: &TileCache, key: &TileKey) -> Option<PooledTile> {
+    // Same representability rule as the coarser-cover direction: a tile
+    // whose block rect does not fit i32 cannot be painted or generated.
+    tile_rect(
+        TileCoord::new(i64::from(key.tx), i64::from(key.ty)),
+        key.zoom.step(),
+    )?;
+
+    let coarse_step = key.zoom.step();
+    let mut factor: u32 = 2;
+    while factor <= MAX_POOL_FACTOR {
+        // Halving the step stays on the level ladder while it is still at
+        // least one block per sample; below that (the finest level) the
+        // integer quotient is zero and `from_step` ends the scan.
+        let Some(fine_zoom) = ZoomLevel::from_step(coarse_step / factor) else {
+            break;
+        };
+        if let Some(pooled) = pool_from_level(cache, key, fine_zoom, factor) {
+            return Some(pooled);
+        }
+        factor *= 2;
+    }
+    None
+}
+
+/// Pools `key` from the `factor × factor` children at `fine_zoom`, or
+/// [`None`] when none of them is cached.
+fn pool_from_level(
+    cache: &TileCache,
+    key: &TileKey,
+    fine_zoom: ZoomLevel,
+    factor: u32,
+) -> Option<PooledTile> {
+    let factor_i64 = i64::from(factor);
+    // `div_euclid(child, factor) == coarse` for every child in
+    // `[coarse * factor, coarse * factor + factor)`, so this base is the
+    // floor-aligned first child, negatives included.
+    let base_x = i64::from(key.tx) * factor_i64;
+    let base_y = i64::from(key.ty) * factor_i64;
+    let mut children: Vec<Option<Arc<Tile>>> = Vec::with_capacity((factor * factor) as usize);
+    for cy in 0..factor {
+        for cx in 0..factor {
+            // Narrowing is safe: the coarse block rect fit i32 above and
+            // every child index describes a block inside it.
+            let tx = i32::try_from(base_x + i64::from(cx))
+                .expect("the coarse rect fits i32, and its children lie inside it");
+            let ty = i32::try_from(base_y + i64::from(cy))
+                .expect("the coarse rect fits i32, and its children lie inside it");
+            children.push(cache.get(&TileKey {
+                zoom: fine_zoom,
+                tx,
+                ty,
+                ..*key
+            }));
+        }
+    }
+
+    // Any present child fixes the output grid; without one this level has
+    // nothing to pool and the caller may try a deeper one.
+    let (width, height) = children
+        .iter()
+        .flatten()
+        .next()
+        .map(|tile| (tile.width, tile.height))?;
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let factor_usize = factor as usize;
+    // Zeroes are the no-data value: uncovered pixels are left untouched.
+    let mut rgba = vec![0u8; width_usize * height_usize * 4];
+    for py in 0..height {
+        for px in 0..width {
+            let mut sum = [0u32; 4];
+            let mut samples = 0u32;
+            for sy in 0..factor {
+                let gy = u64::from(py) * u64::from(factor) + u64::from(sy);
+                let cy = (gy / u64::from(height)) as usize;
+                let ly = (gy % u64::from(height)) as usize;
+                for sx in 0..factor {
+                    let gx = u64::from(px) * u64::from(factor) + u64::from(sx);
+                    let cx = (gx / u64::from(width)) as usize;
+                    let lx = (gx % u64::from(width)) as usize;
+                    let Some(child) = children[cy * factor_usize + cx].as_ref() else {
+                        continue;
+                    };
+                    // Production tiles share one grid; a foreign one would
+                    // be sampled with the wrong stride, so it is no-data.
+                    if child.width != width || child.height != height {
+                        continue;
+                    }
+                    let index = (ly * width_usize + lx) * 4;
+                    for (channel, total) in sum.iter_mut().enumerate() {
+                        *total += u32::from(child.rgba[index + channel]);
+                    }
+                    samples += 1;
+                }
+            }
+            if samples == 0 {
+                continue;
+            }
+            let out = (py as usize * width_usize + px as usize) * 4;
+            for (channel, total) in sum.iter().enumerate() {
+                rgba[out + channel] = u8::try_from(total / samples)
+                    .expect("the average of u8 samples cannot exceed u8::MAX");
+            }
+        }
+    }
+
+    Some(PooledTile {
+        key: *key,
+        width,
+        height,
+        rgba,
+        source_zoom: fine_zoom,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -709,7 +954,14 @@ mod tests {
     /// Caches a 2×2 black tile under `key` — the placeholder helpers only
     /// read the key, never the pixels.
     fn cache_tile(cache: &TileCache, key: TileKey) {
-        let tile = Tile::new(key, 2, 2, vec![0u8; 16]).expect("2x2 RGBA is exactly 16 bytes");
+        cache_tile_with_fidelity(cache, key, SummaryFidelity::Full);
+    }
+
+    /// Caches a 2×2 black tile tagged with `fidelity`.
+    fn cache_tile_with_fidelity(cache: &TileCache, key: TileKey, fidelity: SummaryFidelity) {
+        let tile = Tile::new(key, 2, 2, vec![0u8; 16])
+            .expect("2x2 RGBA is exactly 16 bytes")
+            .with_fidelity(fidelity);
         cache.insert(Arc::new(tile));
     }
 
@@ -733,6 +985,34 @@ mod tests {
             placeholder.tile.key.zoom,
             ZoomLevel::new(1).expect("level 1 is in range")
         );
+    }
+
+    /// T29: stand-ins are fidelity-blind by design — a surface-only tile is
+    /// a valid placeholder in both zoom directions; only the scheduler's
+    /// real cache-hit check enforces provenance.
+    #[test]
+    fn fidelity_placeholders_accept_weaker_tiles_as_stand_ins() {
+        let parent = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        let child = key(1, 7, Layer::Biome, 0, 0, 0, 0);
+        let covering_cache = placeholder_cache();
+        cache_tile_with_fidelity(&covering_cache, parent, SummaryFidelity::SurfaceOnly);
+        let covering =
+            covering_placeholder(&covering_cache, &child).expect("a weaker parent stands in");
+        assert_eq!(covering.tile.key, parent);
+        assert_eq!(covering.tile.fidelity, SummaryFidelity::SurfaceOnly);
+
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        let pooled_cache = placeholder_cache();
+        for (tx, ty) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            cache_tile_with_fidelity(
+                &pooled_cache,
+                key(1, 7, Layer::Biome, 0, 0, tx, ty),
+                SummaryFidelity::SurfaceOnly,
+            );
+        }
+        let pooled = pooled_placeholder(&pooled_cache, &coarse)
+            .expect("weaker children pool into a coarse stand-in");
+        assert_eq!(pooled.key, coarse);
     }
 
     #[test]
@@ -849,5 +1129,370 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Pooled placeholder (zoom-out stand-in) -----------------------------
+
+    /// Caches a `width × height` tile under `key`, filling each pixel from
+    /// `pixel(x, y)` — lets a test lay out an exact sample grid.
+    fn cache_pattern(
+        cache: &TileCache,
+        key: TileKey,
+        width: u32,
+        height: u32,
+        pixel: impl Fn(u32, u32) -> [u8; 4],
+    ) {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&pixel(x, y));
+            }
+        }
+        let tile = Tile::new(key, width, height, rgba).expect("the buffer matches the pixel grid");
+        cache.insert(Arc::new(tile));
+    }
+
+    /// Caches a solid-colour `size × size` tile under `key`.
+    fn cache_solid(cache: &TileCache, key: TileKey, color: [u8; 4], size: u32) {
+        cache_pattern(cache, key, size, size, |_, _| color);
+    }
+
+    #[test]
+    fn pooling_placeholder_averages_four_children_exactly() {
+        let cache = placeholder_cache();
+        // Coarse (0,0) at step 2 owns the four step-1 children below it.
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        let colors = [
+            [10, 20, 30, 255],
+            [40, 50, 60, 255],
+            [70, 80, 90, 127],
+            [100, 110, 120, 0],
+        ];
+        for (index, color) in colors.iter().enumerate() {
+            let (cx, cy) = (index as i32 % 2, index as i32 / 2);
+            cache_solid(&cache, key(1, 7, Layer::Biome, 0, 0, cx, cy), *color, 2);
+        }
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("all four children are cached");
+        assert_eq!(pooled.key, coarse);
+        assert_eq!((pooled.width, pooled.height), (2, 2));
+        assert_eq!(
+            pooled.source_zoom,
+            ZoomLevel::new(0).expect("level 0 is in range")
+        );
+        assert_eq!(pooled.rgba.len(), 2 * 2 * 4);
+        for (index, color) in colors.iter().enumerate() {
+            let (x, y) = (index % 2, index / 2);
+            let offset = (y * 2 + x) * 4;
+            assert_eq!(
+                &pooled.rgba[offset..offset + 4],
+                color,
+                "quadrant ({x}, {y}) averages its child's uniform pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn pooling_placeholder_prefers_the_closest_finer_level() {
+        let cache = placeholder_cache();
+        // Coarse level 2 (step 4) at (0,0): its level-1 children (factor
+        // 2) and level-0 grandchildren (factor 4) both cover it.
+        let coarse = key(1, 7, Layer::Biome, 0, 2, 0, 0);
+        for cy in 0..4 {
+            for cx in 0..4 {
+                cache_solid(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                    [1, 2, 3, 255],
+                    2,
+                );
+            }
+        }
+        for cy in 0..2 {
+            for cx in 0..2 {
+                cache_solid(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 1, cx, cy),
+                    [9, 8, 7, 255],
+                    2,
+                );
+            }
+        }
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("both levels are cached");
+        assert_eq!(
+            pooled.source_zoom,
+            ZoomLevel::new(1).expect("level 1 is in range"),
+            "the step-2 children dominate; step-1 grandchildren only add blur"
+        );
+        assert_eq!(&pooled.rgba[0..4], &[9, 8, 7, 255]);
+
+        // Without the level-1 children the level-0 grandchildren are the
+        // closest level left, so they are pooled at factor 4.
+        let cache = placeholder_cache();
+        for cy in 0..4 {
+            for cx in 0..4 {
+                cache_solid(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                    [1, 2, 3, 255],
+                    2,
+                );
+            }
+        }
+        let pooled = pooled_placeholder(&cache, &coarse).expect("the grandchildren are cached");
+        assert_eq!(
+            pooled.source_zoom,
+            ZoomLevel::new(0).expect("level 0 is in range")
+        );
+        assert_eq!(&pooled.rgba[0..4], &[1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn pooling_placeholder_marks_missing_children_as_no_data() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 0, 0, 0),
+            [12, 34, 56, 255],
+            2,
+        );
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("one child suffices");
+        assert_eq!(
+            &pooled.rgba[0..4],
+            &[12, 34, 56, 255],
+            "the cached quadrant pools"
+        );
+        for offset in [4, 8, 12] {
+            assert_eq!(
+                &pooled.rgba[offset..offset + 4],
+                &[0, 0, 0, 0],
+                "an uncovered quadrant is transparent: no data"
+            );
+        }
+    }
+
+    #[test]
+    fn pooling_placeholder_handles_negative_tile_indices() {
+        let cache = placeholder_cache();
+        // Coarse (-1,-1) at step 2 owns the step-1 children (-2,-2),
+        // (-1,-2), (-2,-1), (-1,-1): floor semantics, not truncation.
+        let coarse = key(1, 7, Layer::Biome, 0, 1, -1, -1);
+        for (cx, cy) in [(-2, -2), (-1, -2), (-2, -1), (-1, -1)] {
+            cache_solid(
+                &cache,
+                key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                [7, 7, 7, 255],
+                2,
+            );
+        }
+        // A positive-index child must not contribute to a negative key.
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 0, 0, 0),
+            [200, 0, 0, 255],
+            2,
+        );
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("the negative children are cached");
+        assert_eq!(pooled.key, coarse);
+        assert!(
+            pooled.rgba.chunks(4).all(|pixel| pixel == [7, 7, 7, 255]),
+            "every quadrant pools from children -2..=-1: {pooled:?}"
+        );
+    }
+
+    #[test]
+    fn pooling_placeholder_without_children_returns_none() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        assert!(
+            pooled_placeholder(&cache, &coarse).is_none(),
+            "an empty cache has nothing to pool"
+        );
+
+        // Another subject's children are different terrain: identity,
+        // seed, layer and mode all have to agree.
+        cache_solid(
+            &cache,
+            key(1, 8, Layer::Biome, 0, 0, 0, 0),
+            [1, 1, 1, 255],
+            2,
+        );
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Height, 0, 0, 1, 0),
+            [1, 1, 1, 255],
+            2,
+        );
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::CaveSlice, 64, 0, 0, 1),
+            [1, 1, 1, 255],
+            2,
+        );
+        cache_solid(
+            &cache,
+            key(2, 7, Layer::Biome, 0, 0, 1, 1),
+            [1, 1, 1, 255],
+            2,
+        );
+        assert!(
+            pooled_placeholder(&cache, &coarse).is_none(),
+            "other subjects never pool in"
+        );
+
+        // Coarser tiles belong to the covering direction, and a tile is
+        // not its own child.
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 2, 0, 0),
+            [1, 1, 1, 255],
+            2,
+        );
+        cache_solid(&cache, coarse, [1, 1, 1, 255], 2);
+        assert!(pooled_placeholder(&cache, &coarse).is_none());
+    }
+
+    #[test]
+    fn pooling_placeholder_is_none_at_the_finest_level() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, ZoomLevel::MIN.0, 0, 0);
+        cache_solid(&cache, coarse, [1, 1, 1, 255], 2);
+        assert!(
+            pooled_placeholder(&cache, &coarse).is_none(),
+            "no finer level exists to pool from"
+        );
+    }
+
+    #[test]
+    fn pooling_placeholder_prefers_a_partial_closer_level_over_a_complete_deeper_one() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, 2, 0, 0);
+        // One level-1 child (step 2), the complete level-0 set (step 4).
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 1, 1, 1),
+            [3, 4, 5, 255],
+            2,
+        );
+        for cy in 0..4 {
+            for cx in 0..4 {
+                cache_solid(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                    [9, 9, 9, 255],
+                    2,
+                );
+            }
+        }
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("the level-1 child suffices");
+        assert_eq!(
+            pooled.source_zoom,
+            ZoomLevel::new(1).expect("level 1 is in range")
+        );
+        // Child (1,1) of the coarse tile is its south-east quadrant.
+        assert_eq!(&pooled.rgba[12..16], &[3, 4, 5, 255]);
+        assert_eq!(
+            &pooled.rgba[0..4],
+            &[0, 0, 0, 0],
+            "the rest is pending, not filled in from the deeper level"
+        );
+    }
+
+    #[test]
+    fn pooling_placeholder_handles_non_square_pixel_grids() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        // 4 x 2 fine pixels per child; at factor 2 the coarse grid is also
+        // 4 x 2 and a coarse pixel averages a 2 x 2 block of the fine grid,
+        // whose row stride is the *width* (4), not the factor.
+        for cy in 0..2i32 {
+            for cx in 0..2i32 {
+                let base = 50 * (cy * 2 + cx) as u8;
+                cache_pattern(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                    4,
+                    2,
+                    |x, y| [base + (y * 4 + x) as u8, 0, 0, 255],
+                );
+            }
+        }
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("all children are cached");
+        assert_eq!((pooled.width, pooled.height), (4, 2));
+        // Output pixel (x, y) starts at this byte; the row stride is 4.
+        let at = |x: usize, y: usize| (y * 4 + x) * 4;
+        // (0,0) pools child (0,0) pixels 0, 1, 4, 5 -> 2 (truncated).
+        assert_eq!(&pooled.rgba[at(0, 0)..at(0, 0) + 4], &[2, 0, 0, 255]);
+        // (1,1) pools child (0,1) (base 100) pixels 2, 3, 6, 7 -> 104.
+        assert_eq!(&pooled.rgba[at(1, 1)..at(1, 1) + 4], &[104, 0, 0, 255]);
+        // (2,0) opens child (1,0) (base 50): 50, 51, 54, 55 -> 52.
+        assert_eq!(&pooled.rgba[at(2, 0)..at(2, 0) + 4], &[52, 0, 0, 255]);
+        // (3,1) pools child (1,1) (base 150): 152, 153, 156, 157 -> 154.
+        assert_eq!(&pooled.rgba[at(3, 1)..at(3, 1) + 4], &[154, 0, 0, 255]);
+    }
+
+    #[test]
+    fn pooling_placeholder_ignores_children_with_other_pixel_grids() {
+        let cache = placeholder_cache();
+        let coarse = key(1, 7, Layer::Biome, 0, 1, 0, 0);
+        // The first present child (row-major) fixes the grid; a child with
+        // a foreign grid would be sampled with the wrong stride, so it is
+        // treated as no data.
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 0, 0, 0),
+            [5, 5, 5, 255],
+            2,
+        );
+        cache_solid(
+            &cache,
+            key(1, 7, Layer::Biome, 0, 0, 1, 1),
+            [9, 9, 9, 255],
+            4,
+        );
+
+        let pooled = pooled_placeholder(&cache, &coarse).expect("one child fixes the grid");
+        assert_eq!((pooled.width, pooled.height), (2, 2));
+        assert_eq!(&pooled.rgba[0..4], &[5, 5, 5, 255]);
+        assert_eq!(
+            &pooled.rgba[12..16],
+            &[0, 0, 0, 0],
+            "the 4x4 child is skipped"
+        );
+    }
+
+    #[test]
+    fn pooling_placeholder_stops_at_the_pool_factor_cap() {
+        let cache = placeholder_cache();
+        // Factor 16 (four levels finer) is past MAX_POOL_FACTOR: the read
+        // cost would dwarf the blur it adds.
+        let too_deep = key(1, 7, Layer::Biome, 0, 4, 0, 0);
+        for cy in 0..16 {
+            for cx in 0..16 {
+                cache_solid(
+                    &cache,
+                    key(1, 7, Layer::Biome, 0, 0, cx, cy),
+                    [1, 1, 1, 255],
+                    1,
+                );
+            }
+        }
+        assert!(
+            pooled_placeholder(&cache, &too_deep).is_none(),
+            "factor 16 is past the cap; the app shows its pending treatment"
+        );
+        // Factor 8 (three levels finer) is still inside the cap.
+        let within_cap = key(1, 7, Layer::Biome, 0, 3, 0, 0);
+        let pooled = pooled_placeholder(&cache, &within_cap).expect("factor 8 is within the cap");
+        assert_eq!(
+            pooled.source_zoom,
+            ZoomLevel::new(0).expect("level 0 is in range")
+        );
     }
 }

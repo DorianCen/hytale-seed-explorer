@@ -25,6 +25,7 @@ use map_core::coords::{TileCoord, TileRect, ZoomLevel};
 use map_core::error::SourceError;
 use map_core::render::Layer;
 use map_core::scheduler::{CancelToken, TilePass, TileRenderer, TileScheduler, TileSubject};
+use map_core::source::SummaryFidelity;
 use map_core::tiles::{Tile, TileCache, TileKey, covering_placeholder};
 
 // ---------------------------------------------------------------------------
@@ -70,7 +71,12 @@ impl FakeRenderer {
 }
 
 impl TileRenderer for FakeRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> Result<Tile, SourceError> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        _fidelity: SummaryFidelity,
+    ) -> Result<Tile, SourceError> {
         let start = Instant::now();
         let deadline = start + Duration::from_millis(self.render_ms);
         while Instant::now() < deadline {

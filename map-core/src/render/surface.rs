@@ -39,7 +39,7 @@ use crate::render::fluid::{DEFAULT_FLUID_OPACITY, fluid_blend};
 use crate::render::relief;
 use crate::render::tiles::render_layer_tile;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::{Rect, SurfaceGrid, SurfaceSample};
 
@@ -206,7 +206,12 @@ impl SurfaceTileRenderer {
 }
 
 impl TileRenderer for SurfaceTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         // The hillshade's slope needs the neighbour samples; the flat
         // render does not, and a full-block ring is a whole chunk wider.
         let border = u32::from(self.options.hillshade);
@@ -214,9 +219,12 @@ impl TileRenderer for SurfaceTileRenderer {
             self.source.as_ref(),
             key,
             cancel,
+            fidelity,
             self.world,
             border,
-            |source, rect, step, cancel| source.surface_region_cancelled(rect, step, cancel),
+            |source, rect, step, cancel| {
+                source.surface_region_cancelled(rect, step, cancel, fidelity)
+            },
             |grid, query, cancel| {
                 surface_image(
                     grid,
@@ -231,5 +239,200 @@ impl TileRenderer for SurfaceTileRenderer {
                 .map(|image| (image, (0, 0)))
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    use crate::catalog::{BiomeCatalog, FluidCatalog, ZoneCatalog};
+    use crate::coords::ZoomLevel;
+    use crate::render::Layer;
+    use crate::scheduler::cancel_token;
+    use crate::types::{
+        BiomeGrid, BiomeId, BlockId, GeneratorIdentity, HeightGrid, Seed, SliceGrid, SpawnPoint,
+        SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
+    };
+
+    /// Records the fidelity each surface query asks for; every other layer
+    /// is unused by the surface renderer.
+    struct RecordingSurfaceSource {
+        identity: GeneratorIdentity,
+        seed: Seed,
+        biomes: BiomeCatalog,
+        blocks: BlockCatalog,
+        fluids: FluidCatalog,
+        zones: ZoneCatalog,
+        fidelities: Arc<Mutex<Vec<SummaryFidelity>>>,
+    }
+
+    fn unused() -> SourceError {
+        SourceError::Unsupported("not used by the surface renderer tests")
+    }
+
+    impl WorldSource for RecordingSurfaceSource {
+        fn identity(&self) -> &GeneratorIdentity {
+            &self.identity
+        }
+
+        fn seed(&self) -> &Seed {
+            &self.seed
+        }
+
+        fn biome_at(&self, _x: i32, _z: i32) -> SourceResult<BiomeId> {
+            Err(unused())
+        }
+
+        fn biome_region(&self, _rect: Rect, _step: u32) -> SourceResult<BiomeGrid> {
+            Err(unused())
+        }
+
+        fn height_at(&self, _x: i32, _z: i32) -> SourceResult<i32> {
+            Err(unused())
+        }
+
+        fn height_region(&self, _rect: Rect, _step: u32) -> SourceResult<HeightGrid> {
+            Err(unused())
+        }
+
+        fn surface_at(&self, _x: i32, _z: i32) -> SourceResult<SurfaceSample> {
+            Err(unused())
+        }
+
+        fn surface_region(
+            &self,
+            rect: Rect,
+            step: u32,
+            fidelity: SummaryFidelity,
+        ) -> SourceResult<SurfaceGrid> {
+            self.record(rect, step, fidelity)
+        }
+
+        fn surface_region_cancelled(
+            &self,
+            rect: Rect,
+            step: u32,
+            _cancel: &CancelToken,
+            fidelity: SummaryFidelity,
+        ) -> SourceResult<SurfaceGrid> {
+            self.record(rect, step, fidelity)
+        }
+
+        fn slice_region(&self, _rect: Rect, _step: u32, _y: i32) -> SourceResult<SliceGrid> {
+            Err(unused())
+        }
+
+        fn spawn_points(&self) -> SourceResult<Vec<SpawnPoint>> {
+            Err(unused())
+        }
+
+        fn zone_at(&self, _x: i32, _z: i32) -> SourceResult<Option<ZoneId>> {
+            Err(unused())
+        }
+
+        fn zone_region(&self, _rect: Rect, _step: u32) -> SourceResult<ZoneGrid> {
+            Err(unused())
+        }
+
+        fn biome_catalog(&self) -> &BiomeCatalog {
+            &self.biomes
+        }
+
+        fn block_catalog(&self) -> &BlockCatalog {
+            &self.blocks
+        }
+
+        fn fluid_catalog(&self) -> &FluidCatalog {
+            &self.fluids
+        }
+
+        fn zone_catalog(&self) -> &ZoneCatalog {
+            &self.zones
+        }
+    }
+
+    impl RecordingSurfaceSource {
+        fn record(
+            &self,
+            rect: Rect,
+            step: u32,
+            fidelity: SummaryFidelity,
+        ) -> SourceResult<SurfaceGrid> {
+            self.fidelities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fidelity);
+            let (width, height) = rect.sample_dims(step);
+            let sample = SurfaceSample {
+                x: rect.min_x,
+                z: rect.min_z,
+                biome: BiomeId(0),
+                height: 64,
+                block: BlockId(0),
+                fluid: None,
+                fluid_depth: 0,
+                tint: 0,
+            };
+            Ok(SurfaceGrid::new(
+                rect.min_x,
+                rect.min_z,
+                step,
+                width,
+                height,
+                vec![sample; (width * height) as usize],
+            ))
+        }
+    }
+
+    /// T29: the surface tile renderer is the summary-based path, so the
+    /// pass fidelity must reach the source's surface query unchanged.
+    #[test]
+    fn fidelity_renderer_forwards_the_pass_fidelity_to_the_source() {
+        let fidelities = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::new(RecordingSurfaceSource {
+            identity: GeneratorIdentity {
+                generator_version: 0,
+                world_assets: String::from("test"),
+                palette_version: 0,
+            },
+            seed: Seed::parse("7").expect("a numeric test seed"),
+            biomes: BiomeCatalog::default(),
+            blocks: BlockCatalog::default(),
+            fluids: FluidCatalog::default(),
+            zones: ZoneCatalog::default(),
+            fidelities: Arc::clone(&fidelities),
+        });
+        let renderer = SurfaceTileRenderer::new(
+            source,
+            None,
+            SurfaceOptions {
+                palette: Arc::new(BlockPalette::fallback()),
+                hillshade: false,
+            },
+        );
+        let key = TileKey {
+            identity_hash: 1,
+            generator_seed: 7,
+            layer: Layer::Surface,
+            mode: 0,
+            zoom: ZoomLevel::MIN,
+            tx: 0,
+            ty: 0,
+        };
+        let cancel = cancel_token();
+        for fidelity in [SummaryFidelity::Full, SummaryFidelity::SurfaceOnly] {
+            TileRenderer::render(&renderer, &key, &cancel, fidelity)
+                .expect("the recording source serves any rect");
+        }
+        assert_eq!(
+            *fidelities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![SummaryFidelity::Full, SummaryFidelity::SurfaceOnly],
+            "the renderer must forward the pass fidelity, in order"
+        );
     }
 }

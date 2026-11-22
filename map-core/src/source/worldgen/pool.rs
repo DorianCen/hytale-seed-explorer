@@ -35,6 +35,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::error::{SourceError, SourceResult};
+use crate::source::SummaryFidelity;
 use crate::types::{Feature, FeatureFilter, Rect, SpawnPoint, ZoneId};
 
 /// Everything a worker needs to load its own generator. `Send` by
@@ -102,10 +103,12 @@ pub(crate) enum Command {
         reply: Reply<Option<ZoneId>>,
     },
     /// Generate one chunk and extract its compact summary (T09). The caller
-    /// caches; the worker never retains the `GeneratedChunk`.
+    /// caches it under its fidelity; the worker never retains the
+    /// `GeneratedChunk`.
     GenerateSummary {
         cx: i32,
         cz: i32,
+        fidelity: SummaryFidelity,
         reply: Reply<Arc<crate::source::chunks::ChunkSummary>>,
     },
     /// Generate one chunk and extract one horizontal slice (T09). The reply
@@ -473,14 +476,21 @@ impl GeneratorPool {
     }
 
     /// Requests one chunk summary: generation + extraction on a worker. The
-    /// caller caches the result; the worker never retains the chunk.
+    /// caller caches the result under its fidelity; the worker never retains
+    /// the chunk.
     pub fn generate_summary(
         &self,
         cx: i32,
         cz: i32,
+        fidelity: SummaryFidelity,
     ) -> SourceResult<Arc<crate::source::chunks::ChunkSummary>> {
         let (tx, rx) = mpsc::channel();
-        self.send(Command::GenerateSummary { cx, cz, reply: tx })?;
+        self.send(Command::GenerateSummary {
+            cx,
+            cz,
+            fidelity,
+            reply: tx,
+        })?;
         rx.recv()
             .map_err(|_| SourceError::Internal("the summary reply channel closed".to_string()))?
     }
@@ -638,13 +648,19 @@ fn worker_main(
                 let result = crate::source::worldgen::zone_at(&generator, seed, x, z);
                 let _ = send_reply(reply, result);
             }
-            Command::GenerateSummary { cx, cz, reply } => {
+            Command::GenerateSummary {
+                cx,
+                cz,
+                fidelity,
+                reply,
+            } => {
                 let result = crate::source::worldgen::generate_summary(
                     &generator,
                     &mut gen_state,
                     seed,
                     cx,
                     cz,
+                    fidelity,
                 );
                 let _ = send_reply(reply, result);
             }

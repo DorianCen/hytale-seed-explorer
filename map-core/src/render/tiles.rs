@@ -31,7 +31,7 @@ use crate::render::relief::ReliefTileRenderer;
 use crate::render::surface::{SurfaceOptions, SurfaceTileRenderer};
 use crate::render::zone::ZoneTileRenderer;
 use crate::scheduler::{CancelToken, TileRenderer};
-use crate::source::WorldSource;
+use crate::source::{SummaryFidelity, WorldSource};
 use crate::tiles::{Tile, TileKey};
 use crate::types::Rect;
 
@@ -168,15 +168,22 @@ pub fn blit_patch(canvas: &mut RgbaImage, patch: &RgbaImage, origin: (i32, i32))
 ///   carries the offset; a border-aware layer may instead return a
 ///   canvas-true image at `(0,0)`).
 ///
+/// `fidelity` is stamped onto the finished tile's provenance (T29) and is
+/// what the summary-based layers forward to the source.
+///
 /// The token is checked before the query — a cancelled tile never
 /// starts its work unit — and `paint` may check it between row batches
 /// (the expensive layers do). A render that completes despite its
 /// token is returned normally: the scheduler caches it (the pixels are
 /// content-addressed) and reports the cancellation itself.
+// The skeleton mirrors a renderer's whole job (query plan + fetch + paint);
+// one more argument than clippy's default is the fidelity stamp (T29).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_layer_tile<G>(
     source: &dyn WorldSource,
     key: &TileKey,
     cancel: &CancelToken,
+    fidelity: SummaryFidelity,
     world: Option<Rect>,
     border: u32,
     fetch: impl FnOnce(&dyn WorldSource, Rect, u32, &CancelToken) -> SourceResult<G>,
@@ -208,7 +215,8 @@ pub(crate) fn render_layer_tile<G>(
     }
     Ok(
         Tile::new(*key, TILE_SIZE, TILE_SIZE, canvas.as_raw().clone())
-            .expect("the canvas is TILE_SIZE square with a matching buffer"),
+            .expect("the canvas is TILE_SIZE square with a matching buffer")
+            .with_fidelity(fidelity),
     )
 }
 
@@ -257,14 +265,19 @@ impl LayeredTileRenderer {
 }
 
 impl TileRenderer for LayeredTileRenderer {
-    fn render(&self, key: &TileKey, cancel: &CancelToken) -> SourceResult<Tile> {
+    fn render(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+    ) -> SourceResult<Tile> {
         match key.layer {
-            Layer::Biome => TileRenderer::render(&self.biome, key, cancel),
-            Layer::Height => TileRenderer::render(&self.height, key, cancel),
-            Layer::Relief => TileRenderer::render(&self.relief, key, cancel),
-            Layer::Fluid => TileRenderer::render(&self.fluid, key, cancel),
-            Layer::Zone => TileRenderer::render(&self.zone, key, cancel),
-            Layer::Surface => TileRenderer::render(&self.surface, key, cancel),
+            Layer::Biome => TileRenderer::render(&self.biome, key, cancel, fidelity),
+            Layer::Height => TileRenderer::render(&self.height, key, cancel, fidelity),
+            Layer::Relief => TileRenderer::render(&self.relief, key, cancel, fidelity),
+            Layer::Fluid => TileRenderer::render(&self.fluid, key, cancel, fidelity),
+            Layer::Zone => TileRenderer::render(&self.zone, key, cancel, fidelity),
+            Layer::Surface => TileRenderer::render(&self.surface, key, cancel, fidelity),
             Layer::CaveSlice | Layer::CaveDensity => Err(SourceError::Unsupported(
                 "this layer has no renderer yet (caves: T28)",
             )),

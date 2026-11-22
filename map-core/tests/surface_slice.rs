@@ -17,8 +17,8 @@ use std::thread;
 use std::time::Duration;
 
 use map_core::error::SourceError;
-use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
+use map_core::source::{SummaryFidelity, WorldSource};
 use map_core::types::{BiomeId, BlockId, FluidId, Rect, SliceCell, SurfaceSample};
 
 use worldgen_hytale::chunk::chunk_generator::ChunkGenerator;
@@ -301,7 +301,7 @@ fn surface_region_matches_surface_at_at_steps_1_2_4() {
     let rect = Rect::from_dims(7, -40, 40, 29);
     for step in [1_u32, 2, 4] {
         let grid = source
-            .surface_region(rect, step)
+            .surface_region(rect, step, SummaryFidelity::Full)
             .expect("the source serves the surface region");
         let (width, height) = rect.sample_dims(step);
         assert_eq!(
@@ -407,7 +407,7 @@ fn out_of_bounds_queries_are_typed_errors() {
     // Check every path independently so one wrong result does not hide the
     // state of the others.
     let surface = source.surface_at(x, 0);
-    let region = source.surface_region(rect, 1);
+    let region = source.surface_region(rect, 1, SummaryFidelity::Full);
     let slice = source.slice_region(rect, 1, 64);
 
     let mut failures = Vec::new();
@@ -473,7 +473,7 @@ fn a_large_surface_region_can_be_cancelled() {
     // 2×64 chunks: ~60 s uncancelled, but the token poll between chunks lands
     // within about one chunk generation.
     let rect = Rect::from_dims(0, 0, 64, 2048);
-    let in_flight = thread::spawn(move || source.surface_region(rect, 1));
+    let in_flight = thread::spawn(move || source.surface_region(rect, 1, SummaryFidelity::Full));
     thread::sleep(Duration::from_millis(150));
     source.cancel_pending();
     let result = in_flight
@@ -486,7 +486,7 @@ fn a_large_surface_region_can_be_cancelled() {
 
     // The token re-arms at the start of the next region request.
     let grid = source
-        .surface_region(Rect::from_dims(0, 0, 1, 1), 1)
+        .surface_region(Rect::from_dims(0, 0, 1, 1), 1, SummaryFidelity::Full)
         .expect("the source still serves a tiny region after a cancel");
     assert_eq!(grid.width, 1, "the tiny region has one sample");
     assert_eq!(grid.height, 1, "the tiny region has one sample");
