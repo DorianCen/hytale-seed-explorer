@@ -283,6 +283,43 @@ impl TileRenderer for LayeredTileRenderer {
             )),
         }
     }
+
+    /// Forwards streaming to the layer that supports it (the full-block
+    /// surface layer, one chunk row at a time); every other layer takes the
+    /// trait's no-streaming default. The dispatcher is the renderer the app
+    /// hands the scheduler, so without this forward the surface override
+    /// would be unreachable in production.
+    fn render_streaming(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+        progress: &mut dyn FnMut(Tile),
+    ) -> SourceResult<Tile> {
+        match key.layer {
+            Layer::Biome => {
+                TileRenderer::render_streaming(&self.biome, key, cancel, fidelity, progress)
+            }
+            Layer::Height => {
+                TileRenderer::render_streaming(&self.height, key, cancel, fidelity, progress)
+            }
+            Layer::Relief => {
+                TileRenderer::render_streaming(&self.relief, key, cancel, fidelity, progress)
+            }
+            Layer::Fluid => {
+                TileRenderer::render_streaming(&self.fluid, key, cancel, fidelity, progress)
+            }
+            Layer::Zone => {
+                TileRenderer::render_streaming(&self.zone, key, cancel, fidelity, progress)
+            }
+            Layer::Surface => {
+                TileRenderer::render_streaming(&self.surface, key, cancel, fidelity, progress)
+            }
+            Layer::CaveSlice | Layer::CaveDensity => Err(SourceError::Unsupported(
+                "this layer has no renderer yet (caves: T28)",
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

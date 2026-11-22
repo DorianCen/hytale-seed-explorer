@@ -125,6 +125,13 @@ pub struct Tile {
     /// deliberately fidelity-blind. Every construction path defaults to
     /// [`SummaryFidelity::Full`]; renderers set the pass's value.
     pub fidelity: SummaryFidelity,
+    /// Whether every pixel of the tile is final. `false` marks a streaming
+    /// publication — a full-size snapshot with the not-yet-drawn rows still
+    /// alpha 0. Incomplete tiles are valid *placeholders*, but never satisfy
+    /// a pass's cache short-circuit ([`TileCache::contains_serving`]), so a
+    /// cancelled stream's leftover partial is re-rendered instead of being
+    /// served forever.
+    pub complete: bool,
     /// When the tile was created. A generation/priority stamp for T15's
     /// scheduling and T33's tuning reports; not part of any key.
     pub created: Instant,
@@ -152,6 +159,7 @@ impl Tile {
             height,
             rgba,
             fidelity: SummaryFidelity::Full,
+            complete: true,
             created: Instant::now(),
         })
     }
@@ -162,6 +170,17 @@ impl Tile {
     #[must_use]
     pub fn with_fidelity(mut self, fidelity: SummaryFidelity) -> Self {
         self.fidelity = fidelity;
+        self
+    }
+
+    /// Sets whether this tile is complete (default `true`). Streaming
+    /// renderers mark their intermediate publications `false`: they are
+    /// full-size snapshots with the not-yet-drawn rows alpha 0, valid as
+    /// placeholders but never as a pass's authoritative cache hit. The
+    /// final tile of a stream is complete.
+    #[must_use]
+    pub fn with_complete(mut self, complete: bool) -> Self {
+        self.complete = complete;
         self
     }
 
@@ -318,7 +337,8 @@ impl TileCache {
     ///
     /// Keys are content-addressed within one fidelity, so re-inserting an
     /// existing key normally refreshes identical pixels; the T29
-    /// provenance upgrade (surface-only → full) replaces the pixels
+    /// provenance upgrade (surface-only → full) and a streaming band's
+    /// successive snapshots (incomplete → complete) replace the pixels
     /// instead. Either way subscribers are notified (moka's "replaced"
     /// semantics, so the bridge can drop the old upload) but it does not
     /// count as an eviction.
@@ -338,15 +358,20 @@ impl TileCache {
     /// Whether the cached tile at `key` is at least as authoritative as
     /// `fidelity` — the scheduler's fidelity-aware cache-hit test (T29).
     ///
-    /// A weaker cached tile (surface-only where a full pass asks) is a
-    /// miss: the pass must re-render and overwrite the entry. Without
-    /// recency or hit/miss side effects, like [`TileCache::contains`].
+    /// Two conditions: the tile must be **complete** (a streaming partial
+    /// never stands as the finished tile — the scheduler re-queues and the
+    /// re-render overwrites it) and its provenance must satisfy `fidelity`
+    /// (a surface-only tile is a miss for a full pass). Without recency or
+    /// hit/miss side effects, like [`TileCache::contains`].
+    ///
+    /// Completeness is *not* required of the placeholder helpers: a partial
+    /// with alpha-0 rows is still a better stand-in than blank.
     #[must_use]
     pub fn contains_serving(&self, key: &TileKey, fidelity: SummaryFidelity) -> bool {
         lock(&self.inner)
             .entries
             .get(key)
-            .is_some_and(|entry| entry.tile.fidelity.satisfies(fidelity))
+            .is_some_and(|entry| entry.tile.complete && entry.tile.fidelity.satisfies(fidelity))
     }
 
     /// Removes one key explicitly. Subscribers are notified (so the
@@ -534,6 +559,11 @@ pub struct PlaceholderTile {
 /// answer; the scheduler's provenance check governs real hits, not this
 /// helper.
 ///
+/// **Completeness-blind by design (streaming):** a partial tile — a
+/// streaming publication with alpha-0 rows still to come — is also a valid
+/// stand-in. Its known rows are real pixels, which read far better than a
+/// blank; only [`TileCache::contains_serving`] gates on completeness.
+///
 /// Returns [`None`] when no coarser tile of the same subject is cached,
 /// when the key is already at the coarsest level, or when either rect
 /// falls outside the representable block space (the caller paints its
@@ -677,6 +707,11 @@ pub struct PooledTile {
 /// stand-in for a missing coarse tile, just as a surface-only parent is
 /// for [`covering_placeholder`]. Stand-ins never satisfy a real cache hit;
 /// the scheduler's provenance check owns that decision.
+///
+/// **Completeness-blind by design (streaming):** partial children pool
+/// like complete ones — their known rows are real samples, and a half-
+/// painted stand-in beats a blank. Only [`TileCache::contains_serving`]
+/// refuses an incomplete tile as an authoritative hit.
 ///
 /// Returns [`None`] when the key is at [`ZoomLevel::MIN`], when no finer
 /// child of the same subject (identity, seed, layer, mode) is cached, or

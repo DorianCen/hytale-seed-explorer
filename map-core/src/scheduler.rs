@@ -20,6 +20,20 @@
 //!   cache when its `Ready` event arrives, and [`TileScheduler::stats`]
 //!   / [`TileScheduler::is_pending`] expose what is cached-side for T16's
 //!   placeholder painting.
+//! - **Tiles arrive in bands (streaming).** A worker calls
+//!   [`TileRenderer::render_streaming`]; renderers that support it publish
+//!   full-size partial tiles through the same cache + `Ready` path as the
+//!   finished tile, so a zoomed-in full-block tile appears chunk row by
+//!   chunk row instead of popping in whole. Repeated `Ready` events for one
+//!   key are expected (the app's per-key upload replaces the texture), and
+//!   a cancelled stream leaves its already-published bands cached as valid
+//!   data — keyed and fidelity-tagged like a finished tile but marked
+//!   *incomplete*, so a partial is a valid placeholder stand-in and never
+//!   satisfies a later cache hit: the pass re-queues, the re-render
+//!   overwrites the partial, and until it lands the app paints the partial
+//!   as the exact tile (no per-tile pending cue; the frame spinner still
+//!   shows while the re-queue is in flight — a cosmetic caveat, not a
+//!   correctness one).
 //! - **Dedup is exact.** Scheduling skips cached, queued and in-flight
 //!   tiles, so no tile is rendered twice concurrently. A queued job
 //!   whose tile scrolled away and came back is *revived* (its token is
@@ -230,6 +244,28 @@ pub trait TileRenderer: Send + Sync {
         cancel: &CancelToken,
         fidelity: SummaryFidelity,
     ) -> SourceResult<Tile>;
+
+    /// Renders `key` while publishing intermediate results: every
+    /// `progress` call hands the app a **full-size** [`Tile`] carrying the
+    /// pixels completed so far (not-yet-drawn regions stay alpha 0), and
+    /// the return value is the complete tile, bit-identical to
+    /// [`TileRenderer::render`] for the same key and fidelity.
+    ///
+    /// The default means **no streaming**: it renders in one shot and
+    /// never calls `progress`. Only renderers whose work decomposes into
+    /// publishable units override this (the full-block surface layer
+    /// publishes one chunk row at a time). `cancel` is checked between
+    /// those units, exactly as in `render`.
+    fn render_streaming(
+        &self,
+        key: &TileKey,
+        cancel: &CancelToken,
+        fidelity: SummaryFidelity,
+        progress: &mut dyn FnMut(Tile),
+    ) -> SourceResult<Tile> {
+        let _ = progress;
+        self.render(key, cancel, fidelity)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +283,13 @@ pub enum TileEvent {
     /// The tile finished rendering and is in the cache. `generation` is
     /// the request generation the tile was queued under; the app may
     /// drop events from generations older than its current view.
+    ///
+    /// A streaming renderer emits this once per published band, so one
+    /// key can see several `Ready` events before its final tile; each
+    /// carries a full-size [`Tile`] whose not-yet-drawn rows are alpha 0
+    /// and which is marked incomplete (the final completion is complete).
+    /// The app's per-key upload replaces the previous texture, so repeats
+    /// are safe.
     Ready { tile: Arc<Tile>, generation: u64 },
     /// The render failed (panics included); the tile is no longer pending.
     Failed(TileKey, SourceError),
@@ -696,11 +739,31 @@ fn worker_main(
 
         let _ = events.send(TileEvent::Started(job.key));
         let render_started = Instant::now();
+        // Every progress publication is cached and reported through the
+        // same path as a finished tile: the cache is the state of record,
+        // and the app's `Ready` upload is idempotent per key (a re-upload
+        // replaces the texture). The renderer marks those publications
+        // incomplete, so they stand in as placeholders but never satisfy the
+        // scheduler's authoritative cache short-circuit. The closure stays
+        // outside the scheduler lock — `cache.insert` takes the cache's own
+        // lock and must never nest with `shared`.
+        let mut progress = |tile: Tile| {
+            let tile = Arc::new(tile);
+            cache.insert(Arc::clone(&tile));
+            // A partial is still valid, cached data; it is only not worth
+            // uploading when the view has already moved on.
+            if !job.cancel.load(Relaxed) {
+                let _ = events.send(TileEvent::Ready {
+                    tile,
+                    generation: job.generation,
+                });
+            }
+        };
         // Style-guide deviation (documented, same argument as the T08
         // loader boundary): the renderer is foreign code and must not be
         // allowed to kill the pipeline's worker thread.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            renderer.render(&job.key, &job.cancel, job.fidelity)
+            renderer.render_streaming(&job.key, &job.cancel, job.fidelity, &mut progress)
         }));
         let render_nanos = u64::try_from(render_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 

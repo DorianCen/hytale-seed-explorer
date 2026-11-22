@@ -434,6 +434,54 @@ mod fake_surface {
             "an uncancelled surface tile renders normally",
         );
     }
+
+    /// The app hands the scheduler the [`LayeredTileRenderer`] dispatcher, not
+    /// the surface renderer directly, so the dispatcher must forward
+    /// streaming to the surface layer — and only to it.
+    #[test]
+    fn streaming_dispatcher_forwards_only_the_surface_layer() {
+        let fake = Arc::new(FakeWorldSource::new("7"));
+        let palette = palette_covering_the_fake_blocks();
+        let dispatcher = renderer(&fake, &palette, true);
+        let cancel = cancel_token();
+        let surface_key = key(Layer::Surface, 0, 0);
+
+        let mut partials = Vec::new();
+        let streamed = TileRenderer::render_streaming(
+            &dispatcher,
+            &surface_key,
+            &cancel,
+            SummaryFidelity::Full,
+            &mut |tile| partials.push(tile),
+        )
+        .expect("the fake dispatcher streams the surface tile");
+        let plain = TileRenderer::render(&dispatcher, &surface_key, &cancel, SummaryFidelity::Full)
+            .expect("the plain dispatcher renders the surface tile");
+        assert_eq!(
+            streamed.rgba, plain.rgba,
+            "streamed equals plain through the dispatcher"
+        );
+        assert_eq!(partials.len(), 8, "a step-1 tile is 8 chunk-row bands");
+        assert!(
+            partials.iter().all(|tile| !tile.complete),
+            "dispatched band snapshots are incomplete"
+        );
+        assert!(streamed.complete, "the dispatched final tile is complete");
+
+        let mut height_partials = 0;
+        TileRenderer::render_streaming(
+            &dispatcher,
+            &key(Layer::Height, 0, 0),
+            &cancel,
+            SummaryFidelity::Full,
+            &mut |_| height_partials += 1,
+        )
+        .expect("the height layer renders through the dispatcher");
+        assert_eq!(
+            height_partials, 0,
+            "layers without a streaming override publish nothing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
