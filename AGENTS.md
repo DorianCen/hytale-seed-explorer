@@ -108,6 +108,27 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
   fine refine pass — the coarse tiles are placeholder parents
   (`covering_placeholder` crosses zooms), never painted directly.
   Extend `schedule`/`cancel` through the pass APIs, not around them.
+- **Fidelity rides the pass (perf push, Nov 2026).** A fill pass at a
+  step strictly coarser than the user's effective step renders with
+  `SummaryFidelity::SurfaceOnly` (the generator's opt-in mode that
+  skips cave/prefab stages — 5.4× measured, worldgen commit `40dec05`);
+  refine passes and the user's own step are always `Full` — step alone
+  never decides fidelity, a user-chosen coarse view is authoritative.
+  The summary cache keys on fidelity (a SurfaceOnly summary can never
+  serve a Full request), `Tile` carries provenance and a weaker cache
+  hit is re-rendered, and the placeholder lookups are fidelity-blind by
+  design (any cached tile is a valid stand-in).
+- **A missing tile has a stand-in in both zoom directions.**
+  `covering_placeholder` crops a cached coarser tile (zoom-in);
+  `pooled_placeholder` box-averages the cached finer tiles into the
+  missing coarse one (zoom-out — derived pixels, never inserted into the
+  tile cache; alpha-0 means no-data). Unzooming never blanks.
+- The feature overlay fetches in **two tiers** (perf push): cheap kinds
+  (spawn/unique/POI — the T22 kind mask skips the placement pass, so
+  milliseconds) fire immediately at source-ready; the biome-prefab fetch
+  stays debounced with its margin/cap plus a one-shot prewarm query
+  (see `map-app/src/overlays/features.rs` and the budgets in
+  `docs/benchmarks.md`).
 - Heavy background objects (generator sources, worker pools) are dropped
   on background threads, never the UI thread — see the retirement
   pattern in `map-app/src/state.rs`.
