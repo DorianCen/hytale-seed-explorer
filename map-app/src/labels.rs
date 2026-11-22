@@ -30,6 +30,16 @@ pub const VERSION: &str = "Version";
 /// The resolution selector label.
 pub const RESOLUTION: &str = "Resolution";
 
+/// The render-mode selector's label (top bar, next to Resolution).
+pub const RENDER_MODE: &str = "Mode";
+
+/// The default render mode: today's full layer stack.
+pub const MODE_SURFACE: &str = "Surface (full blocks)";
+
+/// The hard-filter render mode: only the biome layer paints, every
+/// structure/prefab/spawn overlay is dark.
+pub const MODE_BIOMES_ONLY: &str = "Biomes (only)";
+
 /// The worker-cap control's label (T21): the generator pool size the
 /// NEXT load uses.
 pub const WORKERS: &str = "workers";
@@ -54,6 +64,9 @@ pub const OPACITY: &str = "opacity";
 /// coarser than one block (T21's "auto-select step 1 only when visible"
 /// note). `{n}×{n}` is the effective step.
 pub const LAYER_HINT_SURFACE: &str = "full-block samples {n}×{n} — zoom in for every block";
+/// Why the left panel's layer checkboxes and overlay rows don't change
+/// the map: the top bar's render mode is a hard filter.
+pub const MODE_HINT_BIOMES_ONLY: &str = "biomes-only mode: other layers and overlays are off";
 /// What the status bar says when no renderable layer is enabled.
 pub const LAYERS_NONE: &str = "none";
 

@@ -28,6 +28,15 @@
 //! "not drawn or fetched": fetches carry a kind filter, drawing carries the
 //! finer group filter.
 //!
+//! # Render-mode gate
+//!
+//! The top bar's Biomes-only mode flips
+//! [`FeatureOverlayState::set_enabled`] to `false`: every planning step
+//! (quick, prewarm, tier 2) returns nothing, the draw list is empty and the
+//! status hint is suppressed, while both catalogs and the query cache stay
+//! for the return to the surface mode — which re-arms the once-per-source
+//! tiers so a switch before the first fetch still gets its markers.
+//!
 //! # Why the rect cap
 //!
 //! `docs/benchmarks.md` §"Feature enumeration (T22)" prices a 2048-block-side
@@ -470,6 +479,12 @@ pub struct FeatureOverlayState {
     /// Tier 1 and the prewarm fire once per source; `reset` re-arms both.
     quick_requested: bool,
     prewarm_requested: bool,
+    /// The master gate behind the top bar's render mode. `false` (the
+    /// biomes-only view) makes every planning step return nothing, keeps
+    /// the draw list empty and suppresses the status hint; the catalogs
+    /// and the query cache are deliberately kept, so returning to the
+    /// surface mode resumes without a reload.
+    enabled: bool,
     deadline_ms: Option<u64>,
     observed_signature: Option<ViewSignature>,
     fetched_signature: Option<ViewSignature>,
@@ -501,6 +516,7 @@ impl FeatureOverlayState {
             prewarm_in_flight: None,
             quick_requested: false,
             prewarm_requested: false,
+            enabled: true,
             deadline_ms: None,
             observed_signature: None,
             fetched_signature: None,
@@ -538,6 +554,38 @@ impl FeatureOverlayState {
         self.selected = None;
         self.flash_until = None;
         self.draw = None;
+    }
+
+    /// Flips the overlay's master gate (the render-mode switch).
+    ///
+    /// Going dark cancels every in-flight query — the mode says no tier
+    /// may be issued, so a query already running would be wasted work —
+    /// and [`Self::plan_quick_fetch`], [`Self::plan_prewarm_fetch`],
+    /// [`Self::plan_fetch`], [`Self::draw_catalog`] and
+    /// [`Self::status_hint`] all consult the gate. Both catalogs and the
+    /// query cache survive untouched.
+    ///
+    /// Coming back re-arms the once-per-source tiers: the user may have
+    /// switched modes before a quick/prewarm fetch ever completed, and a
+    /// one-shot that never fired must still get its chance.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        if enabled {
+            self.rearm_one_shots();
+        } else {
+            self.cancel_fetch();
+        }
+    }
+
+    /// Re-arms tier 1 and the prewarm without touching the catalogs or
+    /// the query cache. The next planning frame issues them again for the
+    /// current source.
+    fn rearm_one_shots(&mut self) {
+        self.quick_requested = false;
+        self.prewarm_requested = false;
     }
 
     /// The full (tier 2) catalog, when a query or cache hit produced one.
@@ -585,8 +633,7 @@ impl FeatureOverlayState {
     /// tier-2 fetch must not look like a dead UI.
     #[must_use]
     pub fn status_hint(&self) -> Option<&'static str> {
-        self.has_fetch_in_flight()
-            .then_some(labels::STATUS_FEATURES_GENERATING)
+        (self.enabled && self.has_fetch_in_flight()).then_some(labels::STATUS_FEATURES_GENERATING)
     }
 
     /// The selected feature key, when one was clicked.
@@ -644,6 +691,9 @@ impl FeatureOverlayState {
         view: &MapViewState,
         settings: &OverlaySettings,
     ) -> Option<FeatureFetch> {
+        if !self.enabled {
+            return None;
+        }
         if self.quick_requested || self.quick_in_flight.is_some() {
             return None;
         }
@@ -727,6 +777,9 @@ impl FeatureOverlayState {
         view: &MapViewState,
         settings: &OverlaySettings,
     ) -> Option<FeatureFetch> {
+        if !self.enabled {
+            return None;
+        }
         if self.prewarm_requested || self.prewarm_in_flight.is_some() {
             return None;
         }
@@ -805,6 +858,9 @@ impl FeatureOverlayState {
         view: &MapViewState,
         settings: &OverlaySettings,
     ) -> Option<FeatureFetch> {
+        if !self.enabled {
+            return None;
+        }
         if self.full_in_flight.is_some() {
             return None;
         }
@@ -933,6 +989,10 @@ impl FeatureOverlayState {
     /// catalogs or the toggle mask changed. Returns [`None`] while neither
     /// tier has a catalog.
     pub fn draw_catalog(&mut self, mask: FeatureToggleMask) -> Option<Arc<FeatureCatalog>> {
+        // Dark mode draws nothing even when a catalog is still cached.
+        if !self.enabled {
+            return None;
+        }
         if self.catalog.is_none() && self.quick.is_none() {
             return None;
         }
@@ -2125,5 +2185,76 @@ mod tests {
         );
         state.cancel_fetch();
         assert_eq!(state.status_hint(), None);
+    }
+
+    #[test]
+    fn mode_biomes_only_darkens_every_overlay_tier() {
+        // The overlay's master gate: no quick, full or prewarm query is
+        // planned, no marker is in the draw list and the generating hint
+        // is suppressed — while the catalogs and cache stay for the
+        // return to Surface.
+        let mut state = FeatureOverlayState::new();
+        let settings = all_settings();
+        let view = view_at((0.0, 0.0), 0.0, 400.0, 300.0);
+
+        // A catalog and an in-flight quick query are live before the mode
+        // flips, so the gate is tested against real state, not a blank.
+        let catalog = Arc::new(FeatureCatalog::build(vec![feature(
+            FeatureKind::Spawn,
+            "Spawn",
+            "Spawn",
+            (0, 0, 0),
+        )]));
+        state.adopt(Arc::clone(&catalog), Rect::new(-10, -10, 10, 10));
+        let quick = state
+            .plan_quick_fetch(&view, &settings)
+            .expect("tier 1 fires on a fresh state");
+        let (sender, receiver) = mpsc::channel();
+        state.begin_quick_fetch(quick, receiver);
+        assert!(state.draw_catalog(FeatureToggleMask::all()).is_some());
+        assert_eq!(
+            state.status_hint(),
+            Some(labels::STATUS_FEATURES_GENERATING)
+        );
+
+        state.set_enabled(false);
+        assert!(
+            !state.has_fetch_in_flight(),
+            "the switch cancels the in-flight query"
+        );
+        assert!(
+            state.plan_quick_fetch(&view, &settings).is_none(),
+            "tier 1 is never planned while dark"
+        );
+        assert!(
+            state.plan_prewarm_fetch(&view, &settings).is_none(),
+            "the prewarm is never planned while dark"
+        );
+        let t0 = Instant::now() + Duration::from_secs(1);
+        state.observe(t0, &view);
+        assert!(
+            state
+                .plan_fetch(
+                    t0 + Duration::from_millis(SETTLE_DEBOUNCE_MS + 1),
+                    &view,
+                    &settings
+                )
+                .is_none(),
+            "tier 2 is never planned while dark"
+        );
+        assert!(
+            state.draw_catalog(FeatureToggleMask::all()).is_none(),
+            "the draw list is empty even with a catalog cached"
+        );
+        assert_eq!(state.status_hint(), None, "the generating hint is gone");
+
+        // The sender's drop is expected (the receiver was cancelled);
+        // nothing reached the catalog or the draw list.
+        drop(sender);
+        assert!(state.catalog().is_some(), "the cached catalog survives");
+
+        // Surface returns: the same catalog draws again without a fetch.
+        state.set_enabled(true);
+        assert!(state.draw_catalog(FeatureToggleMask::all()).is_some());
     }
 }

@@ -29,10 +29,16 @@ use map_core::coords::{
     self, BlockPos, ScreenPos, TileCoord, TileRect, Viewport, WorldPos, ZoomLevel,
 };
 
-/// The continuous zoom range in level units: `MIN_SMOOTH_ZOOM` is one
-/// point per block (the finest level), `MAX_SMOOTH_ZOOM` the coarsest
-/// tile level T10 supports.
-pub const MIN_SMOOTH_ZOOM: f32 = 0.0;
+/// The continuous zoom range in level units.
+///
+/// The upper end is the coarsest tile level T10 supports. The lower end
+/// deliberately goes **below** the finest tile level: `-3` is
+/// `2^-(-3) = 8` points per block, a pure display magnification of the
+/// step-1 (`ZoomLevel::MIN`) tiles. [`MapViewState::zoom_level`] clamps at
+/// [`ZoomLevel::MIN`], so sub-block zoom never generates finer data and
+/// never requests a different tile — the same 256-pixel tile is simply
+/// painted eight times larger.
+pub const MIN_SMOOTH_ZOOM: f32 = -3.0;
 pub const MAX_SMOOTH_ZOOM: f32 = ZoomLevel::MAX.0 as f32;
 
 /// The interactive view: where the map is centered, how far it is zoomed and
@@ -50,7 +56,9 @@ impl MapViewState {
     pub fn new() -> MapViewState {
         MapViewState {
             center: WorldPos::new(0.0, 0.0),
-            smooth_zoom: MIN_SMOOTH_ZOOM,
+            // Not MIN_SMOOTH_ZOOM: the floor is the sub-block magnification
+            // range now, but the plan's initial view stays at 1 pt/blk.
+            smooth_zoom: 0.0,
             size: (0.0, 0.0),
         }
     }
@@ -390,6 +398,15 @@ mod tests {
     fn view_state_zoom_clamps_to_the_supported_range() {
         let mut view = view_at((-1203.0, 455.0), 1024.0, 768.0);
 
+        // The floor is the sub-block magnification range (8 pt/blk), not
+        // the step-1 level: a center-anchored overshoot clamps there and
+        // keeps the center fixed.
+        view.zoom_at_center(-100.0);
+        assert_eq!(view.smooth_zoom(), MIN_SMOOTH_ZOOM);
+        assert_eq!(view.scale(), 8.0, "the floor magnifies below step 1");
+        assert_eq!(view.center(), WorldPos::new(-1203.0, 455.0));
+        // Already at the clamp: another cursor-anchored overshoot is a
+        // no-op (the zoom would not change, so the anchor is untouched).
         view.zoom_at_screen((100.0, 100.0), -5.0);
         assert_eq!(view.smooth_zoom(), MIN_SMOOTH_ZOOM);
         assert_eq!(view.center(), WorldPos::new(-1203.0, 455.0));
@@ -402,6 +419,42 @@ mod tests {
         view.zoom_at_screen((50.0, 50.0), 5.0);
         assert_eq!(view.smooth_zoom(), MAX_SMOOTH_ZOOM);
         assert_eq!(view.center(), at_max);
+    }
+
+    #[test]
+    fn zoom_below_step_one_scales_without_finer_tiles() {
+        // The Nov 2026 "closer to the ground" request: the wheel may go
+        // below 1 pt/blk, down to 8 pt/blk (smooth_zoom -3), but the data
+        // is the same step-1 tile painted larger — no finer generation,
+        // no new tile keys.
+        let at_one = view_at((0.0, 0.0), 1024.0, 768.0);
+        let mut view = at_one;
+        view.zoom_at_center(-3.0);
+        assert_eq!(view.smooth_zoom(), -3.0);
+        assert_eq!(view.scale(), 8.0, "2^-(-3) = 8 points per block");
+        assert_eq!(view.zoom_level(), ZoomLevel::MIN, "the data stays step 1");
+        assert_eq!(view.tile_step(1), 1, "the pass requests the same step");
+        assert_eq!(
+            view.tile_step(1),
+            at_one.tile_step(1),
+            "sub-block zoom never changes the sampling request"
+        );
+        assert_eq!(view.tile_step(8), 8, "the user's minimum still wins");
+        assert!(
+            view.visible_tiles(1).is_some(),
+            "the magnified view still resolves a tile range"
+        );
+
+        // The projection agrees: one 256-block step-1 tile covers 256 * 8
+        // points at this scale, and the cursor math still floors to blocks.
+        let (x0, _, x1, _) =
+            tile_screen_rect(&view, TileCoord::new(0, 0), 1).expect("tile 0 is representable");
+        assert_eq!(x1 - x0, 2048.0, "the same tile paints eight times larger");
+        assert_eq!(
+            view.screen_to_block((512.0, 384.0)),
+            Some(BlockPos::new(0, 0)),
+            "the viewport center is still block (0, 0)"
+        );
     }
 
     #[test]
@@ -432,7 +485,11 @@ mod tests {
     #[test]
     fn view_state_zoom_level_is_ceil_and_clamped() {
         for (smooth_zoom, level) in [
-            (0.0_f32, 0_u8),
+            // The sub-block display range clamps onto the finest level:
+            // there is no data finer than step 1 to sample.
+            (-3.0_f32, 0_u8),
+            (-0.5, 0),
+            (0.0, 0),
             (0.001, 1),
             (1.0, 1),
             (1.5, 2),

@@ -42,6 +42,40 @@ use crate::view_state::MapViewState;
 /// The plan's default is 2×2.
 pub const RESOLUTION_STEPS: [u32; 4] = [1, 2, 4, 8];
 
+/// The top bar's render mode: a hard filter over the layer stack and the
+/// feature overlay.
+///
+/// [`RenderMode::Surface`] is today's behavior byte for byte: the enabled
+/// layer stack paints and the overlay fetches/draws as before.
+/// [`RenderMode::BiomesOnly`] is the chunkbase-style speed view: only
+/// [`Layer::Biome`] is scheduled and the feature overlay is dark (see
+/// [`AppState::schedulable_layers`] and
+/// [`crate::overlays::features::FeatureOverlayState::set_enabled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// The full layer stack plus the feature overlay (the default).
+    #[default]
+    Surface,
+    /// Only the biome layer; every other layer and the whole overlay are
+    /// ignored until the mode returns to [`RenderMode::Surface`].
+    BiomesOnly,
+}
+
+impl RenderMode {
+    /// Every mode the selector offers, in display order.
+    pub const ALL: [RenderMode; 2] = [RenderMode::Surface, RenderMode::BiomesOnly];
+}
+
+/// The combo-box label of a render mode (the vocabulary lives in
+/// [`labels`] so the selector and the panels never drift).
+#[must_use]
+pub fn render_mode_label(mode: RenderMode) -> &'static str {
+    match mode {
+        RenderMode::Surface => labels::MODE_SURFACE,
+        RenderMode::BiomesOnly => labels::MODE_BIOMES_ONLY,
+    }
+}
+
 /// Whether the panel offers `layer` a checkbox (T19): true for every
 /// layer with a renderer today. The later layers stay [`LayerStack`]
 /// entries — their settings persist for their arrival — but no checkbox
@@ -195,6 +229,11 @@ pub struct AppState {
     /// default is 2.
     resolution_step: u32,
 
+    /// The top bar's render mode (default [`RenderMode::Surface`]).
+    /// Session state like the layer stack: a source reload never touches
+    /// the user's choice.
+    render_mode: RenderMode,
+
     /// The interactive view (T16's pan/zoom state): the world position
     /// at the map center, the continuous wheel zoom, the viewport size.
     /// The map widget drives it; everything else reads it.
@@ -249,6 +288,7 @@ impl Default for AppState {
             world_path: PathBuf::new(),
             workers: None,
             resolution_step: 2,
+            render_mode: RenderMode::default(),
             view: MapViewState::new(),
             layers: LayerStack::new(),
             overlays: OverlaySettings::default(),
@@ -554,6 +594,32 @@ impl AppState {
         }
     }
 
+    /// The top bar's render mode.
+    #[must_use]
+    pub fn render_mode(&self) -> RenderMode {
+        self.render_mode
+    }
+
+    /// Switches the render mode. A real switch does three things:
+    ///
+    /// - the next frame's [`Self::schedulable_layers`] changes, so the
+    ///   scheduler request differs and the widget re-requests exactly as a
+    ///   layer-checkbox toggle does;
+    /// - the overlay's master gate flips ([`FeatureOverlayState`]): dark
+    ///   mode cancels in-flight queries and plans none, and returning to
+    ///   [`RenderMode::Surface`] re-arms the once-per-source quick tier and
+    ///   prewarm (the user may have switched before any fetch completed);
+    /// - nothing else is touched: the layer stack, the overlay checkboxes,
+    ///   both overlay catalogs and the query cache survive, so switching
+    ///   back restores the normal view without a reload.
+    pub fn set_render_mode(&mut self, mode: RenderMode) {
+        if self.render_mode == mode {
+            return;
+        }
+        self.render_mode = mode;
+        self.features.set_enabled(mode == RenderMode::Surface);
+    }
+
     /// The layer stack (read-only access for the panels).
     #[must_use]
     pub fn layers(&self) -> &LayerStack {
@@ -569,12 +635,20 @@ impl AppState {
     /// order (bottom → top), each with its paint-time opacity. Only
     /// these are scheduled and painted — a disabled or unsupported
     /// layer never reaches the scheduler.
+    ///
+    /// [`RenderMode::BiomesOnly`] is a hard filter on top of the stack:
+    /// only [`Layer::Biome`] survives, whatever the other checkboxes say
+    /// (they keep their settings for the return to
+    /// [`RenderMode::Surface`]). The mode is why a switch invalidates the
+    /// scheduler request — the pass list changes exactly like a checkbox
+    /// toggle.
     #[must_use]
     pub fn schedulable_layers(&self) -> Vec<(Layer, f32)> {
         self.layers
             .enabled_layers()
             .into_iter()
             .filter(|layer| offers_layer(*layer))
+            .filter(|layer| self.render_mode == RenderMode::Surface || *layer == Layer::Biome)
             .map(|layer| (layer, self.layers.opacity(layer)))
             .collect()
     }
@@ -1136,6 +1210,131 @@ mod tests {
     }
 
     #[test]
+    fn mode_biomes_only_schedules_only_the_biome_layer() {
+        // The speed view is a hard filter over the stack: whatever else
+        // is enabled, only Biomes reaches the scheduler. The other
+        // checkboxes keep their settings for the return to Surface.
+        let mut state = state();
+        for layer in [Layer::Height, Layer::Fluid, Layer::Surface] {
+            assert!(state.layers_mut().set_enabled(layer, true));
+        }
+        assert_eq!(state.render_mode(), RenderMode::Surface);
+        assert!(
+            state
+                .schedulable_layers()
+                .iter()
+                .any(|(layer, _)| *layer == Layer::Surface)
+        );
+
+        state.set_render_mode(RenderMode::BiomesOnly);
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![(Layer::Biome, 1.0)],
+            "only the cheap direct-column layer is scheduled"
+        );
+        assert_eq!(state.layer_summary(), labels::LAYER_BIOMES);
+        assert!(
+            state.layers().enabled_layers().contains(&Layer::Surface),
+            "the ignored checkboxes keep their state"
+        );
+
+        // The filter does not force Biomes on: unticking it still blanks
+        // the map in either mode.
+        assert!(state.layers_mut().set_enabled(Layer::Biome, false));
+        assert_eq!(state.schedulable_layers(), Vec::new());
+    }
+
+    #[test]
+    fn mode_surface_schedules_the_stack() {
+        // Surface is the default and byte-for-byte the pre-mode behavior:
+        // the enabled, offered layers in stack order. A round trip through
+        // the dark mode restores exactly that stack.
+        let mut state = state();
+        assert_eq!(state.render_mode(), RenderMode::Surface);
+        assert_eq!(state.schedulable_layers(), vec![(Layer::Biome, 1.0)]);
+        assert!(state.layers_mut().set_enabled(Layer::Relief, true));
+        assert!(state.layers_mut().set_enabled(Layer::Zone, true));
+        let stack = vec![
+            (Layer::Biome, 1.0),
+            (Layer::Relief, 1.0),
+            (Layer::Zone, 1.0),
+        ];
+        assert_eq!(state.schedulable_layers(), stack);
+
+        state.set_render_mode(RenderMode::BiomesOnly);
+        assert_eq!(state.schedulable_layers(), vec![(Layer::Biome, 1.0)]);
+        state.set_render_mode(RenderMode::Surface);
+        assert_eq!(
+            state.schedulable_layers(),
+            stack,
+            "the stack survives the mode round trip"
+        );
+    }
+
+    #[test]
+    fn mode_switching_restores_the_overlay_one_shots() {
+        // The user may toggle modes before any overlay fetch completed:
+        // the return to Surface must re-arm the quick tier and the
+        // prewarm for the current source, and the dark mode must issue
+        // nothing (and drop the in-flight query).
+        let mut state = state();
+        state.view_mut().set_size(400.0, 300.0);
+        let view = *state.view();
+        let settings = *state.overlays();
+
+        let quick = state
+            .features_mut()
+            .plan_quick_fetch(&view, &settings)
+            .expect("tier 1 fires on a fresh source");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        state.features_mut().begin_quick_fetch(quick, receiver);
+        assert!(state.features().has_fetch_in_flight());
+        assert!(
+            state
+                .features_mut()
+                .plan_prewarm_fetch(&view, &settings)
+                .is_some(),
+            "the prewarm fires on a fresh source"
+        );
+        assert!(state.features().status_hint().is_some());
+
+        state.set_render_mode(RenderMode::BiomesOnly);
+        assert!(
+            !state.features().has_fetch_in_flight(),
+            "the dark mode cancels the in-flight query"
+        );
+        assert!(
+            state
+                .features_mut()
+                .plan_quick_fetch(&view, &settings)
+                .is_none()
+        );
+        assert!(
+            state
+                .features_mut()
+                .plan_prewarm_fetch(&view, &settings)
+                .is_none()
+        );
+        assert_eq!(state.features().status_hint(), None);
+
+        state.set_render_mode(RenderMode::Surface);
+        assert!(
+            state
+                .features_mut()
+                .plan_quick_fetch(&view, &settings)
+                .is_some(),
+            "tier 1 re-arms for the current source"
+        );
+        assert!(
+            state
+                .features_mut()
+                .plan_prewarm_fetch(&view, &settings)
+                .is_some(),
+            "the prewarm re-arms for the current source"
+        );
+    }
+
+    #[test]
     fn resolution_changes_map_to_the_expected_effective_step() {
         // The selector sets the user's *minimum* step (T10's
         // effective_step folds it with the zoom level the view needs):
@@ -1159,6 +1358,54 @@ mod tests {
         state.set_resolution_step(8);
         state.view_mut().zoom_at_center(-2.0);
         assert_eq!(state.view().tile_step(state.resolution_step()), 8);
+    }
+
+    #[test]
+    fn zoom_cursor_readout_below_step_one() {
+        // The sub-block floor magnifies the map (8 pt/blk) while cursor
+        // sampling and the resolution readout stay at the step-1 data.
+        let mut state = state();
+        state.view_mut().set_size(800.0, 600.0);
+        state.view_mut().zoom_at_center(-3.0);
+        assert_eq!(state.view().scale(), 8.0);
+        assert_eq!(
+            state
+                .view()
+                .screen_to_block((400.0, 300.0))
+                .map(|b| (b.x, b.z)),
+            Some((0, 0)),
+            "the viewport center is still block (0, 0)"
+        );
+        assert_eq!(
+            state
+                .view()
+                .screen_to_block((408.0, 300.0))
+                .map(|b| (b.x, b.z)),
+            Some((1, 0)),
+            "eight points right is exactly the next block"
+        );
+        assert_eq!(
+            state
+                .view()
+                .screen_to_block((407.0, 300.0))
+                .map(|b| (b.x, b.z)),
+            Some((0, 0)),
+            "less than a block right stays in the current one"
+        );
+
+        // The status tail keeps showing the true display scale and the
+        // user's step; no zoom-forced coarser "effective" step appears.
+        let line = format_status(
+            0,
+            state.view().scale(),
+            state.resolution_step(),
+            state.view().tile_step(state.resolution_step()),
+            &state.layer_summary(),
+            state.source_status_text(),
+        );
+        assert!(line.contains("zoom 8.0 pt/blk"), "{line}");
+        assert!(line.contains("2×2"), "{line}");
+        assert!(!line.contains("effective"), "{line}");
     }
 
     #[test]

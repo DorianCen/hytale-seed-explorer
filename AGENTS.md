@@ -123,6 +123,18 @@ cargo fmt --all && cargo clippy -p map-core -p map-cli -p map-app --all-targets 
   `pooled_placeholder` box-averages the cached finer tiles into the
   missing coarse one (zoom-out — derived pixels, never inserted into the
   tile cache; alpha-0 means no-data). Unzooming never blanks.
+- **Tiles stream in chunk-row bands.** `render_streaming` (default = the
+  one-shot `render`) lets the surface renderer publish a snapshot after
+  each chunk row; snapshots are `complete: false` tiles that
+  `contains_serving` never counts as a hit (a cancelled partial is
+  re-rendered on the next pass), while the placeholder lookups stay
+  completeness-blind — a partial is still better than blank. The final
+  band's tile is pixel-identical to the one-shot render.
+- The **render mode** ("Surface (full blocks)" vs "Biomes (only)") is a
+  hard app-level gate: BiomesOnly schedules only the biome layer and
+  darkens every overlay tier (no fetches, no prewarm, no markers).
+  Sub-block zoom (down to 8 points per block) is display scale on the
+  same step-1 tiles — never finer generation.
 - The feature overlay fetches in **two tiers** (perf push): cheap kinds
   (spawn/unique/POI — the T22 kind mask skips the placement pass, so
   milliseconds) fire immediately at source-ready; the biome-prefab fetch

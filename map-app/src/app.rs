@@ -31,7 +31,8 @@ use crate::labels;
 use crate::map_view::MapView;
 use crate::overlays::features::{FeatureFetch, FeatureReplyOutcome};
 use crate::state::{
-    self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, layer_label, offers_layer,
+    self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, RenderMode, layer_label,
+    offers_layer, render_mode_label,
 };
 
 /// How often to wake the UI while a background load is in flight.
@@ -467,6 +468,11 @@ impl SeedExplorerApp {
                 ui.separator();
                 ui.label(labels::RESOLUTION);
                 self.resolution_combo(ui);
+                ui.separator();
+                // The chunkbase-style mode selector: Surface is today's
+                // stack; Biomes (only) is the hard speed filter.
+                ui.label(labels::RENDER_MODE);
+                self.render_mode_combo(ui);
                 // The cap feeds the GENERATOR pool of the NEXT load (T21's
                 // cost control; T33 tunes the default). It cannot resize a
                 // pool that is already generating, so the change is
@@ -511,6 +517,22 @@ impl SeedExplorerApp {
             });
         if selected != current {
             self.state.set_resolution_step(selected);
+        }
+    }
+
+    /// The Surface / Biomes-only render-mode selector.
+    fn render_mode_combo(&mut self, ui: &mut egui::Ui) {
+        let current = self.state.render_mode();
+        let mut selected = current;
+        egui::ComboBox::from_id_salt("render-mode")
+            .selected_text(render_mode_label(current))
+            .show_ui(ui, |ui| {
+                for mode in RenderMode::ALL {
+                    ui.selectable_value(&mut selected, mode, render_mode_label(mode));
+                }
+            });
+        if selected != current {
+            self.state.set_render_mode(selected);
         }
     }
 
@@ -563,6 +585,9 @@ impl SeedExplorerApp {
             .schedulable_layers()
             .iter()
             .any(|(layer, _)| *layer == map_core::render::Layer::Surface);
+        // The mode is a hard filter: the checkboxes below keep their
+        // settings but cannot change the map until Surface returns.
+        let biomes_only = self.state.render_mode() == RenderMode::BiomesOnly;
         let mut copied = false;
 
         // The layer stack's edits, buffered while the panel closure
@@ -576,6 +601,9 @@ impl SeedExplorerApp {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.label(RichText::new(labels::GROUP_LAYERS).strong());
+                if biomes_only {
+                    ui.label(RichText::new(labels::MODE_HINT_BIOMES_ONLY).weak());
+                }
                 // Every offered layer in stack order: the checkbox, and
                 // — while enabled — its opacity slider. Order is paint
                 // order, bottom → top; the unoffered future layers get
