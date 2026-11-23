@@ -31,7 +31,6 @@ clap = { version = "4", features = ["derive"] }
 eframe = "0.31"
 egui = "0.31"
 directories = "6"
-bytemuck = "1"
 
 # Property-test framework for coordinate math (T10) and search (T24/T25).
 proptest = "1"
