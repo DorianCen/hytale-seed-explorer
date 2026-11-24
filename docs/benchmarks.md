@@ -300,6 +300,40 @@ search is viable. Two rules for T24/T26:
   multi-GiB memory — the follow-up lever (bounded prefab-store cache,
   LRU memo) belongs to T33.
 
+## Feature search (T24)
+
+**Task:** [T24](../tasks/T24-feature-search.md) — the ring engine measured
+against the real generator. Harness: the ignored test
+`feature_search_bench_10k_radius` (`map-core/tests/feature_search.rs`),
+release build, Default fixture, 512-block ring regions, **cheap-tier kinds
+only** (spawn / unique prefab / POI — the kind mask skips the generator's
+biome placement pass, which is what makes the UI path viable at all):
+
+| Seed | Radius | First result | 100th result | Results | Regions | Total |
+|---|---:|---:|---|---:|---:|---:|
+| 12345 | 10,000 | 48.8 ms | n/a | 3 | 1,681 | 73.1 ms |
+| 0 | 10,000 | 50.2 ms | n/a | 3 | 1,681 | 72.9 ms |
+| 0 | 50,000 | 49.2 ms | n/a | 3 | 38,809 | 614.6 ms |
+
+Readings:
+
+- **The plan's "first results within ~500 ms" target is met with a 10×
+  margin**: ~49 ms to the first streamed result at the standard
+  10,000-block radius. The latency is the generator's cold unique/spawn
+  list build (T04: 26.2 ms cold) plus the first ring's pool round-trips;
+  warm regions then cost ~44 µs each, so the *bound* (the first safe
+  emission threshold), not query latency, sets first-result time.
+- The full 10k scan is ~73 ms over 1,681 regions; a 50,000-radius sweep
+  stays at 0.6 s over 38,809. Ring count for a radius is
+  `ceil(r / 512) + 1` per side — the region size, not the radius, shapes
+  the streaming granularity.
+- "Time to 100 results" is **n/a on this fixture**: the Default world
+  defines only three cheap-tier features within 50,000 blocks of the
+  origin on both seeds, so no dense case exists at the UI path's kind
+  tier. Density lives in biome prefabs, whose ring rects pay the T22
+  seconds-each price — a biome-prefab-inclusive search is the T33 batch
+  lever, not a UI-path benchmark.
+
 ## What this means for the explorer
 
 1. **Worker count: start 2, cap at 8-12.** Measured parallel scaling on the
@@ -397,6 +431,8 @@ Only release runs on the environment above (or note the change).
 | 2026-11-19 | fluid tile (256 chunk summaries cold, 2 workers) | 86.23 s (n=1) | `... --layer fluid ...` | T17 |
 | 2026-11-19 | full-block surface tile 65,536 @ step 1 (64 chunks cold), 1 / 4 / 12 workers | 24.40 s / 14.25 s / 21.69 s | `cargo test -p map-core --features test-support --release --test surface_render -- --ignored surface_bench --nocapture` | T21 |
 | 2026-11-19 | same tile, warm (summaries cached), 1 / 4 / 12 workers | 1.276 s / 0.464 s / 0.136 s | as above | T21 |
+| 2026-11-24 | feature search first result / total, 10,000 radius, cheap tier (seeds 12345 / 0) | 48.8 ms / 73.1 ms and 50.2 ms / 72.9 ms (3 results, 1,681 regions) | `cargo test -p map-core --release --test feature_search -- --ignored feature_search_bench --nocapture` | T24 |
+| 2026-11-24 | feature search 50,000 radius sweep, cheap tier (seed 0) | 49.2 ms first / 614.6 ms total (38,809 regions) | as above | T24 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

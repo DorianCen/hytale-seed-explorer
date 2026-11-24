@@ -1,6 +1,18 @@
 # T24 — Feature search engine and streaming
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/search/feature.rs` —
+`FeatureSearch`/`SearchFilters`/`ProximityFilter`, the ring walk with an
+exact O(1) `ring_min` bound and a safe-emission threshold (buffered
+pending heap, dedupe on the T23 key, proximity pool), `SearchHandle` +
+spawned worker (bounded channel: block results, drop progress;
+cancel-then-drop-handle termination, no thread leak), `teleport_string`
+shared with T31; `map-core/tests/feature_search.rs` — 15 fake-source
+acceptance tests (exact order, mid-ring cancellation, dedupe, proximity,
+panicking-source boundary) plus the ignored release benchmark (first
+result ~49 ms at the 10,000-block radius — 10× inside the plan target;
+`docs/benchmarks.md` §"Feature search (T24)" + two regression rows);
+`map-core/tests/search_property.rs` — proptest brute-force equality,
+unlimited and capped, 64 cases each.)
 **Milestone:** 7 — Search
 **Depends on:** T22, T23
 **Blocks:** T25, T26, T33
