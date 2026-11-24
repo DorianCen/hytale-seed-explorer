@@ -11,3 +11,5 @@
 
 # Local fixture dumps (never commit; see fixtures/README.md)
 fixtures/*.local.json
+
+.claude/
