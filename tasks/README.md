@@ -34,7 +34,7 @@ it owns, and the acceptance gate.
 | [T22](T22-feature-placement-query.md) | Feature placement query API in worldgen | 6 | T01, T05, T08 | done |
 | [T23](T23-feature-catalog-overlay.md) | Feature catalog, source adapter and overlay | 6 | T16, T22 | done |
 | [T24](T24-feature-search.md) | Feature search engine and streaming | 7 | T22, T23 | done |
-| [T25](T25-biome-search.md) | Biome search | 7 | T08, T24 | proposed |
+| [T25](T25-biome-search.md) | Biome search | 7 | T08, T24 | done |
 | [T26](T26-search-ui.md) | Search UI, cancellation and filters | 7 | T18, T23, T24, T25 | proposed |
 | [T27](T27-cave-entrances.md) | Cave entrance overlay | 8 | T22, T23 | proposed |
 | [T28](T28-cave-slices-density.md) | Cave Y-slice and density heat map | 8 | T09, T21, T27 | proposed |

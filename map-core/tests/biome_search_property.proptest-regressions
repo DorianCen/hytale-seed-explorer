@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5280b0c60b9c0eb8b3c766d1f8070662632068b1e1356efa53c8e776382d9c89 # shrinks to case = Case { center: (-1697.2, -4993.9), radius: 217.0, coarse_step: 8, blobs: [(-1481, -4998, -1472, -4991)] }

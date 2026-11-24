@@ -334,6 +334,37 @@ Readings:
   seconds-each price — a biome-prefab-inclusive search is the T33 batch
   lever, not a UI-path benchmark.
 
+## Biome search (T25)
+
+**Task:** [T25](../tasks/T25-biome-search.md) — the ring engine measured
+against the real generator. Harness: the ignored test
+`biome_search_bench_10k_radius` (`map-core/tests/biome_search_fixture.rs`),
+release build, Default fixture, seed 12345, step-16 coarse lattice, origin
+center, 10,000-block radius, unlimited results. The common/rare roles come
+from a runtime ±8,192 probe histogram (65,536 samples at step 64 — the
+fixture's biome distribution is world data, not a constant):
+
+| Biome | Role | First result | Results | Coarse samples | Total |
+|---|---|---:|---:|---:|---:|
+| 32 (Shore) | common | 20.8 ms | 1,797 | 1,575,025 | 170.2 s |
+| 39 (Plains_Spawn) | rare | 143.2 ms | 1 | 1,575,025 | 34.6 s |
+
+Readings:
+
+- **The plan's "first results within ~500 ms" target is met**: 20.8 ms for
+  the most common biome, 143.2 ms for a rare one. The first result rides
+  the first rings (the walk outruns the radius by the
+  `(step−1)·√2` lattice reach), never the full scan.
+- The full 10k scan is 627 rings / ~2,508 strip queries / 1.57M coarse
+  samples: ~35 s for a biome with one match, linear in radius² at a fixed
+  step (the walk covers the whole (2·627+1)²-point lattice).
+- The common case costs 5× the rare one: 1,797 frontier results each pay a
+  ±31-block step-1 refinement (~4k samples), so refinement — not the scan
+  — dominates when results are dense. The default `max_results` cap stops
+  the walk when it is reached, so the UI path never pays the full 1,797.
+- Patch-area flood fills are opt-in (`min_patch_blocks`, not set here) and
+  are bounded by the 4-strips × 32-rings fill cap per candidate.
+
 ## What this means for the explorer
 
 1. **Worker count: start 2, cap at 8-12.** Measured parallel scaling on the
@@ -433,6 +464,8 @@ Only release runs on the environment above (or note the change).
 | 2026-11-19 | same tile, warm (summaries cached), 1 / 4 / 12 workers | 1.276 s / 0.464 s / 0.136 s | as above | T21 |
 | 2026-11-24 | feature search first result / total, 10,000 radius, cheap tier (seeds 12345 / 0) | 48.8 ms / 73.1 ms and 50.2 ms / 72.9 ms (3 results, 1,681 regions) | `cargo test -p map-core --release --test feature_search -- --ignored feature_search_bench --nocapture` | T24 |
 | 2026-11-24 | feature search 50,000 radius sweep, cheap tier (seed 0) | 49.2 ms first / 614.6 ms total (38,809 regions) | as above | T24 |
+| 2026-11-24 | biome search first result, 10,000 radius (common id 32 / rare id 39) | 20.8 ms / 143.2 ms | `cargo test -p map-core --release --test biome_search_fixture -- --ignored biome_search_bench --nocapture` | T25 |
+| 2026-11-24 | biome search full 10,000 scan, unlimited results (common 1,797 results / rare 1 result) | 170.2 s / 34.6 s (1,575,025 coarse samples) | as above | T25 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

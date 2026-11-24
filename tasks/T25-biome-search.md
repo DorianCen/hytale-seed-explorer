@@ -1,6 +1,24 @@
 # T25 — Biome search
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/search/rings.rs` — the ring
+walk extracted from T24's feature search so both engines share the exact
+O(1) `ring_min` bound; `map-core/src/search/biome.rs` — `BiomeSearch`, the
+coarse strip walk (4 `biome_region` calls per ring), the frontier filter
+(cost heuristic with one-step coverage inheritance), `±(2·step − 1)` step-1
+refinement returning true `biome_at` readings never beyond the radius, the
+ring stop outrunning the radius by the `(step−1)·√2` lattice reach, the
+fixpoint-closure patch flood fill with ring/cell caps, and T24's exact
+event/handle/backpressure contract verbatim; `map-core/tests/biome_search.rs`
+— 16 synthetic-source tests incl. the look-ahead crossing, the
+narrow-strip limitation and the patch caps;
+`map-core/tests/biome_search_property.rs` — proptest vs brute force
+(+ its checked-in regression seed); `map-core/tests/biome_search_fixture.rs`
+— the real-generator fixture check and the ignored release benchmark (first
+result 20.8 ms common / 143.2 ms rare at the 10,000-block radius — 24×
+inside the plan target; `docs/benchmarks.md` §"Biome search (T25)" + two
+regression rows). Three engine bugs were found by the property suite and
+fixed: results beyond the radius, cross-patch diagonal shadowing, and the
+ring stop skipping the lattices that detect in-radius blocks.)
 **Milestone:** 7 — Search
 **Depends on:** T08, T24
 **Blocks:** T26
