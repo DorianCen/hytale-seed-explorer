@@ -587,7 +587,7 @@ impl SeedExplorerApp {
     }
 
     /// The plan's left panel: the layer stack's checkboxes and opacity
-    /// sliders (T19), overlay checkboxes, search placeholder, the
+    /// sliders (T19), overlay checkboxes, the search panel (T26), the
     /// inspector (T18), the zone legend and the palette diagnostics.
     /// Widget order is stable across frames so egui keeps its state;
     /// every control writes into [`AppState`] — through buffered locals
@@ -682,8 +682,9 @@ impl SeedExplorerApp {
                         ui.checkbox(&mut overlays.prefabs, labels::OVERLAY_PREFABS);
                         ui.checkbox(&mut overlays.spawn, labels::OVERLAY_SPAWN);
                         ui.checkbox(&mut overlays.poi, labels::OVERLAY_POI);
-                        // Maps to the cave group now; still a no-op until T27
-                        // actually emits cave entrances.
+                        // The cave toggle drives the full tier's
+                        // cave-entrance kind (T27); large views omit it per
+                        // the adapter's cap.
                         ui.checkbox(&mut overlays.cave_entrances, labels::OVERLAY_CAVE_ENTRANCES);
                         ui.checkbox(&mut overlays.chunk_grid, labels::OVERLAY_CHUNK_GRID);
 

@@ -347,9 +347,17 @@ fn saturate_i64(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-/// The left panel's checkbox state as a map-core toggle mask. `cave_entrances`
-/// maps to [`FeatureToggleGroup::Cave`] now but stays a draw/fetch no-op until
-/// T27 starts emitting entrances.
+/// The longer side of an inclusive rect, in blocks (counted in `i64` so a
+/// zoomed-out rect cannot overflow before a cap check).
+fn rect_side(rect: Rect) -> i64 {
+    let width = i64::from(rect.max_x) - i64::from(rect.min_x) + 1;
+    let height = i64::from(rect.max_z) - i64::from(rect.min_z) + 1;
+    width.max(height)
+}
+
+/// The left panel's checkbox state as a map-core toggle mask. Every group maps
+/// to its kind; the cave-entrance kind is fetched by the full tier when the
+/// rect fits the cave cap (T27).
 #[must_use]
 pub fn toggle_mask(settings: &OverlaySettings) -> FeatureToggleMask {
     let mut mask = FeatureToggleMask::none();
@@ -383,8 +391,7 @@ pub fn fetch_filter(settings: &OverlaySettings) -> FeatureFilter {
 /// `docs/benchmarks.md` §"Feature enumeration (T22)": `Spawn`, `Poi` and
 /// `UniquePrefab` come from asset tables, so they answer in milliseconds over
 /// rects whose placement pass would cost minutes; `BiomePrefab` (the expensive
-/// one) and the reserved `CaveEntrance` stay in tier 2 only. Cave entrances
-/// have no placement kind yet (T27), so their absence costs nothing today.
+/// one) and `CaveEntrance` (T27's dense entrance scan) stay in tier 2 only.
 #[must_use]
 pub fn cheap_kind_mask() -> FeatureKindMask {
     FeatureKindMask::from_kind(FeatureKind::Spawn)
@@ -868,15 +875,27 @@ impl FeatureOverlayState {
         if !self.fetch_due(now, view) {
             return None;
         }
-        let rect =
+        let filter = fetch_filter(settings);
+        let visible = FeatureFetchPlanner::visible_rect(view);
+        let mut rect =
             FeatureFetchPlanner::desired_rect(view, FeatureFetchPlanner::margin_blocks(view));
+        // T27's cave-entrance kind is capped at a small rect: when the
+        // visible view itself fits the cap but the margin-expanded rect does
+        // not, query exactly the visible rect (no margin) so caves are still
+        // fetched. A larger visible view keeps the normal rect and the
+        // adapter drops only the cave kind.
+        if filter.kinds.contains(FeatureKind::CaveEntrance)
+            && rect_side(rect) > map_core::source::worldgen::MAX_CAVE_ENTRANCE_SIDE_BLOCKS
+            && rect_side(visible) <= map_core::source::worldgen::MAX_CAVE_ENTRANCE_SIDE_BLOCKS
+        {
+            rect = visible;
+        }
         if FeatureFetchPlanner::oversized(&rect) {
             // Cache-only view: keep drawing the last catalog, and do not
             // re-run this decision every frame until the view changes.
             self.fetched_signature = Some(signature);
             return None;
         }
-        let filter = fetch_filter(settings);
         if let Some(catalog) = self.cache.get(rect, &filter) {
             self.adopt(catalog, rect);
             self.fetched_signature = Some(signature);
@@ -1402,14 +1421,22 @@ fn arch_points(center: Pos2, radius: f32) -> Vec<Pos2> {
 #[must_use]
 pub fn tooltip_text(feature: &Feature, view: &MapViewState) -> String {
     let category = category_for(feature);
+    // A cave entrance's `category` is the owning zone (T27), which the
+    // tooltip shows next to the group name; other kinds already name their
+    // category.
+    let category_line = if feature.kind == FeatureKind::CaveEntrance && !feature.category.is_empty()
+    {
+        format!("{} ({})", category.display_name, feature.category)
+    } else {
+        category.display_name.clone()
+    };
     let (x, _, z) = feature.position;
     let dx = f64::from(x) - view.center().x;
     let dz = f64::from(z) - view.center().z;
     let distance = (dx * dx + dz * dz).sqrt().round() as u64;
     format!(
-        "{name}\n{category}\nX:{x} Z:{z}\n{distance} {unit}",
+        "{name}\n{category_line}\nX:{x} Z:{z}\n{distance} {unit}",
         name = feature.name,
-        category = category.display_name,
         unit = labels::FEATURE_BLOCKS,
     )
 }
@@ -1454,6 +1481,22 @@ mod tests {
 
     fn all_settings() -> OverlaySettings {
         OverlaySettings::default()
+    }
+
+    #[test]
+    fn features_cave_tooltip_shows_the_zone_and_group() {
+        // A cave entrance's category is the owning zone (T27); the tooltip
+        // must not hide it behind the generic "Cave Entrances" group name.
+        let cave = feature(
+            FeatureKind::CaveEntrance,
+            "Copper",
+            "Zone1_Tier1",
+            (0, 107, 0),
+        );
+        let text = tooltip_text(&cave, &view_at((0.0, 0.0), 0.0, 800.0, 600.0));
+        assert!(text.contains("Copper"), "{text}");
+        assert!(text.contains("Cave Entrances (Zone1_Tier1)"), "{text}");
+        assert!(text.contains("X:0 Z:0"), "{text}");
     }
 
     #[test]
@@ -1907,6 +1950,43 @@ mod tests {
         assert!(!request.filter.kinds.contains(FeatureKind::Spawn));
         assert!(request.filter.kinds.contains(FeatureKind::Poi));
         assert!(request.filter.kinds.contains(FeatureKind::UniquePrefab));
+    }
+
+    #[test]
+    fn features_cave_fetch_uses_the_visible_rect_when_zoomed_in() {
+        // T27: the adapter caps the cave kind at 256 blocks. A margin-
+        // expanded rect would always exceed that cap, so when the visible
+        // view itself fits, tier 2 asks for exactly the visible rect.
+        let mut state = FeatureOverlayState::new();
+        let settings = all_settings();
+        let view = view_at((0.0, 0.0), 0.0, 200.0, 200.0);
+        let t0 = Instant::now() + Duration::from_secs(1);
+        state.observe(t0, &view);
+        let settled = t0 + Duration::from_millis(SETTLE_DEBOUNCE_MS + 1);
+        let request = state
+            .plan_fetch(settled, &view, &settings)
+            .expect("the settled view plans a fetch");
+        assert_eq!(
+            request.rect,
+            FeatureFetchPlanner::visible_rect(&view),
+            "the cave-fitting visible rect has no margin",
+        );
+        assert!(request.filter.kinds.contains(FeatureKind::CaveEntrance));
+
+        // Without the cave toggle the normal margin-expanded rect returns.
+        let mut no_caves = settings;
+        no_caves.cave_entrances = false;
+        let mut plain = FeatureOverlayState::new();
+        plain.observe(t0, &view);
+        let request = plain
+            .plan_fetch(settled, &view, &no_caves)
+            .expect("the settled view still plans a fetch");
+        assert_ne!(
+            request.rect,
+            FeatureFetchPlanner::visible_rect(&view),
+            "the other kinds keep their margin",
+        );
+        assert!(!request.filter.kinds.contains(FeatureKind::CaveEntrance));
     }
 
     #[test]
