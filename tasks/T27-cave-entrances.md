@@ -1,6 +1,25 @@
 # T27 — Cave entrance overlay
 
-**Status:** proposed
+**Status:** done (deliverable: the worldgen cave stage's shared predicate
+extraction (`CavePopulator::entrance_height` plus `entrance_zone`/
+`entrance_height_matches`, so the populator and the query run exactly one
+filter), `ChunkGenerator::cave_entrances_in` (zone/height column memo, the
+point generator's interval padding for anchor rects, deterministic
+`(x, z, y, name)` order, `PlacementKind::CAVE_ENTRANCE`, no `get_cave`), the
+explorer adapter (`FeatureKind::CaveEntrance` → cave/zone names, catalog
+category/icon/toggle already reserved), the 256-block overlay cap and the
+visible-rect fetch rule for zoomed-in cave views, the zone-aware tooltip, and
+the fixture tests (worldgen predicate/geometry/kind-filter/negative-rect;
+map-core adapter/catalog/dedupe/cap). The 512×512 release benchmark is
+61.9 s / 52,941 entrances; the 10,000×10,000 case is documented as a
+~6.6–8 h batch job and is capped in the adapter (the task's "cap the rect"
+allowance) rather than returned to the overlay. Deviation: the query pads the
+anchor rect by the point generator's interval instead of the populator's
+`maximum_size` — the larger reach exists to find caves crossing into a chunk,
+not entry points inside a query rect; fixture chunk counts are unchanged.
+Manual overlay verification remains the user's display-side check; the
+worldgen `query`/`chunks_golden` gates, `map-core cave_entrances`, the full
+`map-app` suite and `cargo build -p map-app` are green.)
 **Milestone:** 8 — Caves
 **Depends on:** T22, T23
 **Blocks:** T28

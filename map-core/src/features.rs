@@ -33,7 +33,7 @@ pub enum FeatureIcon {
     Cross,
     /// A four-point star (points of interest).
     Star,
-    /// An arch/cave mouth (reserved until T27 emits cave entrances).
+    /// An arch/cave mouth (cave entrances, T27).
     Cave,
 }
 
@@ -66,7 +66,7 @@ pub enum FeatureToggleGroup {
     Spawn,
     /// Map pins split out of unique prefabs via `show_on_map`.
     Poi,
-    /// Cave entrances (reserved until T27).
+    /// Cave entrances (T27).
     Cave,
 }
 
@@ -217,7 +217,7 @@ const BIOME_PREFAB_COLOR: [u8; 4] = [120, 230, 158, 255];
 ///
 /// - [`FeatureKind::Spawn`] → `"spawn"`,
 /// - [`FeatureKind::Poi`] → `"poi"`,
-/// - [`FeatureKind::CaveEntrance`] → `"cave"` (reserved until T27),
+/// - [`FeatureKind::CaveEntrance`] → `"cave"`,
 /// - [`FeatureKind::UniquePrefab`] → `"prefab/unique/<category>"`,
 /// - [`FeatureKind::BiomePrefab`] → `"prefab/biome/<category>"`.
 ///
@@ -260,8 +260,8 @@ pub fn category_for(feature: &Feature) -> FeatureCategory {
         id,
         display_name,
         icon,
-        // Every category is on by default, including the reserved cave layer:
-        // when T27 starts emitting entrances they appear without extra setup.
+        // Every category is on by default — cave entrances included, so they
+        // appear without extra setup once the overlay fetches them.
         default_visible: true,
     }
 }

@@ -365,6 +365,44 @@ Readings:
 - Patch-area flood fills are opt-in (`min_patch_blocks`, not set here) and
   are bounded by the 4-strips × 32-rings fill cap per candidate.
 
+## Cave entrances (T27)
+
+**Task:** [T27](../tasks/T27-cave-entrances.md) — the cave stage's entrance
+predicate without cave generation, measured against the real generator.
+Harness: the worldgen ignored test `query_cave_entrances_bench_512`
+(`hytale-server-rust/crates/worldgen-hytale/tests/cave_entrances.rs`),
+release build, Default fixture, seed 0, warm on a disjoint 64×64 rect, one
+512×512 query centred on the origin. The smaller rows are from the same
+query's debug probe (`cave_entrances` integration test) and are debug
+timings, not comparable to the release row:
+
+| Rect side | Entrances | Time | Profile |
+|---:|---:|---:|---|
+| 32 (one chunk) | 219 | 35 ms | debug |
+| 128 | 3,311 | 0.38 s | debug |
+| 256 | 13,257 | 21.8 s | debug |
+| 512 | 52,941 | 61.9 s | release |
+
+Readings:
+
+- **The Default world's cave entrances are dense**: ~0.2 candidate columns
+  per block², so one chunk has ~200 entrances and a 512-block rect has
+  ~53k. The overlay therefore clusters them heavily (T23) and the adapter
+  caps the cave kind at **256 blocks per side**; the other feature kinds
+  keep the normal overlay rect. A view with a visible rect that fits the cap
+  queries exactly that visible rect (no margin) so caves still load when
+  zoomed in; a larger view draws no cave icons.
+- **The 10,000×10,000 query is a batch job, not a UI query**: at the
+  measured density it would return ≈20M placements and take
+  ≈61.9 s × (10,000/512)² ≈ 6.6 h (plus memory for the result vector).
+  This is the T33 tiling/streaming lever; the task's "cap the rect"
+  allowance is what the 256-block overlay cap implements.
+- The query never calls `get_cave`: a 32-block query is 35 ms while a full
+  chunk generation with caves is ~0.45 s (T09), and the fixture geometry
+  test finds carved blocks around every checked entrance. The entrance
+  predicate is the shared `CavePopulator` filter, so the recorded positions
+  are the generator's own placements, not a reimplementation.
+
 ## What this means for the explorer
 
 1. **Worker count: start 2, cap at 8-12.** Measured parallel scaling on the
@@ -466,6 +504,8 @@ Only release runs on the environment above (or note the change).
 | 2026-11-24 | feature search 50,000 radius sweep, cheap tier (seed 0) | 49.2 ms first / 614.6 ms total (38,809 regions) | as above | T24 |
 | 2026-11-24 | biome search first result, 10,000 radius (common id 32 / rare id 39) | 20.8 ms / 143.2 ms | `cargo test -p map-core --release --test biome_search_fixture -- --ignored biome_search_bench --nocapture` | T25 |
 | 2026-11-24 | biome search full 10,000 scan, unlimited results (common 1,797 results / rare 1 result) | 170.2 s / 34.6 s (1,575,025 coarse samples) | as above | T25 |
+| 2026-11-25 | cave entrances, 512×512 rect (seed 0, warm) | 52,941 entrances in 61.9 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench --nocapture` (in the sibling worldgen checkout) | T27 |
+| 2026-11-25 | cave entrances, 32×32 chunk (debug, cold) | 219 entrances in 35 ms | `cargo test -p worldgen-hytale --test cave_entrances query_cave_entrances --nocapture` | T27 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

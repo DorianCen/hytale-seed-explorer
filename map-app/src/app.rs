@@ -648,8 +648,8 @@ impl SeedExplorerApp {
                 ui.checkbox(&mut overlays.prefabs, labels::OVERLAY_PREFABS);
                 ui.checkbox(&mut overlays.spawn, labels::OVERLAY_SPAWN);
                 ui.checkbox(&mut overlays.poi, labels::OVERLAY_POI);
-                // Maps to the cave group now; still a no-op until T27
-                // actually emits cave entrances.
+                // The cave toggle drives the full tier's cave-entrance kind
+                // (T27); large views omit it per the adapter's cap.
                 ui.checkbox(&mut overlays.cave_entrances, labels::OVERLAY_CAVE_ENTRANCES);
                 ui.checkbox(&mut overlays.chunk_grid, labels::OVERLAY_CHUNK_GRID);
 

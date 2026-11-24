@@ -105,8 +105,8 @@ pub fn layer_label(layer: Layer) -> &'static str {
 
 /// The overlay checkboxes of the left panel. The feature groups (T23) are
 /// draw-time filters first and the next fetch's kind mask second; the chunk
-/// grid stays a debug placeholder. `cave_entrances` maps to the cave group
-/// now but stays a no-op until T27 starts emitting entrances.
+/// grid stays a debug placeholder. `cave_entrances` drives T27's cave group
+/// (the full tier fetches entrances when the view fits the adapter's cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlaySettings {
     pub structures: bool,

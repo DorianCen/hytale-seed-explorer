@@ -36,7 +36,7 @@ it owns, and the acceptance gate.
 | [T24](T24-feature-search.md) | Feature search engine and streaming | 7 | T22, T23 | done |
 | [T25](T25-biome-search.md) | Biome search | 7 | T08, T24 | done |
 | [T26](T26-search-ui.md) | Search UI, cancellation and filters | 7 | T18, T23, T24, T25 | proposed |
-| [T27](T27-cave-entrances.md) | Cave entrance overlay | 8 | T22, T23 | proposed |
+| [T27](T27-cave-entrances.md) | Cave entrance overlay | 8 | T22, T23 | done |
 | [T28](T28-cave-slices-density.md) | Cave Y-slice and density heat map | 8 | T09, T21, T27 | proposed |
 | [T29](T29-map-tools.md) | Grid, go-to, spawn/origin and measurement | 9 | T16, T23 | proposed |
 | [T30](T30-waypoints.md) | Waypoints and annotations | 9 | T16, T29 | proposed |

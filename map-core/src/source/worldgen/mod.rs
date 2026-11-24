@@ -864,9 +864,22 @@ pub(crate) fn zone_at(
 /// [`FeatureKindMask`] is not a placement predicate and cannot drift from the
 /// generator.
 ///
-/// A [`FeatureKind::CaveEntrance`] request contributes no worldgen kind yet
-/// (T27 reserves it); a filter that asks for nothing else returns an empty
-/// list without running the placement pass.
+/// A [`FeatureKind::CaveEntrance`] request maps to the worldgen cave-entrance
+/// query, which runs the cave stage's shared entrance predicate without
+/// `get_cave`. Rects larger than [`MAX_CAVE_ENTRANCE_SIDE_BLOCKS`] drop that
+/// kind (the other kinds still run): the Default world's entrance density
+/// makes a large cave rect a batch job, not an overlay fetch.
+///
+/// The cave-entrance pass is cheap per candidate but the Default world's
+/// cave point generators are dense (about 0.2 candidate columns per block²),
+/// so a full 2048-block overlay rect would enumerate hundreds of thousands of
+/// entrances and block the overlay worker for minutes. The overlay's job is
+/// the visible view: 256 blocks per side is ~5.5 s in release (~22 s in
+/// debug) and ~13k entrances; larger cave views are a batch job (T33). The
+/// other feature kinds keep their own cap (`MAX_FETCH_SIDE_BLOCKS` in the
+/// app).
+pub const MAX_CAVE_ENTRANCE_SIDE_BLOCKS: i64 = 256;
+
 pub(crate) fn feature_query(
     generator: &Rc<ChunkGenerator>,
     seed: i32,
@@ -874,9 +887,15 @@ pub(crate) fn feature_query(
     filter: &FeatureFilter,
 ) -> SourceResult<Vec<Feature>> {
     catch_query_panics(|| {
-        let Some(kinds) = placement_kinds(filter.kinds) else {
+        let Some(mut kinds) = placement_kinds(filter.kinds) else {
             return Ok(Vec::new());
         };
+        if !cave_entrances_fit(rect) {
+            kinds = kinds.without(PlacementKind::CaveEntrance);
+        }
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
         let block_rect = BlockRect {
             min_x: rect.min_x,
             min_z: rect.min_z,
@@ -898,10 +917,17 @@ pub(crate) fn feature_query(
     })
 }
 
+/// Whether the rect is small enough to include cave entrances (see
+/// [`MAX_CAVE_ENTRANCE_SIDE_BLOCKS`]).
+fn cave_entrances_fit(rect: Rect) -> bool {
+    let cap = MAX_CAVE_ENTRANCE_SIDE_BLOCKS;
+    i64::from(rect.max_x) - i64::from(rect.min_x) < cap
+        && i64::from(rect.max_z) - i64::from(rect.min_z) < cap
+}
+
 /// Maps a map-core kind mask onto the generator's placement mask.
 ///
-/// Returns [`None`] when no worldgen kind is requested (e.g. only cave
-/// entrances, which the query does not emit until T27): the caller then
+/// Returns [`None`] when no worldgen kind is requested: the caller then
 /// skips the query entirely instead of running it just to filter everything
 /// out.
 fn placement_kinds(mask: FeatureKindMask) -> Option<PlacementKindMask> {
@@ -923,7 +949,9 @@ fn placement_kinds(mask: FeatureKindMask) -> Option<PlacementKindMask> {
     if mask.contains(FeatureKind::Spawn) {
         add(PlacementKindMask::SPAWN);
     }
-    // `CaveEntrance` has no worldgen placement kind yet (reserved for T27).
+    if mask.contains(FeatureKind::CaveEntrance) {
+        add(PlacementKindMask::CAVE_ENTRANCE);
+    }
     kinds
 }
 
@@ -936,15 +964,17 @@ fn placement_kinds(mask: FeatureKindMask) -> Option<PlacementKindMask> {
 ///   chunkbase-style map pin; unique prefabs are otherwise hidden landmarks);
 /// - `UniquePrefab` without `show_on_map` → [`FeatureKind::UniquePrefab`];
 /// - `BiomePrefab` → [`FeatureKind::BiomePrefab`];
-/// - any unknown/future kind (T27's cave entrance) → [`None`], skipped.
+/// - `CaveEntrance` → [`FeatureKind::CaveEntrance`] (name = cave type,
+///   category = zone, Y = the height the entrance predicate accepted).
+/// - any unknown/future kind → [`None`], skipped.
 ///
 /// `metadata.source` records which generator list produced the feature
-/// (`"unique-prefab"`, `"biome-prefab"` or `"spawn"`), so same-named
-/// features from different sources stay distinguishable. `metadata.size` is
-/// the larger horizontal footprint when bounds exist. `bounds` maps straight
-/// through: both sides use inclusive block bounds, and the y span a unique
-/// prefab reports is its placement origin (the worldgen query's documented
-/// contract).
+/// (`"unique-prefab"`, `"biome-prefab"`, `"spawn"` or `"cave-entrance"`), so
+/// same-named features from different sources stay distinguishable.
+/// `metadata.size` is the larger horizontal footprint when bounds exist.
+/// `bounds` maps straight through: both sides use inclusive block bounds, and
+/// the y span a unique prefab reports is its placement origin (the worldgen
+/// query's documented contract).
 ///
 /// Public so the adapter parity test can run the same translation over a
 /// directly loaded generator's query result. It is the only worldgen-typed
@@ -956,8 +986,9 @@ pub fn translate_placement(placement: &FeaturePlacement) -> Option<Feature> {
         PlacementKind::UniquePrefab if placement.show_on_map => (FeatureKind::Poi, "unique-prefab"),
         PlacementKind::UniquePrefab => (FeatureKind::UniquePrefab, "unique-prefab"),
         PlacementKind::BiomePrefab => (FeatureKind::BiomePrefab, "biome-prefab"),
-        // `PlacementKind` is `#[non_exhaustive]`: a future cave-entrance kind
-        // maps to nothing until T27 defines its map-core identity.
+        PlacementKind::CaveEntrance => (FeatureKind::CaveEntrance, "cave-entrance"),
+        // `PlacementKind` is `#[non_exhaustive]`: a future kind maps to
+        // nothing until the explorer defines its identity.
         _ => return None,
     };
 
@@ -1146,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn features_placement_kinds_map_poi_to_unique_and_skip_cave() {
+    fn features_placement_kinds_map_poi_to_unique_and_cave_to_cave() {
         // Poi is the show_on_map slice of the worldgen unique kind.
         let poi = FeatureKindMask::from_kind(FeatureKind::Poi);
         let kinds = placement_kinds(poi).expect("Poi asks the generator for unique prefabs");
@@ -1167,9 +1198,16 @@ mod tests {
         assert!(spawn.contains(PlacementKind::Spawn));
         assert!(!spawn.contains(PlacementKind::UniquePrefab));
 
-        // Cave entrances (T27) and an empty mask request no worldgen kind,
-        // so the query is skipped instead of running and dropping all.
-        assert!(placement_kinds(FeatureKindMask::from_kind(FeatureKind::CaveEntrance)).is_none());
+        // Cave entrances (T27) are their own worldgen query.
+        let cave = placement_kinds(FeatureKindMask::from_kind(FeatureKind::CaveEntrance))
+            .expect("CaveEntrance asks for cave entrances");
+        assert!(cave.contains(PlacementKind::CaveEntrance));
+        assert!(!cave.contains(PlacementKind::UniquePrefab));
+        assert!(!cave.contains(PlacementKind::BiomePrefab));
+        assert!(!cave.contains(PlacementKind::Spawn));
+
+        // An empty mask requests nothing, so the query is skipped instead of
+        // running and dropping all.
         assert!(placement_kinds(FeatureKindMask(0)).is_none());
 
         // Every worldgen kind can be requested by the matching map-core kind.
