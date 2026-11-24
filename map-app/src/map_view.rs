@@ -65,7 +65,7 @@ use crate::labels;
 use crate::overlays::features as feature_overlay;
 use crate::state::AppState;
 use crate::texture::TextureCache;
-use crate::view_state::{MapViewState, expand_to_pixels, tile_screen_rect};
+use crate::view_state::{MapViewState, block_to_screen, expand_to_pixels, tile_screen_rect};
 
 /// Tile-cache byte budget: 256 MiB ≈ a thousand 256×256 tiles. The
 /// visible set is a few dozen tiles, so this holds a long pan's worth
@@ -617,6 +617,32 @@ impl MapView {
         // the frame (the cursor readout is the status bar's next frame).
         // With no catalog this is a cheap no-op.
         self.paint_feature_overlay(ui, &painter, &response, state);
+        // T26's search selection ring: a result row's click centers the map
+        // and flashes this ring for one second.
+        self.paint_search_flash(&painter, state);
+    }
+
+    /// Draws the flashing ring around the selected search result, when its
+    /// one-second window is open.
+    fn paint_search_flash(&self, painter: &egui::Painter, state: &AppState) {
+        let Some((x, z)) = state.search().flash_position(Instant::now()) else {
+            return;
+        };
+        let Some((screen_x, screen_y)) = block_to_screen(state.view(), x, z) else {
+            return;
+        };
+        let center = self.rect.min + egui::vec2(screen_x, screen_y);
+        painter.circle_stroke(
+            center,
+            12.0,
+            egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 200, 255)),
+        );
+        painter.circle_stroke(
+            center,
+            18.0,
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 140, 220)),
+        );
+        painter.circle_filled(center, 2.5, Color32::from_rgb(220, 240, 255));
     }
 
     // -- Input --------------------------------------------------------------

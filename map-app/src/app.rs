@@ -30,6 +30,7 @@ use crate::inspector::{self, HoverKnowledge, HoverReply, Readout};
 use crate::labels;
 use crate::map_view::MapView;
 use crate::overlays::features::{FeatureFetch, FeatureReplyOutcome};
+use crate::search_panel::SearchPanel;
 use crate::state::{
     self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, RenderMode, layer_label,
     offers_layer, render_mode_label,
@@ -46,6 +47,11 @@ const HOVER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// query itself runs for seconds-to-minutes on its worker; this only makes
 /// the reply land promptly instead of at the next input event.
 const FEATURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often to wake the UI while a search is streaming (T26). The state
+/// drains at most 64 events per frame; this keeps the stream flowing without
+/// pinning the CPU.
+const SEARCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Which overlay slot a spawned query feeds: the immediate cheap tier, the
 /// invisible biome-prefab prewarm, or the debounced full tier.
@@ -67,6 +73,9 @@ pub struct SeedExplorerApp {
     hover_rx: Option<Receiver<HoverReply>>,
     /// The central map widget (T16): input, tile pipeline, painting.
     map: MapView,
+    /// The left-panel search form (T26); its headless state lives in
+    /// [`AppState`].
+    search_panel: SearchPanel,
 }
 
 impl SeedExplorerApp {
@@ -85,6 +94,7 @@ impl SeedExplorerApp {
             load_rx: None,
             hover_rx: None,
             map: MapView::new(),
+            search_panel: SearchPanel::default(),
         }
     }
 
@@ -96,6 +106,7 @@ impl SeedExplorerApp {
         // inspector's knowledge.
         self.poll_load_channel(ctx);
         self.poll_hover_replies();
+        self.state.search_mut().poll();
         self.keyboard_shortcuts(ctx);
 
         self.status_bar(ctx);
@@ -114,6 +125,15 @@ impl SeedExplorerApp {
         // notes the settled viewport and polls its query (T23).
         self.drive_hover_sampling(ctx);
         self.drive_feature_overlay(ctx);
+        if self.state.search().is_running() {
+            // Keep the search stream flowing while the user does nothing.
+            ctx.request_repaint_after(SEARCH_POLL_INTERVAL);
+        }
+        if self.state.search().flash_position(Instant::now()).is_some() {
+            // The search flash is a one-second animation; repaint until it
+            // expires.
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
 
         if self.state.go_to().is_some() {
             self.go_to_dialog(ctx);
@@ -398,6 +418,13 @@ impl SeedExplorerApp {
     fn keyboard_shortcuts(&mut self, ctx: &Context) {
         if self.state.go_to().is_some() && ctx.input_mut(|input| input.key_pressed(Key::Escape)) {
             self.state.close_go_to();
+        } else if self.state.go_to().is_none()
+            && ctx.input_mut(|input| input.key_pressed(Key::Escape))
+        {
+            // `Esc` cancels a running search or clears a finished one; it
+            // works even while a text field has focus (egui never consumes
+            // Escape in a singleline edit).
+            self.state.cancel_or_clear_search();
         }
         if ctx.wants_keyboard_input() {
             return;
@@ -599,222 +626,235 @@ impl SeedExplorerApp {
             .default_width(190.0)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(RichText::new(labels::GROUP_LAYERS).strong());
-                if biomes_only {
-                    ui.label(RichText::new(labels::MODE_HINT_BIOMES_ONLY).weak());
-                }
-                // Every offered layer in stack order: the checkbox, and
-                // — while enabled — its opacity slider. Order is paint
-                // order, bottom → top; the unoffered future layers get
-                // their grayed "arrives with" notes instead.
-                for settings in self.state.layers().iter().filter(|s| offers_layer(s.id)) {
-                    let mut enabled = settings.enabled;
-                    if ui
-                        .checkbox(&mut enabled, layer_label(settings.id))
-                        .changed()
-                    {
-                        toggled = Some((settings.id, enabled));
-                    }
-                    if enabled {
-                        let mut opacity = settings.opacity;
-                        ui.horizontal(|ui| {
-                            ui.label(labels::OPACITY);
-                            if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)).changed() {
-                                opacity_edited = Some((settings.id, opacity));
-                            }
-                        });
-                    }
-                }
-                if surface_enabled && effective > 1 {
-                    // The plan's "auto-select step 1 only when visible"
-                    // note: full-block detail at 4×4 is a deliberate
-                    // zoom-out, not a rendering bug.
-                    let hint = labels::LAYER_HINT_SURFACE
-                        .replace("{n}×{n}", &format!("{effective}×{effective}"));
-                    ui.label(RichText::new(hint).weak());
-                }
-                ui.label(RichText::new(labels::MAP_PLACEHOLDER_CAVES).weak());
-                // The plan's climate debug layers: only if the
-                // generator exposes a per-column query — it does not,
-                // and the refusal is explicit rather than approximated.
-                ui.label(RichText::new(labels::CLIMATE_NOTE).weak());
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label(RichText::new(labels::GROUP_OVERLAYS).strong());
-                let overlays = self.state.overlays_mut();
-                ui.checkbox(&mut overlays.structures, labels::OVERLAY_STRUCTURES);
-                ui.checkbox(&mut overlays.prefabs, labels::OVERLAY_PREFABS);
-                ui.checkbox(&mut overlays.spawn, labels::OVERLAY_SPAWN);
-                ui.checkbox(&mut overlays.poi, labels::OVERLAY_POI);
-                // Maps to the cave group now; still a no-op until T27
-                // actually emits cave entrances.
-                ui.checkbox(&mut overlays.cave_entrances, labels::OVERLAY_CAVE_ENTRANCES);
-                ui.checkbox(&mut overlays.chunk_grid, labels::OVERLAY_CHUNK_GRID);
-
-                ui.add_space(8.0);
-                ui.separator();
-                let search_heading = if flash_search {
-                    RichText::new(labels::GROUP_SEARCH)
-                        .strong()
-                        .color(Color32::from_rgb(120, 200, 255))
-                } else {
-                    RichText::new(labels::GROUP_SEARCH).strong()
-                };
-                ui.label(search_heading);
-                ui.label(labels::SEARCH_PLACEHOLDER);
-
-                // The inspector (T18): the same data the status bar reads,
-                // with names *and* ids, the tint and the copy button.
-                ui.add_space(8.0);
-                ui.separator();
-                egui::CollapsingHeader::new(labels::INSPECTOR)
-                    .default_open(true)
+                // T26 adds a search form and a result table to an already
+                // tall column; the whole panel scrolls so the table and the
+                // inspector below it stay reachable in a short window.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let coords = match hovered {
-                            Some((x, z)) => format!("X:{x} Z:{z}"),
-                            None => {
-                                format!("X:{} Z:{}", labels::STATUS_MISSING, labels::STATUS_MISSING)
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(labels::GROUP_LAYERS).strong());
+                        if biomes_only {
+                            ui.label(RichText::new(labels::MODE_HINT_BIOMES_ONLY).weak());
+                        }
+                        // Every offered layer in stack order: the checkbox, and
+                        // — while enabled — its opacity slider. Order is paint
+                        // order, bottom → top; the unoffered future layers get
+                        // their grayed "arrives with" notes instead.
+                        for settings in self.state.layers().iter().filter(|s| offers_layer(s.id)) {
+                            let mut enabled = settings.enabled;
+                            if ui
+                                .checkbox(&mut enabled, layer_label(settings.id))
+                                .changed()
+                            {
+                                toggled = Some((settings.id, enabled));
                             }
-                        };
-                        ui.label(format!("{}: {coords}", labels::INSPECTOR_COORDINATES));
-                        match &readout {
-                            Readout::Sample(sample) => {
-                                ui.label(format!(
-                                    "{}: {} (#{})",
-                                    labels::STATUS_BIOME,
-                                    sample.biome,
-                                    sample.biome_id.0,
-                                ));
-                                ui.label(format!("{}: {}", labels::STATUS_HEIGHT, sample.height));
-                                ui.label(format!(
-                                    "{}: {} (#{})",
-                                    labels::STATUS_BLOCK,
-                                    sample.block,
-                                    sample.block_id.0,
-                                ));
-                                match &sample.fluid {
-                                    Some(fluid) => {
+                            if enabled {
+                                let mut opacity = settings.opacity;
+                                ui.horizontal(|ui| {
+                                    ui.label(labels::OPACITY);
+                                    if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)).changed()
+                                    {
+                                        opacity_edited = Some((settings.id, opacity));
+                                    }
+                                });
+                            }
+                        }
+                        if surface_enabled && effective > 1 {
+                            // The plan's "auto-select step 1 only when visible"
+                            // note: full-block detail at 4×4 is a deliberate
+                            // zoom-out, not a rendering bug.
+                            let hint = labels::LAYER_HINT_SURFACE
+                                .replace("{n}×{n}", &format!("{effective}×{effective}"));
+                            ui.label(RichText::new(hint).weak());
+                        }
+                        ui.label(RichText::new(labels::MAP_PLACEHOLDER_CAVES).weak());
+                        // The plan's climate debug layers: only if the
+                        // generator exposes a per-column query — it does not,
+                        // and the refusal is explicit rather than approximated.
+                        ui.label(RichText::new(labels::CLIMATE_NOTE).weak());
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(RichText::new(labels::GROUP_OVERLAYS).strong());
+                        let overlays = self.state.overlays_mut();
+                        ui.checkbox(&mut overlays.structures, labels::OVERLAY_STRUCTURES);
+                        ui.checkbox(&mut overlays.prefabs, labels::OVERLAY_PREFABS);
+                        ui.checkbox(&mut overlays.spawn, labels::OVERLAY_SPAWN);
+                        ui.checkbox(&mut overlays.poi, labels::OVERLAY_POI);
+                        // Maps to the cave group now; still a no-op until T27
+                        // actually emits cave entrances.
+                        ui.checkbox(&mut overlays.cave_entrances, labels::OVERLAY_CAVE_ENTRANCES);
+                        ui.checkbox(&mut overlays.chunk_grid, labels::OVERLAY_CHUNK_GRID);
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        // T26: the real search form, results table and actions.
+                        // `flash_search` is the `F` shortcut's one-shot.
+                        self.search_panel.ui(ui, &mut self.state, flash_search);
+
+                        // The inspector (T18): the same data the status bar reads,
+                        // with names *and* ids, the tint and the copy button.
+                        ui.add_space(8.0);
+                        ui.separator();
+                        egui::CollapsingHeader::new(labels::INSPECTOR)
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let coords = match hovered {
+                                    Some((x, z)) => format!("X:{x} Z:{z}"),
+                                    None => {
+                                        format!(
+                                            "X:{} Z:{}",
+                                            labels::STATUS_MISSING,
+                                            labels::STATUS_MISSING
+                                        )
+                                    }
+                                };
+                                ui.label(format!("{}: {coords}", labels::INSPECTOR_COORDINATES));
+                                match &readout {
+                                    Readout::Sample(sample) => {
                                         ui.label(format!(
-                                            "{}: {fluid} (#{})",
-                                            labels::STATUS_FLUID,
-                                            sample.fluid_id.map_or_else(
-                                                || labels::STATUS_MISSING.to_string(),
-                                                |id| id.0.to_string()
-                                            ),
+                                            "{}: {} (#{})",
+                                            labels::STATUS_BIOME,
+                                            sample.biome,
+                                            sample.biome_id.0,
                                         ));
                                         ui.label(format!(
                                             "{}: {}",
-                                            labels::INSPECTOR_DEPTH,
-                                            sample.fluid_depth
+                                            labels::STATUS_HEIGHT,
+                                            sample.height
+                                        ));
+                                        ui.label(format!(
+                                            "{}: {} (#{})",
+                                            labels::STATUS_BLOCK,
+                                            sample.block,
+                                            sample.block_id.0,
+                                        ));
+                                        match &sample.fluid {
+                                            Some(fluid) => {
+                                                ui.label(format!(
+                                                    "{}: {fluid} (#{})",
+                                                    labels::STATUS_FLUID,
+                                                    sample.fluid_id.map_or_else(
+                                                        || labels::STATUS_MISSING.to_string(),
+                                                        |id| id.0.to_string()
+                                                    ),
+                                                ));
+                                                ui.label(format!(
+                                                    "{}: {}",
+                                                    labels::INSPECTOR_DEPTH,
+                                                    sample.fluid_depth
+                                                ));
+                                            }
+                                            None => {
+                                                ui.label(format!(
+                                                    "{}: {}",
+                                                    labels::STATUS_FLUID,
+                                                    labels::STATUS_NONE
+                                                ));
+                                            }
+                                        }
+                                        ui.label(format!(
+                                            "{}: #{:06x}",
+                                            labels::INSPECTOR_TINT,
+                                            sample.tint & 0xFF_FF_FF,
                                         ));
                                     }
-                                    None => {
-                                        ui.label(format!(
-                                            "{}: {}",
-                                            labels::STATUS_FLUID,
-                                            labels::STATUS_NONE
-                                        ));
+                                    Readout::OutOfWorld => {
+                                        ui.label(labels::STATUS_OUT_OF_WORLD);
+                                    }
+                                    Readout::Pending => {
+                                        ui.label(labels::STATUS_PENDING);
+                                    }
+                                    Readout::Nothing => {
+                                        ui.label(labels::STATUS_MISSING);
                                     }
                                 }
+                                if let Some(error) = &inspector_error {
+                                    ui.label(
+                                        RichText::new(error).color(ui.visuals().error_fg_color),
+                                    );
+                                }
                                 ui.label(format!(
-                                    "{}: #{:06x}",
-                                    labels::INSPECTOR_TINT,
-                                    sample.tint & 0xFF_FF_FF,
+                                    "{}: {scale:.1} {}",
+                                    labels::STATUS_ZOOM,
+                                    labels::STATUS_PT_PER_BLOCK
                                 ));
-                            }
-                            Readout::OutOfWorld => {
-                                ui.label(labels::STATUS_OUT_OF_WORLD);
-                            }
-                            Readout::Pending => {
-                                ui.label(labels::STATUS_PENDING);
-                            }
-                            Readout::Nothing => {
-                                ui.label(labels::STATUS_MISSING);
-                            }
-                        }
-                        if let Some(error) = &inspector_error {
-                            ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
-                        }
-                        ui.label(format!(
-                            "{}: {scale:.1} {}",
-                            labels::STATUS_ZOOM,
-                            labels::STATUS_PT_PER_BLOCK
-                        ));
-                        ui.label(state::format_resolution(step, effective));
-                        if ui
-                            .add_enabled(
-                                hovered.is_some(),
-                                egui::Button::new(labels::COPY_COORDINATES),
-                            )
-                            .clicked()
-                        {
-                            copied = true;
+                                ui.label(state::format_resolution(step, effective));
+                                if ui
+                                    .add_enabled(
+                                        hovered.is_some(),
+                                        egui::Button::new(labels::COPY_COORDINATES),
+                                    )
+                                    .clicked()
+                                {
+                                    copied = true;
+                                }
+                            });
+
+                        // Palette diagnostics (T13): every biome the loaded world
+                        // defines, name and map color, so a palette bug is visible
+                        // without running a render.
+                        if let Some(source) = self.state.source() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            egui::CollapsingHeader::new(labels::PALETTE)
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    // HashMap iteration order would jitter the
+                                    // list between runs; sort by name.
+                                    let mut entries: Vec<_> =
+                                        source.biome_catalog().iter().collect();
+                                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                                    for info in entries {
+                                        let [r, g, b] = info.map_color_rgb();
+                                        ui.horizontal(|ui| {
+                                            let (swatch, _) = ui.allocate_exact_size(
+                                                Vec2::new(12.0, 12.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                swatch,
+                                                2.0,
+                                                Color32::from_rgb(r, g, b),
+                                            );
+                                            ui.label(&info.name);
+                                        });
+                                    }
+                                });
+
+                            // The zone debug layer's legend (T19): the layer
+                            // colors by a stable name hash, so the legend is how
+                            // a color becomes a name again.
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(labels::ZONE_LEGEND)
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    let mut zones: Vec<_> = source.zone_catalog().iter().collect();
+                                    if zones.is_empty() {
+                                        ui.label(labels::ZONE_NONE);
+                                    }
+                                    // Sorted like the palette: stable list, no
+                                    // HashMap jitter.
+                                    zones.sort_by(|a, b| a.name.cmp(&b.name));
+                                    for info in zones {
+                                        let [r, g, b] = map_core::render::zone_color(&info.name);
+                                        ui.horizontal(|ui| {
+                                            let (swatch, _) = ui.allocate_exact_size(
+                                                Vec2::new(12.0, 12.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                swatch,
+                                                2.0,
+                                                Color32::from_rgb(r, g, b),
+                                            );
+                                            ui.label(&info.name);
+                                        });
+                                    }
+                                });
                         }
                     });
-
-                // Palette diagnostics (T13): every biome the loaded world
-                // defines, name and map color, so a palette bug is visible
-                // without running a render.
-                if let Some(source) = self.state.source() {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    egui::CollapsingHeader::new(labels::PALETTE)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            // HashMap iteration order would jitter the
-                            // list between runs; sort by name.
-                            let mut entries: Vec<_> = source.biome_catalog().iter().collect();
-                            entries.sort_by(|a, b| a.name.cmp(&b.name));
-                            for info in entries {
-                                let [r, g, b] = info.map_color_rgb();
-                                ui.horizontal(|ui| {
-                                    let (swatch, _) = ui.allocate_exact_size(
-                                        Vec2::new(12.0, 12.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        swatch,
-                                        2.0,
-                                        Color32::from_rgb(r, g, b),
-                                    );
-                                    ui.label(&info.name);
-                                });
-                            }
-                        });
-
-                    // The zone debug layer's legend (T19): the layer
-                    // colors by a stable name hash, so the legend is how
-                    // a color becomes a name again.
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new(labels::ZONE_LEGEND)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let mut zones: Vec<_> = source.zone_catalog().iter().collect();
-                            if zones.is_empty() {
-                                ui.label(labels::ZONE_NONE);
-                            }
-                            // Sorted like the palette: stable list, no
-                            // HashMap jitter.
-                            zones.sort_by(|a, b| a.name.cmp(&b.name));
-                            for info in zones {
-                                let [r, g, b] = map_core::render::zone_color(&info.name);
-                                ui.horizontal(|ui| {
-                                    let (swatch, _) = ui.allocate_exact_size(
-                                        Vec2::new(12.0, 12.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        swatch,
-                                        2.0,
-                                        Color32::from_rgb(r, g, b),
-                                    );
-                                    ui.label(&info.name);
-                                });
-                            }
-                        });
-                }
             });
         // The layer edits were buffered while the panel held the stack:
         // apply them here, where the state is mutable again. Each write

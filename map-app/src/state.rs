@@ -36,6 +36,7 @@ use map_core::types::{Rect, Seed, SeedError};
 use crate::inspector::{GoToDialog, InspectorState, parse_go_to};
 use crate::labels;
 use crate::overlays::features::FeatureOverlayState;
+use crate::search_state::{SearchState, SearchStatus};
 use crate::view_state::MapViewState;
 
 /// The resolution steps the top-bar selector offers (blocks per sample).
@@ -251,6 +252,10 @@ pub struct AppState {
     /// cache, in-flight channel and selection. Reset with the source.
     features: FeatureOverlayState,
 
+    /// The left-panel search (T26): form request, streamed results,
+    /// cancellation and the click/flash state. Reset with the source.
+    search: SearchState,
+
     /// Cursor block coordinates once the map widget exists (T16).
     cursor: Option<(i32, i32)>,
 
@@ -293,6 +298,7 @@ impl Default for AppState {
             layers: LayerStack::new(),
             overlays: OverlaySettings::default(),
             features: FeatureOverlayState::new(),
+            search: SearchState::default(),
             cursor: None,
             inspector: InspectorState::new(),
             status: String::new(),
@@ -413,6 +419,7 @@ impl AppState {
         // must not outlive the source, even while the new one loads.
         self.retire_ready_source();
         self.features.reset();
+        self.search.reset();
         self.source = SourceState::Loading { generation };
         self.loaded_seed_input = Some(self.seed_text.clone());
         self.status.clear();
@@ -498,6 +505,8 @@ impl AppState {
         // in-flight query (the worker's send then fails and it exits),
         // the cached catalogs and the active markers.
         self.features.reset();
+        // A running search belongs to the same dead world (T26).
+        self.search.reset();
     }
 
     /// True while a load is in flight (drives the Go button and spinner).
@@ -691,6 +700,35 @@ impl AppState {
     /// click selection.
     pub fn features_mut(&mut self) -> &mut FeatureOverlayState {
         &mut self.features
+    }
+
+    /// The left-panel search (T26), read-only.
+    #[must_use]
+    pub fn search(&self) -> &SearchState {
+        &self.search
+    }
+
+    /// The left-panel search, for the panel's start/cancel/select actions
+    /// and the per-frame poll.
+    pub fn search_mut(&mut self) -> &mut SearchState {
+        &mut self.search
+    }
+
+    /// `Esc`'s search action: cancel a running search, or clear a finished
+    /// one. Returns whether anything changed (so the caller may skip its
+    /// other Escape handling).
+    pub fn cancel_or_clear_search(&mut self) -> bool {
+        match self.search.status() {
+            SearchStatus::Running => {
+                self.search.cancel();
+                true
+            }
+            SearchStatus::Done | SearchStatus::Failed => {
+                self.search.reset();
+                true
+            }
+            SearchStatus::Idle => false,
+        }
     }
 
     /// Cursor block coordinates for the status bar, once the map widget
@@ -1476,5 +1514,35 @@ mod tests {
             1,
             "the stale source was parked too"
         );
+    }
+
+    #[test]
+    fn search_is_cancelled_when_the_seed_changes() {
+        // T26: a search belongs to one source, exactly like the overlay's
+        // catalogs. Editing the seed invalidates the source and resets the
+        // search, so a late result can never mix worlds.
+        let mut state = state();
+        let request = crate::search_state::SearchRequest {
+            target: crate::search_state::SearchTarget::Biome(map_core::types::BiomeId(0)),
+            max_radius: 100.0,
+            ..crate::search_state::SearchRequest::default()
+        };
+        assert!(state.search_mut().start(
+            request,
+            crate::search_state::SearchSource::Biomes(std::sync::Arc::new(
+                map_core::test_support::FakeWorldSource::new("1"),
+            )),
+        ));
+        assert!(state.search().is_running());
+        assert!(state.cancel_or_clear_search(), "Esc cancels first");
+        assert!(state.search().cancel_requested());
+
+        state.set_seed_text(String::from("7"));
+        assert_eq!(
+            state.search().status(),
+            crate::search_state::SearchStatus::Idle,
+            "the source change clears the search",
+        );
+        assert!(state.search().results().is_empty());
     }
 }

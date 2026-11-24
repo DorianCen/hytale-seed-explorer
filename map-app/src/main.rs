@@ -19,6 +19,8 @@ mod inspector;
 mod labels;
 mod map_view;
 mod overlays;
+mod search_panel;
+mod search_state;
 mod state;
 mod texture;
 mod view_state;

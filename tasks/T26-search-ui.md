@@ -1,6 +1,22 @@
 # T26 — Search UI, cancellation and filters
 
-**Status:** proposed
+**Status:** done (deliverable: `map-app/src/search_state.rs` — the headless
+`SearchState`/`SearchDriver` seam: generation-guarded start, ≤64-event
+per-frame draining, result dedupe/binary-ordered insertion, cancel-then-Done,
+stale-event rejection, selected-hit identity and the one-second flash;
+`map-app/src/search_panel.rs` — the left-panel form (feature kind/category/
+name/min-size/proximity or biome/patch/coarse-step targets, view or custom
+center, 1k/5k/10k/25k radius, result cap), the virtualized results table with
+category icons and `1.2 km` distances, click-to-center/flash, double-click
+zoom and right-click teleport copy; app wiring for `F`, `Esc`, source-change
+cancellation, a 50 ms poll repaint and the map flash ring; 20 headless
+`search` tests including real T24/T25 driver runs against the fake sources.
+Manual interaction (`cargo run -p map-app`) remains the user's display-side
+check — this environment is headless; `cargo build -p map-app` and the full
+headless suite are the automatable gates. Timing note: the UI path pays the
+engines' first-result numbers (T24 49 ms at the 10k cheap sweep; T25 20.8 ms
+common / 143.2 ms rare at 10k), and the 64-event frame cap bounds the drain
+work; cancellation is unit-tested down to the worker flag.)
 **Milestone:** 7 — Search
 **Depends on:** T18, T23, T24, T25
 **Blocks:** —

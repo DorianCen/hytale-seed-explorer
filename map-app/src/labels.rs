@@ -77,8 +77,97 @@ pub const OVERLAY_POI: &str = "POI";
 pub const OVERLAY_CAVE_ENTRANCES: &str = "Cave ent.";
 pub const OVERLAY_CHUNK_GRID: &str = "Chunk grid";
 
-/// The search placeholder (real search arrives with T24/T26).
-pub const SEARCH_PLACEHOLDER: &str = "Search arrives with T24";
+// -- Search panel (T26) -------------------------------------------------------
+
+/// The feature/biome target selector's label.
+pub const SEARCH_MODE: &str = "Mode";
+/// The feature target mode.
+pub const SEARCH_MODE_FEATURES: &str = "Features";
+/// The biome target mode.
+pub const SEARCH_MODE_BIOME: &str = "Biome";
+/// The feature-kind selector's label.
+pub const SEARCH_KIND: &str = "Kind";
+/// The all-kinds choice (cave entrances have their own choice; T27's dense
+/// entrance scan would dominate a general search).
+pub const SEARCH_KIND_ALL: &str = "All (no caves)";
+/// The unique-prefab kind choice.
+pub const SEARCH_KIND_UNIQUE: &str = "Unique prefabs";
+/// The biome-prefab kind choice.
+pub const SEARCH_KIND_BIOME_PREFAB: &str = "Biome prefabs";
+/// The spawn kind choice.
+pub const SEARCH_KIND_SPAWN: &str = "Spawn";
+/// The POI kind choice.
+pub const SEARCH_KIND_POI: &str = "POI";
+/// The cave-entrance kind choice.
+pub const SEARCH_KIND_CAVE: &str = "Cave entrances";
+/// The category filter's label.
+pub const SEARCH_CATEGORY: &str = "Category";
+/// The category filter's hint (exact match, empty = any).
+pub const SEARCH_CATEGORY_HINT: &str = "any";
+/// The name-substring filter's label.
+pub const SEARCH_NAME: &str = "Name contains";
+/// The minimum-footprint filter's checkbox.
+pub const SEARCH_MIN_SIZE: &str = "Min size";
+/// The proximity filter's checkbox.
+pub const SEARCH_PROXIMITY: &str = "Near another feature";
+/// The proximity separation field's suffix.
+pub const SEARCH_PROXIMITY_BLOCKS: &str = "blocks apart";
+/// The biome picker's label.
+pub const SEARCH_BIOME: &str = "Biome";
+/// Shown when the world has no biome catalog to choose from.
+pub const SEARCH_BIOME_UNKNOWN: &str = "no biomes in this world";
+/// The results-count noun.
+pub const SEARCH_RESULTS: &str = "results";
+/// The progress line's scanned-work noun (regions or coarse samples).
+pub const SEARCH_SCANNED: &str = "scanned";
+/// The biome patch-area minimum checkbox.
+pub const SEARCH_MIN_PATCH: &str = "Min patch area";
+/// The coarse sampling step's label.
+pub const SEARCH_COARSE_STEP: &str = "Coarse step";
+/// The center-mode row's label.
+pub const SEARCH_CENTER: &str = "Center";
+/// The view-center center mode.
+pub const SEARCH_CENTER_VIEW: &str = "View center";
+/// The custom-point center mode.
+pub const SEARCH_CENTER_CUSTOM: &str = "Custom point";
+/// The radius selector's label.
+pub const SEARCH_RADIUS: &str = "Radius";
+/// The result-cap label.
+pub const SEARCH_MAX_RESULTS: &str = "Max results";
+/// The run button.
+pub const SEARCH_GO: &str = "Search";
+/// The cancel button.
+pub const SEARCH_CANCEL: &str = "Cancel";
+/// The clear-results button (idle).
+pub const SEARCH_CLEAR: &str = "Clear";
+/// The retry button after a failure.
+pub const SEARCH_RETRY: &str = "Retry";
+/// Shown before a world is loaded.
+pub const SEARCH_NEED_SOURCE: &str = "load a seed to search";
+/// Shown before the first search.
+pub const SEARCH_IDLE: &str = "choose a target and press Search";
+/// Shown while the first engine event is pending.
+pub const SEARCH_STARTING: &str = "searching…";
+/// Shown after Cancel until the engine acknowledges with Done.
+pub const SEARCH_CANCELLING: &str = "cancelling…";
+/// Shown when a completed search found nothing.
+pub const SEARCH_NO_RESULTS: &str = "no results within the radius";
+/// Shown when the search worker vanishes without a terminal event.
+pub const SEARCH_WORKER_DIED: &str = "the search worker stopped without reporting";
+/// Status-bar prefix after a result was selected.
+pub const STATUS_SEARCH_SELECTED: &str = "selected";
+/// Status-bar feedback after copying a result's teleport string.
+pub const STATUS_SEARCH_COPIED: &str = "copied";
+/// Status-bar feedback after clearing the search.
+pub const STATUS_SEARCH_CLEARED: &str = "search cleared";
+/// Status-bar feedback after a search starts.
+pub const STATUS_SEARCH_STARTED: &str = "searching";
+/// The completed-search summary prefix.
+pub const SEARCH_DONE: &str = "done";
+/// The cancelled-search summary suffix.
+pub const SEARCH_TRUNCATED: &str = "result cap reached";
+/// The cancelled-search summary.
+pub const SEARCH_CANCELLED: &str = "cancelled";
 
 // -- Central map placeholder -------------------------------------------------
 
