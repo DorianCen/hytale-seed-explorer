@@ -430,10 +430,6 @@ pub struct MapView {
     /// Tiles queued or rendering in the last frame — the status bar's
     /// "tiles N" (one frame of staleness; the count is advisory).
     pending: u64,
-    /// T26: while a search runs, tile scheduling is paused and queued tile
-    /// work is cancelled so the shared generator pool serves the search.
-    /// The flag makes the cancel a one-shot; clearing it reschedules.
-    search_paused: bool,
 }
 
 impl Default for MapView {
@@ -452,7 +448,6 @@ impl MapView {
             textures: TextureCache::new(),
             retired: Vec::new(),
             pending: 0,
-            search_paused: false,
         }
     }
 
@@ -590,20 +585,7 @@ impl MapView {
             let request = (!paint_layers.is_empty())
                 .then(|| frame_tiles(state.view(), paint_layers.clone(), passes, pipeline.world))
                 .flatten();
-            // T26: a running search owns the shared generator pool. Pause
-            // tile scheduling and cancel queued tile work once so a cold map
-            // load cannot starve the search; the next frame after `Done`
-            // reschedules the unchanged view because `last` was cleared.
-            if state.search().is_running() {
-                if !self.search_paused {
-                    pipeline.scheduler.cancel_not_serving(&[]);
-                    pipeline.last = None;
-                    self.search_paused = true;
-                }
-            } else {
-                self.search_paused = false;
-                self.serve(ui.ctx(), &mut pipeline, request.as_ref());
-            }
+            self.serve(ui.ctx(), &mut pipeline, request.as_ref());
             if let Some(request) = &request {
                 self.paint(ui.ctx(), &painter, request, &pipeline, state.view());
                 if self.pending > 0 {
