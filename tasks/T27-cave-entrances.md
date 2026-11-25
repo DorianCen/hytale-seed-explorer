@@ -21,7 +21,9 @@ the larger reach exists to find caves crossing into a chunk, not entry points
 inside a query rect; fixture chunk counts are unchanged.
 Manual overlay verification remains the user's display-side check; the
 worldgen `query`/`chunks_golden` gates, `map-core cave_entrances`, the full
-`map-app` suite and `cargo build -p map-app` are green.)
+`map-app` suite and `cargo build -p map-app` are green. Re-verified on the
+final tiled worldgen main: `cargo test -p map-core cave_entrances` (4
+passed) and `cargo test -p map-app` (123 passed).)
 **Milestone:** 8 — Caves
 **Depends on:** T22, T23
 **Blocks:** T28

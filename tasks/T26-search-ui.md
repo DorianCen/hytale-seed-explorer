@@ -21,10 +21,10 @@ turned a running search into `cancelling…`. The final cold-load search (the
 results · 0.0 s`. The UI uses 128-block regions for biome-prefab/cave
 searches (prompt cancellation, inside the T27 cave cap) and 2048-block
 regions for the cheap kinds (few pool round trips), and the default kind is
-Unique prefabs rather than including the minutes-long biome pass. The
-biome path is covered by the real-driver headless test and the panel's
-request test; the manual mode-combo click was not automatable in this
-session. The 64-event frame cap bounds the drain work.)
+Unique prefabs rather than including the minutes-long biome pass. The biome
+mode was exercised manually too: Beach, 10 km, step 16 streamed 31+ results
+sorted by distance (`searching... 70 · 31 results · 19,881 scanned`) while
+the panel stayed responsive. The 64-event frame cap bounds the drain work.)
 **Milestone:** 7 — Search
 **Depends on:** T18, T23, T24, T25
 **Blocks:** —
