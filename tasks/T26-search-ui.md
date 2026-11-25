@@ -11,12 +11,20 @@ category icons and `1.2 km` distances, click-to-center/flash, double-click
 zoom and right-click teleport copy; app wiring for `F`, `Esc`, source-change
 cancellation, a 50 ms poll repaint and the map flash ring; 20 headless
 `search` tests including real T24/T25 driver runs against the fake sources.
-Manual interaction (`cargo run -p map-app`) remains the user's display-side
-check — this environment is headless; `cargo build -p map-app` and the full
-headless suite are the automatable gates. Timing note: the UI path pays the
-engines' first-result numbers (T24 49 ms at the 10k cheap sweep; T25 20.8 ms
-common / 143.2 ms rare at 10k), and the 64-event frame cap bounds the drain
-work; cancellation is unit-tested down to the worker flag.)
+Manual acceptance was run against the X11 display with the real fixture
+(`cargo run -p map-app`, seed 12345): a Unique-prefabs 10k search streamed
+two rows, clicking a row centered the view (including negative coordinates)
+and drew the flash ring, right-click copied `/tp -333 120 302`, and `Esc`
+turned a running search into `cancelling…`. The first cold-load search took
+239.8 s because the map's 14 chunk-summary tiles and the search share the
+two-worker generator pool; a settled/warm re-search reported `done: 2
+results · 0.0 s`. The UI now uses 128-block regions for biome-prefab/cave
+searches (prompt cancellation, inside the T27 cave cap) and 2048-block
+regions for the cheap kinds (few pool round trips), and the default kind is
+Unique prefabs rather than including the minutes-long biome pass. The
+biome path is covered by the real-driver headless test and the panel's
+request test; the manual mode-combo click was not automatable in this
+session. The 64-event frame cap bounds the drain work.)
 **Milestone:** 7 — Search
 **Depends on:** T18, T23, T24, T25
 **Blocks:** —

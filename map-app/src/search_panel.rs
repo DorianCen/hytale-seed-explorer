@@ -17,7 +17,7 @@ use eframe::egui;
 use egui::{Color32, RichText};
 
 use map_core::features::category_for;
-use map_core::search::feature::{DEFAULT_REGION_SIZE, ProximityFilter};
+use map_core::search::feature::ProximityFilter;
 use map_core::source::FeatureSource;
 use map_core::source::WorldSource;
 use map_core::types::{
@@ -137,7 +137,10 @@ impl Default for SearchPanel {
     fn default() -> Self {
         Self {
             mode: SearchMode::Features,
-            kind: FeatureKindChoice::All,
+            // The cheap kinds are the default: a biome-prefab search runs
+            // for seconds-to-minutes per region, so a user who wants it
+            // chooses it deliberately.
+            kind: FeatureKindChoice::UniquePrefab,
             category: String::new(),
             name_contains: String::new(),
             min_size_enabled: false,
@@ -672,7 +675,6 @@ impl SearchPanel {
             proximity,
             coarse_step: self.coarse_step,
             min_patch_blocks: self.min_patch_enabled.then_some(self.min_patch.max(1)),
-            region_size: DEFAULT_REGION_SIZE,
         })
     }
 

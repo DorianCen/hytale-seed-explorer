@@ -54,15 +54,16 @@ pub const COARSE_STEPS: [u32; 3] = [8, 16, 32];
 /// How many events one frame may drain (the task's 16 ms guard).
 pub const EVENTS_PER_FRAME: usize = 64;
 
-/// The feature-search region edge for masks that include cave entrances.
+/// The feature-search region edges for the UI (T26).
 ///
-/// The T27 worldgen adapter caps cave-entrance queries at 256 blocks per side
-/// (the Default world's entrance density makes a larger rect a batch job). A
-/// cave-only search uses 128-block regions: one region is ~3k entrances in
-/// ~0.4 s (debug), so the first results arrive quickly and the result cap
-/// stops the walk. Region size is a streaming-granularity lever, not a
-/// correctness one.
-const CAVE_SEARCH_REGION_SIZE: u32 = 128;
+/// The engines' default 512-block region is a benchmark tradeoff: a
+/// biome-prefab region can run for tens of seconds, during which a cancel
+/// cannot take effect (the engine checks between regions). Expensive kinds
+/// (biome prefabs, cave entrances) therefore use 128-block regions; the cheap
+/// kinds use 2048-block regions so a 10k search is ~100 pool round trips
+/// instead of tens of thousands (each `WorldgenSource` region is a pool job).
+const UI_SMALL_REGION_SIZE: u32 = 128;
+const UI_CHEAP_REGION_SIZE: u32 = 2_048;
 
 /// The default result cap; `0` would mean unlimited to the engines, so the
 /// UI never offers it.
@@ -99,8 +100,6 @@ pub struct SearchRequest {
     pub coarse_step: u32,
     /// Biome patch-area minimum in blocks² (ignored by feature searches).
     pub min_patch_blocks: Option<u32>,
-    /// Feature-search region edge in blocks (ignored by biome searches).
-    pub region_size: u32,
 }
 
 impl Default for SearchRequest {
@@ -118,7 +117,6 @@ impl Default for SearchRequest {
             proximity: None,
             coarse_step: map_core::search::biome::DEFAULT_COARSE_STEP,
             min_patch_blocks: None,
-            region_size: map_core::search::feature::DEFAULT_REGION_SIZE,
         }
     }
 }
@@ -581,13 +579,17 @@ impl SearchState {
         let generation = self.generation;
         let session = match (&request.target, source) {
             (SearchTarget::Features(filter), SearchSource::Features(source)) => {
-                // A cave-inclusive search uses cap-sized ring regions; the
-                // adapter drops the cave kind above its cap, which would
-                // silently erase cave hits from a 512-block region.
-                let region_size = if filter.kinds.contains(FeatureKind::CaveEntrance) {
-                    CAVE_SEARCH_REGION_SIZE
+                // Expensive kinds use small regions (a biome-prefab region
+                // can run for tens of seconds, and the engine only checks
+                // cancellation between regions); cheap kinds use large
+                // regions to keep the pool round-trip count low. Cave
+                // entrances also stay inside the T27 adapter's cap.
+                let region_size = if filter.kinds.contains(FeatureKind::CaveEntrance)
+                    || filter.kinds.contains(FeatureKind::BiomePrefab)
+                {
+                    UI_SMALL_REGION_SIZE
                 } else {
-                    request.region_size.max(1)
+                    UI_CHEAP_REGION_SIZE
                 };
                 let search = FeatureSearch {
                     kinds: filter.kinds,
@@ -1282,7 +1284,7 @@ mod tests {
         assert!(state.start(request, feature_source()));
         assert_eq!(
             driver.feature_search(0).region_size,
-            CAVE_SEARCH_REGION_SIZE,
+            UI_SMALL_REGION_SIZE,
             "cave searches stay inside the adapter's cap",
         );
 
@@ -1299,8 +1301,8 @@ mod tests {
         assert!(state.start(request, feature_source()));
         assert_eq!(
             driver.feature_search(1).region_size,
-            map_core::search::feature::DEFAULT_REGION_SIZE,
-            "non-cave searches keep the 512-block streaming region",
+            UI_CHEAP_REGION_SIZE,
+            "cheap kinds use large regions to keep pool round trips low",
         );
     }
 
