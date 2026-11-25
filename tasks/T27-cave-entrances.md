@@ -10,13 +10,15 @@ explorer adapter (`FeatureKind::CaveEntrance` → cave/zone names, catalog
 category/icon/toggle already reserved), the 256-block overlay cap and the
 visible-rect fetch rule for zoomed-in cave views, the zone-aware tooltip, and
 the fixture tests (worldgen predicate/geometry/kind-filter/negative-rect;
-map-core adapter/catalog/dedupe/cap). The 512×512 release benchmark is
-61.9 s / 52,941 entrances; the 10,000×10,000 case is documented as a
-~6.6–8 h batch job and is capped in the adapter (the task's "cap the rect"
-allowance) rather than returned to the overlay. Deviation: the query pads the
-anchor rect by the point generator's interval instead of the populator's
-`maximum_size` — the larger reach exists to find caves crossing into a chunk,
-not entry points inside a query rect; fixture chunk counts are unchanged.
+map-core adapter/catalog/dedupe/cap). The 512×512 uncapped release benchmark
+is 54.7 s / 52,941 entrances. The 10,000×10,000 case has a measured
+task-sanctioned capped form: `cave_entrances_in_capped` walks center-first
+256-block tiles and stops at 10,000 entrances in **2.27 s** release; the full
+uncapped 10k scan remains a multi-hour batch job and the overlay caps the
+cave kind at 256 blocks per side. Deviation: the query pads the anchor rect by
+the point generator's interval instead of the populator's `maximum_size` —
+the larger reach exists to find caves crossing into a chunk, not entry points
+inside a query rect; fixture chunk counts are unchanged.
 Manual overlay verification remains the user's display-side check; the
 worldgen `query`/`chunks_golden` gates, `map-core cave_entrances`, the full
 `map-app` suite and `cargo build -p map-app` are green.)

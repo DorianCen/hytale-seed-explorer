@@ -369,19 +369,22 @@ Readings:
 
 **Task:** [T27](../tasks/T27-cave-entrances.md) — the cave stage's entrance
 predicate without cave generation, measured against the real generator.
-Harness: the worldgen ignored test `query_cave_entrances_bench_512`
+Harness: the worldgen ignored tests `query_cave_entrances_bench_512` and
+`query_cave_entrances_bench_10k_capped`
 (`hytale-server-rust/crates/worldgen-hytale/tests/cave_entrances.rs`),
-release build, Default fixture, seed 0, warm on a disjoint 64×64 rect, one
-512×512 query centred on the origin. The smaller rows are from the same
-query's debug probe (`cave_entrances` integration test) and are debug
-timings, not comparable to the release row:
+release build, Default fixture, seed 0, warm on a disjoint 64×64 rect. The
+512 query is uncapped; the 10k query is the task-sanctioned capped walk
+(center-first 256-block tiles, stopped at 10,000 entrances). The smaller rows
+are from the same query's debug probe and are debug timings, not comparable
+to the release rows:
 
-| Rect side | Entrances | Time | Profile |
-|---:|---:|---:|---|
+| Rect | Entrances | Time | Profile |
+|---|---:|---:|---|
 | 32 (one chunk) | 219 | 35 ms | debug |
 | 128 | 3,311 | 0.38 s | debug |
 | 256 | 13,257 | 21.8 s | debug |
-| 512 | 52,941 | 61.9 s | release |
+| 512 (uncapped) | 52,941 | 54.7 s | release |
+| 10,000 × 10,000 (capped at 10,000) | 10,000 | 2.27 s | release |
 
 Readings:
 
@@ -392,11 +395,12 @@ Readings:
   keep the normal overlay rect. A view with a visible rect that fits the cap
   queries exactly that visible rect (no margin) so caves still load when
   zoomed in; a larger view draws no cave icons.
-- **The 10,000×10,000 query is a batch job, not a UI query**: at the
-  measured density it would return ≈20M placements and take
-  ≈61.9 s × (10,000/512)² ≈ 6.6 h (plus memory for the result vector).
-  This is the T33 tiling/streaming lever; the task's "cap the rect"
-  allowance is what the 256-block overlay cap implements.
+- **The 10,000×10,000 query has a measured usable form**: the full uncapped
+  scan would return ≈20M placements and take hours, but
+  `cave_entrances_in_capped` walks 256-block tiles from the rect center and
+  stops at 10,000, which measures **2.27 s** release. This is the task's
+  "cap the rect" allowance; the full cave view remains T33's
+  tiling/streaming work and the overlay uses the 256-block cap.
 - The query never calls `get_cave`: a 32-block query is 35 ms while a full
   chunk generation with caves is ~0.45 s (T09), and the fixture geometry
   test finds carved blocks around every checked entrance. The entrance
@@ -504,7 +508,8 @@ Only release runs on the environment above (or note the change).
 | 2026-11-24 | feature search 50,000 radius sweep, cheap tier (seed 0) | 49.2 ms first / 614.6 ms total (38,809 regions) | as above | T24 |
 | 2026-11-24 | biome search first result, 10,000 radius (common id 32 / rare id 39) | 20.8 ms / 143.2 ms | `cargo test -p map-core --release --test biome_search_fixture -- --ignored biome_search_bench --nocapture` | T25 |
 | 2026-11-24 | biome search full 10,000 scan, unlimited results (common 1,797 results / rare 1 result) | 170.2 s / 34.6 s (1,575,025 coarse samples) | as above | T25 |
-| 2026-11-25 | cave entrances, 512×512 rect (seed 0, warm) | 52,941 entrances in 61.9 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench --nocapture` (in the sibling worldgen checkout) | T27 |
+| 2026-11-25 | cave entrances, 512×512 rect uncapped (seed 0, warm) | 52,941 entrances in 54.7 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench --nocapture` (in the sibling worldgen checkout) | T27 |
+| 2026-11-25 | cave entrances, 10,000×10,000 rect capped at 10,000 (center-first 256 tiles) | 10,000 entrances in 2.27 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench_10k_capped --nocapture` | T27 |
 | 2026-11-25 | cave entrances, 32×32 chunk (debug, cold) | 219 entrances in 35 ms | `cargo test -p worldgen-hytale --test cave_entrances query_cave_entrances --nocapture` | T27 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
