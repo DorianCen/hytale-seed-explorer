@@ -21,12 +21,14 @@ use map_core::coords::ZoomLevel;
 use map_core::render::Layer;
 use map_core::render::caves::{
     CAVE_DENSITY_MODE, CaveDensityTileRenderer, CaveSliceTileRenderer, cave_density_color,
-    cave_slice_color, cave_slice_mode,
+    cave_slice_color, cave_slice_image, cave_slice_mode,
 };
 use map_core::scheduler::{TileRenderer, TileSubject, cancel_token};
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
-use map_core::source::{SummaryFidelity, WorldSource};
-use map_core::types::{BlockId, FluidId, Rect, SliceCell};
+use map_core::source::{FeatureSource, SummaryFidelity, WorldSource};
+use map_core::types::{
+    BlockId, FeatureFilter, FeatureKind, FeatureKindMask, FluidId, Rect, SliceCell,
+};
 
 use worldgen_hytale::chunk::chunk_generator::ChunkGenerator;
 use worldgen_hytale::chunk::chunk_generator_resource::ChunkGeneratorResource;
@@ -206,6 +208,76 @@ fn cave_density_matches_a_direct_chunk_count() {
     assert!(
         nonzero > 0,
         "the fixture chunk has cave volume; the density check is not vacuous"
+    );
+}
+
+/// T28's overlay/slice agreement: take a real cave entrance from the
+/// `FeatureSource` query, find the carved cell the T27 geometry test pins
+/// near its column in a directly generated chunk, then query the slice at
+/// that exact Y and prove the renderer paints the same cell as air.
+#[test]
+fn cave_render_slice_agrees_with_a_known_entrance() {
+    let Some(_world) = world_dir() else {
+        return;
+    };
+    let source = source();
+    let filter = FeatureFilter {
+        kinds: FeatureKindMask::from_kind(FeatureKind::CaveEntrance),
+        categories: None,
+        name_contains: None,
+        min_size: None,
+    };
+    let entrances = source
+        .features_in(Rect::from_dims(0, 0, 32, 32), &filter)
+        .expect("the fixture chunk's cave-entrance query runs");
+    let entrance = entrances
+        .first()
+        .expect("the fixture chunk has cave entrances (T27)");
+    let (ex, ey, ez) = entrance.position;
+    assert!(
+        (0..CHUNK_SIZE).contains(&ex) && (0..CHUNK_SIZE).contains(&ez),
+        "{entrance:?} is inside the queried chunk"
+    );
+
+    // The entrance Y is the surface height the predicate accepted. The
+    // populator carves around that column; find a carved (air, no fluid)
+    // cell in T27's documented ±2-column / ±6-Y window.
+    let generator = direct_generator();
+    let chunk = direct_chunk(&generator, 0, 0);
+    let carved = (-6..=6)
+        .flat_map(|dy| (-2..=2).flat_map(move |dx| (-2..=2).map(move |dz| (dx, dy, dz))))
+        .find(|&(dx, dy, dz)| {
+            let (lx, y, lz) = (ex + dx, ey + dy, ez + dz);
+            (0..CHUNK_SIZE).contains(&lx)
+                && (0..CHUNK_SIZE).contains(&lz)
+                && (0..CHUNK_HEIGHT).contains(&y)
+                && chunk.get_block(lx, y, lz) == 0
+                && chunk.get_fluid_id(lx, y, lz) == 0
+        })
+        .unwrap_or_else(|| {
+            panic!("no carved cell near the entrance {entrance:?}; T27 geometry drifted")
+        });
+    let (dx, dy, dz) = carved;
+    let (x, y, z) = (ex + dx, ey + dy, ez + dz);
+
+    let slice = source
+        .slice_region(Rect::new(x, z, x, z), 1, y)
+        .unwrap_or_else(|error| panic!("slice at the carved cell ({x}, {y}, {z}) failed: {error}"));
+    let cell = *slice
+        .sample(x, z)
+        .expect("the 1x1 slice covers the carved column");
+    assert_eq!(
+        cell,
+        SliceCell::Air,
+        "the entrance's carved cell is air in the slice at y={y}"
+    );
+
+    // The renderer's own color mapping agrees: that cell is transparent.
+    let image = cave_slice_image(&slice, &cancel_token()).expect("the 1x1 slice renders");
+    assert_eq!(
+        image.get_pixel(0, 0),
+        &cave_slice_color(SliceCell::Air),
+        "the slice renderer paints the carved entrance cell as transparent air"
     );
 }
 

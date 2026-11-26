@@ -17,20 +17,23 @@ and the cave choice gates exactly one cave layer. Cave passes schedule the
 tight visible range (no T16 prefetch ring), stream in chunk-row bands, and
 `tile_query` now derives its frame from the requested rect so a band query
 cannot expand back to the whole tile. Acceptance green:
-`cargo test -p map-core cave_render` (4 unit + 5 integration, 1 ignored
+`cargo test -p map-core cave_render` (4 unit + 6 integration, 1 ignored
 benchmark), `cargo test -p map-core cave_density` (4 unit + 2 integration; the
-slice/density cancellation checks included),
-`cargo test -p map-app` (125 passed), full map-core/map-cli and
-`cargo build -p map-app`; fmt/clippy 1.100 clean. Release benchmark (2
-workers, 64 chunks): slice 13.60/0.001 s cold/warm @ step 1 and 13.90/0.000 @
-step 2; density 13.83/0.001 and 14.08/0.001. Manual X11: Y=64 showed a solid/
-air slice, the density ramp rendered, and Y=30 produced a different slice.
-Deviation: the T28 note "out-of-world cells are Unknown" is recorded against
-the T09 contract instead — Y outside 0..320 is `Air`, an out-of-world rect is
-a typed `OutOfBounds`, and out-of-world tile margins are transparent; none
-panics. The entrance-overlay/slice visual comparison remains a user-side check
-(the local pointer grab prevented completing it after the slice/density
-checks).)
+slice/density cancellation checks included), the headless entrance/slice
+agreement test (1 passed), `cargo test -p map-app` (125 passed), full
+map-core/map-cli and `cargo build -p map-app`; fmt/clippy 1.100 clean.
+Release benchmark (2 workers, 64 chunks): slice 13.60/0.001 s cold/warm @
+step 1 and 13.90/0.000 @ step 2; density 13.83/0.001 and 14.08/0.001. Manual
+X11: Y=64 showed a solid/air slice, the density ramp rendered, and Y=30
+produced a different slice. The T28 entrance-overlay/slice agreement is
+proved headlessly by `cave_render_slice_agrees_with_a_known_entrance`:
+it obtains a real `FeatureSource` entrance, finds the carved cell in a
+directly generated chunk within T27's ±2-column / ±6-Y window, and asserts
+the slice query returns `Air` there and `cave_slice_image` paints it
+transparent. Deviation: the T28 note "out-of-world cells are Unknown" is
+recorded against the T09 contract instead — Y outside 0..320 is `Air`, an
+out-of-world rect is a typed `OutOfBounds`, and out-of-world tile margins are
+transparent; none panics.)
 **Milestone:** 8 — Caves
 **Depends on:** T09, T21, T27
 **Blocks:** T33
@@ -147,7 +150,8 @@ cargo run -p map-app
 
 ## Tests
 
-- `map-core/tests/cave_render.rs`: fixture chunks, slice Y values, density.
+- `map-core/tests/cave_render.rs`: fixture chunks, slice Y values, density,
+  cancellation, streaming parity, and the real entrance/slice agreement.
 - `map-app` state test: Y change updates the layer key and requests only the
   cave layer.
 
