@@ -88,6 +88,9 @@ mod fake_layers {
     use map_core::error::SourceError;
     use map_core::render::Layer;
     use map_core::render::SurfaceOptions;
+    use map_core::render::caves::{
+        CAVE_DENSITY_MODE, cave_density_color, cave_slice_color, cave_slice_mode,
+    };
     use map_core::render::fluid::fluid_color;
     use map_core::render::height::height_color;
     use map_core::render::tiles::LayeredTileRenderer;
@@ -111,7 +114,12 @@ mod fake_layers {
 
     /// A tile key for the fake's synthetic identity at `(tx, ty)`.
     fn key(layer: Layer, tx: i32, ty: i32) -> TileKey {
-        TileSubject::new(1, 7, layer, 0, ZoomLevel::MIN).key_at(tx, ty)
+        key_with_mode(layer, 0, tx, ty)
+    }
+
+    /// A tile key with an explicit layer mode (T28's cave Y/metric).
+    fn key_with_mode(layer: Layer, mode: u16, tx: i32, ty: i32) -> TileKey {
+        TileSubject::new(1, 7, layer, mode, ZoomLevel::MIN).key_at(tx, ty)
     }
 
     /// Renders one tile through the dispatcher. The fake is unbounded and
@@ -299,26 +307,69 @@ mod fake_layers {
     }
 
     #[test]
-    fn layered_render_answers_renderer_less_layers_with_unsupported() {
-        // The defensive contract: the app never schedules these (its
-        // radios map them to placeholders), and the dispatcher says so
-        // with the typed error rather than rendering wrong pixels.
+    fn cave_render_layered_slice_and_density_tiles() {
+        // T28: the dispatcher now serves both cave layers. The slice's Y
+        // comes from the key mode and its first pixel is the fake's cell at
+        // (0, 0); density uses the metric-mode key and the matching ramp
+        // color.
         let renderer = fake_renderer();
-        for layer in [Layer::CaveSlice, Layer::CaveDensity] {
-            let result = TileRenderer::render(
-                &renderer,
-                &key(layer, 0, 0),
-                &cancel_token(),
-                SummaryFidelity::Full,
-            );
-            assert_eq!(
-                result.err(),
-                Some(SourceError::Unsupported(
-                    "this layer has no renderer yet (caves: T28)"
-                )),
-                "{layer} has no renderer"
-            );
-        }
+        let fake = FakeWorldSource::new("7");
+        let slice_y = 64;
+        let expected_cell = fake
+            .slice_region(Rect::new(0, 0, 0, 0), 1, slice_y)
+            .expect("the fake serves slices")
+            .cells[0];
+        let slice = TileRenderer::render(
+            &renderer,
+            &key_with_mode(Layer::CaveSlice, cave_slice_mode(slice_y), 0, 0),
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("the fake renders a cave slice instantly");
+        assert_eq!(slice.pixel(0, 0), Some(cave_slice_color(expected_cell).0));
+
+        // A different Y is a different key and selects a different plane:
+        // find a sample the fake classifies differently at the two heights.
+        let other_y = 32;
+        let first_plane = fake
+            .slice_region(Rect::from_dims(0, 0, 32, 32), 1, slice_y)
+            .expect("the fake serves the first plane");
+        let second_plane = fake
+            .slice_region(Rect::from_dims(0, 0, 32, 32), 1, other_y)
+            .expect("the fake serves the second plane");
+        let (x, z) = (0..32)
+            .flat_map(|z| (0..32).map(move |x| (x, z)))
+            .find(|&(x, z)| first_plane.sample(x, z) != second_plane.sample(x, z))
+            .expect("the fake's two planes differ somewhere");
+        let other = TileRenderer::render(
+            &renderer,
+            &key_with_mode(Layer::CaveSlice, cave_slice_mode(other_y), 0, 0),
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("the fake renders the other slice");
+        assert_ne!(other.key, slice.key);
+        assert_ne!(
+            other.pixel(x as u32, z as u32),
+            slice.pixel(x as u32, z as u32),
+            "the Y mode selects a different horizontal plane"
+        );
+
+        let expected_fraction = fake
+            .cave_density_region(Rect::new(0, 0, 0, 0), 1)
+            .expect("the fake serves density")
+            .densities[0];
+        let density = TileRenderer::render(
+            &renderer,
+            &key_with_mode(Layer::CaveDensity, CAVE_DENSITY_MODE, 0, 0),
+            &cancel_token(),
+            SummaryFidelity::Full,
+        )
+        .expect("the fake renders cave density instantly");
+        assert_eq!(
+            density.pixel(0, 0),
+            Some(cave_density_color(expected_fraction).0)
+        );
     }
 }
 

@@ -108,7 +108,8 @@ pub struct TileSubject {
     pub generator_seed: i32,
     /// The layer to render.
     pub layer: Layer,
-    /// Layer-specific mode (e.g. a cave Y bucket); 0 when unused.
+    /// Layer-specific mode (a cave-slice Y or density metric version); 0
+    /// when unused.
     pub mode: u16,
     /// The zoom level whose step samples the tile.
     pub zoom: ZoomLevel,

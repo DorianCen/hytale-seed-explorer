@@ -56,6 +56,28 @@ pub const LAYER_HEIGHT: &str = "Height";
 pub const LAYER_RELIEF: &str = "Relief";
 pub const LAYER_FLUID: &str = "Fluid";
 pub const LAYER_CAVES: &str = "Caves";
+/// The Caves group's heading (T28).
+pub const GROUP_CAVES: &str = "Caves";
+/// The Caves group's off choice.
+pub const CAVE_OFF: &str = "Off";
+/// The Caves group's Y-slice choice.
+pub const CAVE_SLICE: &str = "Y-slice";
+/// The Caves group's density choice.
+pub const CAVE_DENSITY: &str = "Density";
+/// The slice's Y slider label.
+pub const CAVE_Y: &str = "Y";
+/// The slice legend's solid entry.
+pub const CAVE_LEGEND_SOLID: &str = "solid";
+/// The slice legend's air entry (transparent).
+pub const CAVE_LEGEND_AIR: &str = "air";
+/// The slice legend's fluid entry.
+pub const CAVE_LEGEND_FLUID: &str = "fluid";
+/// The density legend's low end.
+pub const CAVE_DENSITY_LOW: &str = "low";
+/// The density legend's high end.
+pub const CAVE_DENSITY_HIGH: &str = "high";
+/// The density metric's one-line explanation.
+pub const CAVE_DENSITY_HINT: &str = "air below the surface / surface height";
 /// The zone debug layer's checkbox (T19).
 pub const LAYER_ZONE: &str = "Zones";
 /// The word before a layer's opacity slider.
@@ -176,9 +198,6 @@ pub const MAP_PLACEHOLDER_NO_SOURCE: &str = "load a seed to explore";
 
 /// Shown while a background load runs.
 pub const MAP_PLACEHOLDER_LOADING: &str = "loading world…";
-
-/// Shown when a Caves layer is selected (its renderer is T28's).
-pub const MAP_PLACEHOLDER_CAVES: &str = "cave layers arrive with T28";
 
 /// Shown when a rendered layer has nothing to serve: the view left the
 /// generatable world.

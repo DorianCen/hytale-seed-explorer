@@ -407,6 +407,52 @@ Readings:
   predicate is the shared `CavePopulator` filter, so the recorded positions
   are the generator's own placements, not a reimplementation.
 
+## Cave slices and density (T28)
+
+**Task:** [T28](../tasks/T28-cave-slices-density.md) — the Y-slice and
+cave-density tile renderers measured against the real generator. Harness:
+the ignored test `cave_render_bench_slice_and_density_tiles`
+(`map-core/tests/cave_render.rs`), release build, Default fixture, seed
+12345, **2 workers**, a 256-block square at the origin. Step 1 is the full
+256×256-sample tile; step 2 uses the same 256 blocks at 128 samples per axis
+so both rows generate the same 64 chunks and the number is the tile path, not
+a different region. Cold means a fresh source (empty slice and summary
+caches); warm repeats the identical request.
+
+```sh
+cargo test -p map-core --release --test cave_render \
+  -- --ignored cave_render_bench --nocapture
+```
+
+| Layer | Step | Samples | Cold (s) | Warm (s) | Chunks |
+|---|---:|---:|---:|---:|---:|
+| Y-slice (Y=64) | 1 | 65,536 | **13.60** | 0.001 | 64 |
+| Y-slice (Y=64) | 2 | 16,384 | **13.90** | 0.000 | 64 |
+| Density | 1 | 65,536 | **13.83** | 0.001 | 64 |
+| Density | 2 | 16,384 | **14.08** | 0.001 | 64 |
+
+Readings:
+
+- **The cold cost is chunk generation, not cave rendering.** Slice and
+  density both land at ~13.6–14.1 s for the same 64 chunks (64 generations
+  across 2 workers), matching T09/T21's chunk-bound scale. The image mapping
+  and ramp are microseconds over 65k samples.
+- **Warm tiles are effectively free** (≤1 ms): the slice cache holds the
+  `(chunk, y)` planes and density rides the full-fidelity summary cache.
+  Changing Y requests only the new slice keys; every other layer's tiles
+  and the summaries stay cached.
+- **Step does not reduce chunk work.** Step 2 covers the same 256 blocks
+  with a quarter of the samples, so chunk count — and cold time — is
+  identical. Only the pixel assembly shrinks.
+- **Density never uses a surface-only summary.** The metric needs the
+  cave stage; the source forces `SummaryFidelity::Full` and a surface-only
+  cache entry can never satisfy it.
+- **The cave passes are tight and streamed.** They schedule the viewport's
+  own tiles (no T16 prefetch ring, which on a coarse step multiplied the
+  chunk work), and both renderers publish one chunk row at a time. On the
+  manual X11 run the first slice rows appeared as their chunks landed; the
+  final streamed tile is pixel-identical to the one-shot benchmark shape.
+
 ## What this means for the explorer
 
 1. **Worker count: start 2, cap at 8-12.** Measured parallel scaling on the
@@ -511,6 +557,10 @@ Only release runs on the environment above (or note the change).
 | 2026-11-25 | cave entrances, 512×512 rect uncapped (seed 0, warm) | 52,941 entrances in 54.7 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench --nocapture` (in the sibling worldgen checkout) | T27 |
 | 2026-11-25 | cave entrances, 10,000×10,000 rect capped at 10,000 (center-first 256 tiles) | 10,000 entrances in 2.27 s | `cargo test --release -p worldgen-hytale --test cave_entrances -- --ignored query_cave_entrances_bench_10k_capped --nocapture` | T27 |
 | 2026-11-25 | cave entrances, 32×32 chunk (debug, cold) | 219 entrances in 35 ms | `cargo test -p worldgen-hytale --test cave_entrances query_cave_entrances --nocapture` | T27 |
+| 2026-11-26 | cave Y-slice tile, 256-block square @ step 1 (64 chunks cold / warm), 2 workers | 13.60 s / 0.001 s | `cargo test -p map-core --release --test cave_render -- --ignored cave_render_bench --nocapture` | T28 |
+| 2026-11-26 | cave Y-slice tile, same 256 blocks @ step 2 (64 chunks cold / warm), 2 workers | 13.90 s / 0.000 s | as above | T28 |
+| 2026-11-26 | cave density tile, 256-block square @ step 1 (64 chunks cold / warm), 2 workers | 13.83 s / 0.001 s | as above | T28 |
+| 2026-11-26 | cave density tile, same 256 blocks @ step 2 (64 chunks cold / warm), 2 workers | 14.08 s / 0.001 s | as above | T28 |
 
 T11 golden hashes (`map-core/tests/render_golden.rs`, seed 0, 64×64 @ step 2,
 PNG bytes):

@@ -309,9 +309,9 @@ fn a_large_height_region_can_be_cancelled() {
     );
 }
 
-/// Smoke-checks the chunk-dependent queries after T09 landed them (the deep
-/// fidelity tests live in `tests/surface_slice.rs` and the cache behavior in
-/// `tests/chunk_cache.rs`).
+/// Smoke-checks the chunk-dependent queries after T09/T28 landed them (the
+/// deep fidelity tests live in `tests/surface_slice.rs`, the cave parity in
+/// `tests/cave_render.rs`, and the cache behavior in `tests/chunk_cache.rs`).
 #[test]
 fn surface_and_slice_queries_are_implemented_by_t09() {
     let Some(_world) = world_dir() else {
@@ -334,6 +334,18 @@ fn surface_and_slice_queries_are_implemented_by_t09() {
         .slice_region(rect, 1, 64)
         .expect("T09 serves slice_region");
     assert_eq!(slice.y, 64);
+    let density = source
+        .cave_density_region(rect, 1)
+        .expect("T28 serves cave_density_region");
+    assert_eq!((density.width, density.height), (4, 4));
+    assert!(
+        density
+            .densities
+            .iter()
+            .all(|value| (0.0..=1.0).contains(value)),
+        "every density sample is a fraction: {:?}",
+        density.densities
+    );
 }
 
 /// Proves the T08 acceptance bullet: spawn points and zone lookups are served

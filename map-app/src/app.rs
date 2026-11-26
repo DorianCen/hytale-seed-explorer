@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, Context, Id, Key, KeyboardShortcut, Modifiers, RichText, TextStyle, Vec2};
 
+use map_core::render::caves::{
+    CAVE_AIR_COLOR, CAVE_FLUID_COLOR, CAVE_SOLID_COLOR, cave_density_color,
+};
+use map_core::render::{CAVE_SLICE_Y_MAX, CAVE_SLICE_Y_MIN};
 use map_core::source::FeatureSource;
 use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, default_world_path};
@@ -32,7 +36,7 @@ use crate::map_view::MapView;
 use crate::overlays::features::{FeatureFetch, FeatureReplyOutcome};
 use crate::search_panel::SearchPanel;
 use crate::state::{
-    self, AppState, LoadRequest, LoadResult, RESOLUTION_STEPS, RenderMode, layer_label,
+    self, AppState, CaveView, LoadRequest, LoadResult, RESOLUTION_STEPS, RenderMode, layer_label,
     offers_layer, render_mode_label,
 };
 
@@ -615,12 +619,32 @@ impl SeedExplorerApp {
         // The mode is a hard filter: the checkboxes below keep their
         // settings but cannot change the map until Surface returns.
         let biomes_only = self.state.render_mode() == RenderMode::BiomesOnly;
+        // T28's group edits are buffered for the same reason as the layer
+        // checkboxes: the panel closure reads state while the controls run.
+        let cave_view = self.state.cave_view();
+        let cave_y = self.state.cave_y();
+        let mut cave_view_edited: Option<CaveView> = None;
+        let mut cave_y_edited: Option<i32> = None;
         let mut copied = false;
 
         // The layer stack's edits, buffered while the panel closure
         // borrows the stack read-only and applied after it returns.
         let mut toggled: Option<(map_core::render::Layer, bool)> = None;
         let mut opacity_edited: Option<(map_core::render::Layer, f32)> = None;
+
+        // A 12 pt swatch with a subtle outline; transparent air needs the
+        // outline so the legend shows the slot rather than a hole.
+        let cave_swatch = |ui: &mut egui::Ui, [r, g, b, a]: [u8; 4]| {
+            let (swatch, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(swatch, 2.0, Color32::from_rgba_unmultiplied(r, g, b, a));
+            ui.painter().rect_stroke(
+                swatch,
+                2.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        };
 
         egui::SidePanel::left(Id::new("left-panel"))
             .default_width(190.0)
@@ -668,7 +692,61 @@ impl SeedExplorerApp {
                                 .replace("{n}×{n}", &format!("{effective}×{effective}"));
                             ui.label(RichText::new(hint).weak());
                         }
-                        ui.label(RichText::new(labels::MAP_PLACEHOLDER_CAVES).weak());
+                        // T28's Caves group: one mutually exclusive choice
+                        // (off / Y-slice / density) instead of two independent
+                        // checkboxes, plus the slice's Y and the active
+                        // legend. The edits are buffered for the state write
+                        // after the closure.
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(labels::GROUP_CAVES).strong());
+                        let mut selected = cave_view;
+                        ui.horizontal(|ui| {
+                            for (view, label) in [
+                                (CaveView::Off, labels::CAVE_OFF),
+                                (CaveView::Slice, labels::CAVE_SLICE),
+                                (CaveView::Density, labels::CAVE_DENSITY),
+                            ] {
+                                if ui.selectable_value(&mut selected, view, label).clicked() {
+                                    cave_view_edited = Some(view);
+                                }
+                            }
+                        });
+                        match selected {
+                            CaveView::Off => {}
+                            CaveView::Slice => {
+                                let mut y = cave_y;
+                                ui.horizontal(|ui| {
+                                    ui.label(labels::CAVE_Y);
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut y,
+                                            CAVE_SLICE_Y_MIN..=CAVE_SLICE_Y_MAX,
+                                        )
+                                        .integer(),
+                                    );
+                                });
+                                if y != cave_y {
+                                    cave_y_edited = Some(y);
+                                }
+                                ui.horizontal(|ui| {
+                                    cave_swatch(ui, CAVE_SOLID_COLOR);
+                                    ui.label(labels::CAVE_LEGEND_SOLID);
+                                    cave_swatch(ui, CAVE_AIR_COLOR);
+                                    ui.label(labels::CAVE_LEGEND_AIR);
+                                    cave_swatch(ui, CAVE_FLUID_COLOR);
+                                    ui.label(labels::CAVE_LEGEND_FLUID);
+                                });
+                            }
+                            CaveView::Density => {
+                                ui.horizontal(|ui| {
+                                    cave_swatch(ui, cave_density_color(0.0).0);
+                                    ui.label(labels::CAVE_DENSITY_LOW);
+                                    cave_swatch(ui, cave_density_color(1.0).0);
+                                    ui.label(labels::CAVE_DENSITY_HIGH);
+                                });
+                                ui.label(RichText::new(labels::CAVE_DENSITY_HINT).weak());
+                            }
+                        }
                         // The plan's climate debug layers: only if the
                         // generator exposes a per-column query — it does not,
                         // and the refusal is explicit rather than approximated.
@@ -867,6 +945,12 @@ impl SeedExplorerApp {
         if let Some((layer, opacity)) = opacity_edited {
             self.state.layers_mut().set_opacity(layer, opacity);
         }
+        if let Some(view) = cave_view_edited {
+            self.state.set_cave_view(view);
+        }
+        if let Some(y) = cave_y_edited {
+            self.state.set_cave_y(y);
+        }
         // The copy button only sets a flag inside the panel: the
         // clipboard write and the status feedback happen here, where
         // the state is mutable again.
@@ -1030,6 +1114,8 @@ mod tests {
             app.state.schedulable_layers(),
             vec![(map_core::render::Layer::Biome, 1.0)]
         );
+        assert_eq!(app.state.cave_view(), CaveView::Off, "caves default off");
+        assert_eq!(app.state.cave_y(), state::DEFAULT_CAVE_Y);
         assert_eq!(app.map.pending_tiles(), 0, "no tiles pending");
         // The interactive view starts at the plan's initial view: the
         // origin at one point per block.

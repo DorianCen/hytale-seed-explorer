@@ -1,10 +1,10 @@
 //! The production `WorldSource` adapter over the external worldgen
 //! workspace (T08).
 //!
-//! Cheap queries only: biome, height, zone and spawn-point data served from
-//! a pool of generator worker threads (see [`pool`]). Chunk-dependent
-//! queries — surface blocks, fluid depths, slices — return
-//! [`SourceError::Unsupported`] until T09 adds chunk summaries.
+//! Cheap queries (biome, height, zone, spawn points) and chunk-dependent
+//! queries (surface blocks, fluid depths, horizontal slices, cave density)
+//! are served from a pool of generator worker threads (see [`pool`]); the
+//! chunk-dependent paths ride T09's compact summaries and slice cache.
 //!
 //! Feature placement ([`crate::source::FeatureSource`], T22/T23) also runs
 //! here: a rect query is sent to a worker, the worker calls the generator's
@@ -44,9 +44,9 @@ use crate::source::chunks::{
 };
 use crate::source::{FeatureSource, SummaryFidelity, WorldSource};
 use crate::types::{
-    BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureKindMask,
-    FeatureMetadata, FluidId, GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid,
-    SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
+    BiomeGrid, BiomeId, BlockId, CaveDensityGrid, Feature, FeatureFilter, FeatureKind,
+    FeatureKindMask, FeatureMetadata, FluidId, GeneratorIdentity, HeightGrid, Rect, Rect3, Seed,
+    SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
 pub(crate) use pool::LoadSpec;
@@ -428,6 +428,91 @@ impl WorldgenSource {
             rect.min_x, rect.min_z, step, width, height, samples,
         ))
     }
+
+    /// The shared body of [`WorldSource::slice_region`] and its cancellable
+    /// variant: one `(chunk, y)` slice per covered chunk, nearest first, with
+    /// both the source's shared token and the caller's per-tile token checked
+    /// between chunk generations.
+    fn slice_region_inner(
+        &self,
+        rect: Rect,
+        step: u32,
+        y: i32,
+        external: Option<&CancelToken>,
+    ) -> SourceResult<SliceGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let cancel = self.fresh_cancel();
+        let ordered = self.ordered_covering_chunks(rect)?;
+
+        let mut slices: HashMap<(i32, i32), ChunkSlice> = HashMap::new();
+        for (cx, cz) in ordered {
+            let cancelled = cancel.load(Ordering::Relaxed)
+                || external.is_some_and(|token| token.load(Ordering::Relaxed));
+            if cancelled {
+                return Err(SourceError::Cancelled);
+            }
+            let slice = self.slice_for(cx, cz, y)?;
+            slices.insert((cx, cz), slice);
+        }
+
+        let mut cells = Vec::with_capacity((width * height) as usize);
+        for z in 0..height {
+            let world_z = rect.min_z + z as i32 * step as i32;
+            for x in 0..width {
+                let world_x = rect.min_x + x as i32 * step as i32;
+                let slice = &slices[&(chunk_of(world_x), chunk_of(world_z))];
+                // A sample between slice pixels takes the pixel at the
+                // sample origin (nearest, never interpolated).
+                let index = column_index(local_of(world_x), local_of(world_z));
+                cells.push(slice[index]);
+            }
+        }
+        Ok(SliceGrid::new(
+            rect.min_x, rect.min_z, step, width, height, y, cells,
+        ))
+    }
+
+    /// The shared body of [`WorldSource::cave_density_region`] and its
+    /// cancellable variant. Density is derived from the full-fidelity
+    /// summaries: it needs the real cave stage, so there is no surface-only
+    /// path and no second cache — the summary cache is the cache.
+    fn cave_density_region_inner(
+        &self,
+        rect: Rect,
+        step: u32,
+        external: Option<&CancelToken>,
+    ) -> SourceResult<CaveDensityGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let cancel = self.fresh_cancel();
+        let ordered = self.ordered_covering_chunks(rect)?;
+
+        let mut summaries: HashMap<(i32, i32), Arc<ChunkSummary>> = HashMap::new();
+        for (cx, cz) in ordered {
+            let cancelled = cancel.load(Ordering::Relaxed)
+                || external.is_some_and(|token| token.load(Ordering::Relaxed));
+            if cancelled {
+                return Err(SourceError::Cancelled);
+            }
+            let summary = self.summary_for(cx, cz, SummaryFidelity::Full)?;
+            summaries.insert((cx, cz), summary);
+        }
+
+        let mut densities = Vec::with_capacity((width * height) as usize);
+        for z in 0..height {
+            let world_z = rect.min_z + z as i32 * step as i32;
+            for x in 0..width {
+                let world_x = rect.min_x + x as i32 * step as i32;
+                let summary = &summaries[&(chunk_of(world_x), chunk_of(world_z))];
+                let column = summary
+                    .column(local_of(world_x), local_of(world_z))
+                    .expect("local coordinates are in range by construction");
+                densities.push(chunks::cave_fraction(&column));
+            }
+        }
+        Ok(CaveDensityGrid::new(
+            rect.min_x, rect.min_z, step, width, height, densities,
+        ))
+    }
 }
 
 impl WorldSource for WorldgenSource {
@@ -503,36 +588,30 @@ impl WorldSource for WorldgenSource {
     }
 
     fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid> {
-        let (width, height) = rect.sample_dims(step);
-        let cancel = self.fresh_cancel();
-        let ordered = self.ordered_covering_chunks(rect)?;
+        self.slice_region_inner(rect, step, y, None)
+    }
 
-        // One (chunk, y) slice per needed chunk, nearest first; each miss
-        // is a chunk generation, so cancellation is checked between chunks.
-        let mut slices: HashMap<(i32, i32), ChunkSlice> = HashMap::new();
-        for (cx, cz) in ordered {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(SourceError::Cancelled);
-            }
-            let slice = self.slice_for(cx, cz, y)?;
-            slices.insert((cx, cz), slice);
-        }
+    fn slice_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        y: i32,
+        cancel: &CancelToken,
+    ) -> SourceResult<SliceGrid> {
+        self.slice_region_inner(rect, step, y, Some(cancel))
+    }
 
-        let mut cells = Vec::with_capacity((width * height) as usize);
-        for z in 0..height {
-            let world_z = rect.min_z + z as i32 * step as i32;
-            for x in 0..width {
-                let world_x = rect.min_x + x as i32 * step as i32;
-                let slice = &slices[&(chunk_of(world_x), chunk_of(world_z))];
-                // A sample between slice pixels takes the pixel at the
-                // sample origin (nearest, never interpolated).
-                let index = column_index(local_of(world_x), local_of(world_z));
-                cells.push(slice[index]);
-            }
-        }
-        Ok(SliceGrid::new(
-            rect.min_x, rect.min_z, step, width, height, y, cells,
-        ))
+    fn cave_density_region(&self, rect: Rect, step: u32) -> SourceResult<CaveDensityGrid> {
+        self.cave_density_region_inner(rect, step, None)
+    }
+
+    fn cave_density_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        cancel: &CancelToken,
+    ) -> SourceResult<CaveDensityGrid> {
+        self.cave_density_region_inner(rect, step, Some(cancel))
     }
 
     fn spawn_points(&self) -> SourceResult<Vec<SpawnPoint>> {

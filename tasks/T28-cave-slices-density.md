@@ -1,6 +1,36 @@
 # T28 — Cave Y-slice layer and density heat map
 
-**Status:** proposed
+**Status:** done (deliverable: `map-core/src/render/caves.rs` —
+`CaveSliceTileRenderer` (the key mode is the world Y; solid/air/fluid colors;
+one chunk-row band at a time with `complete: false` snapshots, final pixels
+bit-identical to the one-shot renderer) and `CaveDensityTileRenderer` (the key
+mode is the metric version 1; dark → red → orange ramp). Supporting data:
+`CaveDensityGrid` and `cave_fraction` (air cells strictly below the top block
+/ that block's Y, fluids excluded, clamped to 0..=1),
+`WorldSource::cave_density_region(_cancelled)` and
+`slice_region_cancelled` (defaults keep every source compatible; the worldgen
+adapter checks both tokens between chunk generations and density always uses
+full-fidelity summaries), the fake source's synthetic slice/density, and tile
+mode dispatch in `LayeredTileRenderer`. The app adds the Caves group
+(Off / Y-slice / Density, Y slider 0..319 default 64, slice/density legends)
+and the cave choice gates exactly one cave layer. Cave passes schedule the
+tight visible range (no T16 prefetch ring), stream in chunk-row bands, and
+`tile_query` now derives its frame from the requested rect so a band query
+cannot expand back to the whole tile. Acceptance green:
+`cargo test -p map-core cave_render` (4 unit + 5 integration, 1 ignored
+benchmark), `cargo test -p map-core cave_density` (4 unit + 2 integration; the
+slice/density cancellation checks included),
+`cargo test -p map-app` (125 passed), full map-core/map-cli and
+`cargo build -p map-app`; fmt/clippy 1.100 clean. Release benchmark (2
+workers, 64 chunks): slice 13.60/0.001 s cold/warm @ step 1 and 13.90/0.000 @
+step 2; density 13.83/0.001 and 14.08/0.001. Manual X11: Y=64 showed a solid/
+air slice, the density ramp rendered, and Y=30 produced a different slice.
+Deviation: the T28 note "out-of-world cells are Unknown" is recorded against
+the T09 contract instead — Y outside 0..320 is `Air`, an out-of-world rect is
+a typed `OutOfBounds`, and out-of-world tile margins are transparent; none
+panics. The entrance-overlay/slice visual comparison remains a user-side check
+(the local pointer grab prevented completing it after the slice/density
+checks).)
 **Milestone:** 8 — Caves
 **Depends on:** T09, T21, T27
 **Blocks:** T33

@@ -86,8 +86,9 @@ pub struct TileKey {
     pub generator_seed: i32,
     /// The rendered layer (see [`Layer`]).
     pub layer: Layer,
-    /// Layer-specific mode (e.g. a cave Y bucket for
-    /// [`Layer::CaveSlice`]); `0` when the layer has no modes.
+    /// Layer-specific mode: the world Y for [`Layer::CaveSlice`], the
+    /// metric version for [`Layer::CaveDensity`]; `0` when the layer has no
+    /// modes.
     pub mode: u16,
     /// The zoom level whose [`step`](ZoomLevel::step) is the sampling
     /// step the pixels were generated at. Callers fold the user's

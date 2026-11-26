@@ -10,12 +10,13 @@
 //! real generator output.
 
 use crate::catalog::{BiomeCatalog, BiomeInfo, BlockCatalog, FluidCatalog, ZoneCatalog, ZoneInfo};
-use crate::error::{SourceError, SourceResult};
+use crate::error::SourceResult;
+use crate::source::chunks::CHUNK_HEIGHT;
 use crate::source::{FeatureSource, SummaryFidelity, WorldSource};
 use crate::types::{
-    BiomeGrid, BiomeId, BlockId, Feature, FeatureFilter, FeatureKind, FeatureMetadata, FluidId,
-    GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceGrid, SpawnPoint, SurfaceGrid,
-    SurfaceSample, ZoneGrid, ZoneId,
+    BiomeGrid, BiomeId, BlockId, CaveDensityGrid, Feature, FeatureFilter, FeatureKind,
+    FeatureMetadata, FluidId, GeneratorIdentity, HeightGrid, Rect, Rect3, Seed, SliceCell,
+    SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
 /// A cheap, deterministic [`WorldSource`] for renderers, tiles and the UI.
@@ -29,6 +30,8 @@ use crate::types::{
 ///   every 64 blocks in both axes.
 /// - **Lakes** appear wherever the fake height is below 66 (the two lowest
 ///   gradient steps), so the fluid layer and inspector have something to show.
+/// - **Caves** are a deterministic sparse void band below Y=8, so the T28
+///   slice/density layers have non-uniform data without the asset pack.
 #[derive(Debug, Clone)]
 pub struct FakeWorldSource {
     seed: Seed,
@@ -174,6 +177,39 @@ impl FakeWorldSource {
         SurfaceGrid::new(rect.min_x, rect.min_z, step, width, height, values)
     }
 
+    /// A deterministic cave-ish void: one of every ~11 cells in the band
+    /// between the bedrock floor and the surface. The exact pattern is not
+    /// meant to resemble Hytale caves; it gives the cave layers something
+    /// non-uniform to draw and test.
+    fn cave_for(x: i32, z: i32, y: i32) -> bool {
+        y >= 8 && (x * 31 + z * 17 + y * 13).rem_euclid(97) < 9
+    }
+
+    /// The fake slice cell at one world position.
+    fn slice_for(x: i32, z: i32, y: i32) -> SliceCell {
+        if !(0..CHUNK_HEIGHT).contains(&y) || y > Self::height_for(x, z) {
+            return SliceCell::Air;
+        }
+        if y < 8 {
+            return SliceCell::Solid(BlockId(1));
+        }
+        if Self::cave_for(x, z, y) {
+            return SliceCell::Air;
+        }
+        SliceCell::Solid(BlockId(Self::biome_for(x, z).0 + 1))
+    }
+
+    /// The fake density fraction, consistent with [`Self::slice_for`]:
+    /// counted air cells over the cells below the top block.
+    fn cave_density_for(x: i32, z: i32) -> f32 {
+        let height = Self::height_for(x, z);
+        if height <= 0 {
+            return 0.0;
+        }
+        let caves = (0..height).filter(|&y| Self::cave_for(x, z, y)).count() as f32;
+        caves / height as f32
+    }
+
     /// The fake zone formula: one zone covers the whole world, matching
     /// [`WorldSource::zone_at`].
     fn zone_for(_x: i32, _z: i32) -> Option<ZoneId> {
@@ -248,9 +284,36 @@ impl WorldSource for FakeWorldSource {
         Ok(self.surface_grid(rect, step))
     }
 
-    fn slice_region(&self, _rect: Rect, _step: u32, _y: i32) -> SourceResult<SliceGrid> {
-        Err(SourceError::Unsupported(
-            "slices are not implemented by the fake source",
+    fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let mut cells = Vec::with_capacity(width as usize * height as usize);
+        for z in 0..height {
+            for x in 0..width {
+                cells.push(Self::slice_for(
+                    Self::sample_coord(rect.min_x, x, step),
+                    Self::sample_coord(rect.min_z, z, step),
+                    y,
+                ));
+            }
+        }
+        Ok(SliceGrid::new(
+            rect.min_x, rect.min_z, step, width, height, y, cells,
+        ))
+    }
+
+    fn cave_density_region(&self, rect: Rect, step: u32) -> SourceResult<CaveDensityGrid> {
+        let (width, height) = rect.sample_dims(step);
+        let mut densities = Vec::with_capacity(width as usize * height as usize);
+        for z in 0..height {
+            for x in 0..width {
+                densities.push(Self::cave_density_for(
+                    Self::sample_coord(rect.min_x, x, step),
+                    Self::sample_coord(rect.min_z, z, step),
+                ));
+            }
+        }
+        Ok(CaveDensityGrid::new(
+            rect.min_x, rect.min_z, step, width, height, densities,
         ))
     }
 

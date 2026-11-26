@@ -363,15 +363,19 @@ pub fn tiles_in(rect: &Rect, step: u32) -> TileRect {
     }
 }
 
-/// The tiles the viewport needs at `step`: the range covering all four
-/// corners, expanded by one tile on every side (so the scheduler (T15) has
-/// a little slack while panning).
+/// The tiles the viewport covers at `step`, without the prefetch ring.
+///
+/// The tight range is every tile whose world rect intersects the viewport.
+/// Expensive layers (T28's cave slices/density) schedule this range: a
+/// one-tile prefetch ring on a coarse step can multiply the chunk work many
+/// times over, while the placeholder scans already make a blank edge
+/// transient.
 ///
 /// Returns [`None`] when a corner falls outside the `i32` block space — the
 /// caller (T16) clamps the viewport or zoom instead of rendering a range
 /// that cannot exist.
 #[must_use]
-pub fn visible_tiles(view: &Viewport, step: u32) -> Option<TileRect> {
+pub fn visible_tiles_tight(view: &Viewport, step: u32) -> Option<TileRect> {
     // scale > 0 makes both axes monotonic, so the top-left corner carries
     // the minima and the bottom-right corner the maxima.
     let min = view.screen_to_world(ScreenPos::new(0.0, 0.0));
@@ -382,7 +386,15 @@ pub fn visible_tiles(view: &Viewport, step: u32) -> Option<TileRect> {
         floor_to_i32(max.x)?,
         floor_to_i32(max.z)?,
     );
-    Some(tiles_in(&rect, step).expand(1))
+    Some(tiles_in(&rect, step))
+}
+
+/// The tiles the viewport needs at `step`: the tight range expanded by one
+/// tile on every side (so the scheduler (T15) has a little slack while
+/// panning).
+#[must_use]
+pub fn visible_tiles(view: &Viewport, step: u32) -> Option<TileRect> {
+    visible_tiles_tight(view, step).map(|visible| visible.expand(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +969,14 @@ mod tests {
         assert_eq!(visible.min, TileCoord::new(-1, -1));
         assert_eq!(visible.max, TileCoord::new(1, 1));
         assert_eq!(visible.iter().count(), 9);
+
+        // The tight range is just the tile the view sits in; T28's cave
+        // layers use it so a coarse tile cannot drag in a 3x3 prefetch
+        // neighborhood of chunk generations.
+        let tight = visible_tiles_tight(&view, 1).expect("small view");
+        assert_eq!(tight.min, TileCoord::new(0, 0));
+        assert_eq!(tight.max, TileCoord::new(0, 0));
+        assert_eq!(tight.iter().count(), 1);
     }
 
     #[test]

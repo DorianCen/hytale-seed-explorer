@@ -216,6 +216,26 @@ pub fn extract_summary(chunk: &GeneratedChunk, cx: i32, cz: i32) -> ChunkSummary
     summary
 }
 
+/// The T28 cave-density fraction of one column: [`SummaryColumn::cave_cells`]
+/// divided by the column's topmost non-air block Y, the number of cells
+/// strictly below that block. An empty or surface-at-Y-0 column has no
+/// below-surface volume and reports `0.0`; the result is clamped to
+/// `0.0..=1.0`.
+///
+/// The numerator counts air only — fluid cells below the surface are not
+/// caves — and it includes every air pocket below the top block (caves,
+/// overhangs and prefab voids). It is a cave-volume proxy, not a cave-type
+/// classifier; this definition is the metric version in
+/// [`CAVE_DENSITY_MODE`](crate::render::caves::CAVE_DENSITY_MODE).
+#[must_use]
+pub fn cave_fraction(column: &SummaryColumn) -> f32 {
+    let height = i32::from(column.height);
+    if height <= 0 {
+        return 0.0;
+    }
+    (f32::from(column.cave_cells) / height as f32).clamp(0.0, 1.0)
+}
+
 /// Extracts the horizontal slice at world `y` (pure; `y` outside
 /// `0..CHUNK_HEIGHT` yields `Air` everywhere, matching the chunk's
 /// out-of-height behavior).
@@ -297,9 +317,29 @@ mod tests {
         assert_eq!(summary.cave_cells[index], 62);
         let column = summary.column(lx, lz).expect("in-chunk");
         assert_eq!(column.height, 64);
+        assert_eq!(
+            cave_fraction(&column),
+            62.0 / 64.0,
+            "the density denominator is the top block's Y (cells below it)"
+        );
         // Out-of-chunk access is typed None, never a panic.
         assert!(summary.column(32, 0).is_none());
         assert!(summary.column(-1, 0).is_none());
+
+        // An empty column has no below-surface volume; a surface at Y=0
+        // has none either, so both report zero rather than dividing by it.
+        let empty = SummaryColumn {
+            height: -1,
+            block: BlockId(0),
+            fluid: FluidId(0),
+            fluid_depth: 0,
+            tint: 0,
+            environment: 0,
+            cave_cells: 0,
+        };
+        assert_eq!(cave_fraction(&empty), 0.0);
+        let surface_at_zero = SummaryColumn { height: 0, ..empty };
+        assert_eq!(cave_fraction(&surface_at_zero), 0.0);
     }
 
     #[test]

@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use map_core::error::SourceResult;
 use map_core::layers::LayerStack;
-use map_core::render::Layer;
+use map_core::render::{
+    CAVE_DENSITY_MODE, CAVE_SLICE_Y_MAX, CAVE_SLICE_Y_MIN, Layer, cave_slice_mode,
+};
 use map_core::source::WorldSource;
 use map_core::source::worldgen::{WorldgenSource, WorldgenSourceConfig};
 use map_core::types::{Rect, Seed, SeedError};
@@ -67,6 +69,26 @@ impl RenderMode {
     pub const ALL: [RenderMode; 2] = [RenderMode::Surface, RenderMode::BiomesOnly];
 }
 
+/// The Caves group's mutually exclusive view (T28): no cave layer, the
+/// horizontal Y-slice, or the volume-density heat map. The choice is session
+/// state; the enabled `CaveSlice`/`CaveDensity` layer bits mirror it so the
+/// existing layer stack remains the persisted source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaveView {
+    /// No cave layer is drawn.
+    #[default]
+    Off,
+    /// One horizontal slice at [`AppState::cave_y`].
+    Slice,
+    /// The per-column cave-volume fraction.
+    Density,
+}
+
+/// The default cave Y: sea level, a useful first slice through the shallow
+/// cave band. The slider then remembers the user's last choice for the
+/// session (T31 persists it later).
+pub const DEFAULT_CAVE_Y: i32 = 64;
+
 /// The combo-box label of a render mode (the vocabulary lives in
 /// [`labels`] so the selector and the panels never drift).
 #[must_use]
@@ -77,16 +99,26 @@ pub fn render_mode_label(mode: RenderMode) -> &'static str {
     }
 }
 
-/// Whether the panel offers `layer` a checkbox (T19): true for every
-/// layer with a renderer today. The later layers stay [`LayerStack`]
-/// entries — their settings persist for their arrival — but no checkbox
-/// schedules an unsupported query.
+/// Whether the generic Layers list offers `layer` a checkbox (T19/T28).
+///
+/// The two cave layers are excluded here because they share one dedicated
+/// Caves group (Off / Slice / Density) instead of appearing as two
+/// independent checkboxes; [`has_renderer`] is the scheduling gate, which
+/// now includes them.
 #[must_use]
 pub fn offers_layer(layer: Layer) -> bool {
     matches!(
         layer,
         Layer::Biome | Layer::Height | Layer::Relief | Layer::Fluid | Layer::Surface | Layer::Zone
     )
+}
+
+/// Whether `layer` has a renderer and may therefore reach the scheduler.
+/// Every planned layer does as of T28; the cave choice is the extra gate in
+/// [`AppState::schedulable_layers`].
+#[must_use]
+pub fn has_renderer(_layer: Layer) -> bool {
+    true
 }
 
 /// The panel label of a layer (checkboxes, the status summary and the
@@ -235,6 +267,16 @@ pub struct AppState {
     /// the user's choice.
     render_mode: RenderMode,
 
+    /// The Caves group's choice (T28): off, Y-slice or density. Session
+    /// state; the `LayerStack` enable bits are kept in sync by
+    /// [`AppState::set_cave_view`].
+    cave_view: CaveView,
+
+    /// The slice's world Y (0..=319), defaulting to
+    /// [`DEFAULT_CAVE_Y`]. Changing it changes only the cave-slice tile
+    /// key's mode.
+    cave_y: i32,
+
     /// The interactive view (T16's pan/zoom state): the world position
     /// at the map center, the continuous wheel zoom, the viewport size.
     /// The map widget drives it; everything else reads it.
@@ -294,6 +336,8 @@ impl Default for AppState {
             workers: None,
             resolution_step: 2,
             render_mode: RenderMode::default(),
+            cave_view: CaveView::default(),
+            cave_y: DEFAULT_CAVE_Y,
             view: MapViewState::new(),
             layers: LayerStack::new(),
             overlays: OverlaySettings::default(),
@@ -629,6 +673,56 @@ impl AppState {
         self.features.set_enabled(mode == RenderMode::Surface);
     }
 
+    /// The Caves group's current choice.
+    #[must_use]
+    pub fn cave_view(&self) -> CaveView {
+        self.cave_view
+    }
+
+    /// Sets the Caves group's choice and mirrors it onto the two layer
+    /// entries, so the layer stack remains the single source of truth for
+    /// what is enabled. The next frame's request changes exactly when the
+    /// selected cave layer changes; other layers keep their keys.
+    pub fn set_cave_view(&mut self, view: CaveView) {
+        if self.cave_view == view {
+            return;
+        }
+        self.cave_view = view;
+        self.layers
+            .set_enabled(Layer::CaveSlice, view == CaveView::Slice);
+        self.layers
+            .set_enabled(Layer::CaveDensity, view == CaveView::Density);
+    }
+
+    /// The slice's world Y (clamped to the renderable cave range).
+    #[must_use]
+    pub fn cave_y(&self) -> i32 {
+        self.cave_y
+    }
+
+    /// Sets the slice Y, clamped to 0..=319; the return value says whether
+    /// it changed. Only cave-slice tiles keyed by the old Y become stale;
+    /// every other layer's tiles keep their cache keys.
+    pub fn set_cave_y(&mut self, y: i32) -> bool {
+        let y = y.clamp(CAVE_SLICE_Y_MIN, CAVE_SLICE_Y_MAX);
+        if self.cave_y == y {
+            return false;
+        }
+        self.cave_y = y;
+        true
+    }
+
+    /// The tile-key mode for `layer`: the Y for a cave slice, the metric
+    /// version for density, and 0 for every layer without a mode.
+    #[must_use]
+    pub fn cave_mode(&self, layer: Layer) -> u16 {
+        match layer {
+            Layer::CaveSlice => cave_slice_mode(self.cave_y),
+            Layer::CaveDensity => CAVE_DENSITY_MODE,
+            _ => 0,
+        }
+    }
+
     /// The layer stack (read-only access for the panels).
     #[must_use]
     pub fn layers(&self) -> &LayerStack {
@@ -640,23 +734,30 @@ impl AppState {
         &mut self.layers
     }
 
-    /// The frame's paint list: enabled layers the panel offers, in stack
-    /// order (bottom → top), each with its paint-time opacity. Only
-    /// these are scheduled and painted — a disabled or unsupported
-    /// layer never reaches the scheduler.
+    /// The frame's paint list: enabled layers with a renderer, in stack
+    /// order (bottom → top), each with its paint-time opacity. Only these
+    /// are scheduled and painted — a disabled layer never reaches the
+    /// scheduler.
     ///
-    /// [`RenderMode::BiomesOnly`] is a hard filter on top of the stack:
-    /// only [`Layer::Biome`] survives, whatever the other checkboxes say
-    /// (they keep their settings for the return to
-    /// [`RenderMode::Surface`]). The mode is why a switch invalidates the
-    /// scheduler request — the pass list changes exactly like a checkbox
-    /// toggle.
+    /// The two cave layers add one gate: exactly the [`CaveView`] choice
+    /// schedules, so a stale enable bit on the other one can never make
+    /// both views paint at once. [`RenderMode::BiomesOnly`] is a hard
+    /// filter on top of the stack: only [`Layer::Biome`] survives, whatever
+    /// the cave choice or other checkboxes say (they keep their settings
+    /// for the return to [`RenderMode::Surface`]). The mode is why a switch
+    /// invalidates the scheduler request — the pass list changes exactly
+    /// like a checkbox toggle.
     #[must_use]
     pub fn schedulable_layers(&self) -> Vec<(Layer, f32)> {
         self.layers
             .enabled_layers()
             .into_iter()
-            .filter(|layer| offers_layer(*layer))
+            .filter(|layer| has_renderer(*layer))
+            .filter(|layer| match layer {
+                Layer::CaveSlice => self.cave_view == CaveView::Slice,
+                Layer::CaveDensity => self.cave_view == CaveView::Density,
+                _ => true,
+            })
             .filter(|layer| self.render_mode == RenderMode::Surface || *layer == Layer::Biome)
             .map(|layer| (layer, self.layers.opacity(layer)))
             .collect()
@@ -1122,23 +1223,129 @@ mod tests {
     }
 
     #[test]
-    fn layers_unoffered_and_future_layers_never_reach_the_scheduler() {
-        // The stack carries every planned layer so settings persist, but
-        // only layers with renderers get a checkbox and a tile request:
-        // Caves (T28) never schedule however their entries read, while
-        // Surface joined once T21 made it render.
+    fn caves_schedule_only_through_the_mutually_exclusive_cave_view() {
+        // T28: the Caves group is one choice. The layer stack still keeps
+        // both entries for persistence, but a stale enable bit on the other
+        // cave layer must never schedule it alongside the selected one.
         let mut state = state();
+        assert_eq!(state.cave_view(), CaveView::Off);
         assert!(state.layers_mut().set_enabled(Layer::Surface, true));
+
+        // A direct layer-stack enable without the Caves choice does not
+        // schedule: the choice is the gate.
         assert!(state.layers_mut().set_enabled(Layer::CaveSlice, true));
         assert_eq!(
             state.schedulable_layers(),
             vec![(Layer::Biome, 1.0), (Layer::Surface, 1.0)],
-            "surface is schedulable now; caves still are not"
+            "CaveView::Off keeps caves out"
         );
+
+        state.set_cave_view(CaveView::Slice);
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![
+                (Layer::Biome, 1.0),
+                (Layer::Surface, 1.0),
+                (Layer::CaveSlice, 1.0)
+            ],
+            "the slice is the one cave layer scheduled"
+        );
+        assert_eq!(state.cave_mode(Layer::CaveSlice), 64);
+        assert_eq!(state.cave_mode(Layer::Surface), 0);
         assert_eq!(
             state.layer_summary(),
-            format!("{}+{}", labels::LAYER_BIOMES, labels::LAYER_SURFACE)
+            format!(
+                "{}+{}+{}",
+                labels::LAYER_BIOMES,
+                labels::LAYER_SURFACE,
+                labels::LAYER_CAVES
+            )
         );
+
+        // Switching to density flips exactly the two cave entries; both can
+        // never be scheduled together.
+        state.set_cave_view(CaveView::Density);
+        assert!(
+            !state
+                .layers()
+                .get(Layer::CaveSlice)
+                .expect("planned")
+                .enabled
+        );
+        assert!(
+            state
+                .layers()
+                .get(Layer::CaveDensity)
+                .expect("planned")
+                .enabled
+        );
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![
+                (Layer::Biome, 1.0),
+                (Layer::Surface, 1.0),
+                (Layer::CaveDensity, 1.0)
+            ]
+        );
+        assert_eq!(
+            state.cave_mode(Layer::CaveDensity),
+            CAVE_DENSITY_MODE,
+            "density carries the metric version in its key mode"
+        );
+
+        state.set_cave_view(CaveView::Off);
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![(Layer::Biome, 1.0), (Layer::Surface, 1.0)],
+            "off returns to the non-cave stack"
+        );
+    }
+
+    #[test]
+    fn cave_y_change_updates_only_the_slice_mode() {
+        // The acceptance rule: changing Y re-keys the cave-slice tiles only.
+        // The other layers' modes and the schedulable list stay identical,
+        // so their cache keys cannot change.
+        let mut state = state();
+        assert!(state.layers_mut().set_enabled(Layer::Height, true));
+        assert!(state.layers_mut().set_enabled(Layer::Fluid, true));
+        state.set_cave_view(CaveView::Slice);
+        let before_layers = state.schedulable_layers();
+        let before_slice = state.cave_mode(Layer::CaveSlice);
+        let before_other_modes: Vec<u16> = before_layers
+            .iter()
+            .filter(|(layer, _)| *layer != Layer::CaveSlice)
+            .map(|(layer, _)| state.cave_mode(*layer))
+            .collect();
+        assert_eq!(state.cave_y(), DEFAULT_CAVE_Y);
+
+        assert!(state.set_cave_y(32));
+        assert_eq!(state.cave_y(), 32);
+        assert_ne!(
+            state.cave_mode(Layer::CaveSlice),
+            before_slice,
+            "the slice key mode moved with Y"
+        );
+        assert_eq!(
+            state.schedulable_layers(),
+            before_layers,
+            "the paint list (and every non-cave key) is unchanged"
+        );
+        let after_other_modes: Vec<u16> = before_layers
+            .iter()
+            .filter(|(layer, _)| *layer != Layer::CaveSlice)
+            .map(|(layer, _)| state.cave_mode(*layer))
+            .collect();
+        assert_eq!(after_other_modes, before_other_modes);
+
+        // A repeated write is a no-op; out-of-range values clamp rather than
+        // wrap into another Y.
+        assert!(!state.set_cave_y(32));
+        assert!(state.set_cave_y(-5));
+        assert_eq!(state.cave_y(), CAVE_SLICE_Y_MIN);
+        assert!(state.set_cave_y(9_999));
+        assert_eq!(state.cave_y(), CAVE_SLICE_Y_MAX);
+        assert!(!state.set_cave_y(CAVE_SLICE_Y_MAX));
     }
 
     #[test]
@@ -1164,8 +1371,9 @@ mod tests {
 
     #[test]
     fn layers_labels_and_offers_agree_on_the_vocabulary() {
-        // Every planned layer has a label; the offered set is exactly
-        // the layers with renderers today (Surface joined with T21).
+        // Every planned layer has a label and a renderer. The generic
+        // checkbox list excludes only the two caves, which T28 serves from
+        // the dedicated Caves group instead.
         for layer in [
             Layer::Biome,
             Layer::Height,
@@ -1177,6 +1385,7 @@ mod tests {
             Layer::Zone,
         ] {
             assert!(!layer_label(layer).is_empty(), "{layer:?} is labelled");
+            assert!(has_renderer(layer), "{layer:?} has a renderer");
             assert_eq!(
                 offers_layer(layer),
                 !matches!(layer, Layer::CaveSlice | Layer::CaveDensity),
@@ -1256,12 +1465,20 @@ mod tests {
         for layer in [Layer::Height, Layer::Fluid, Layer::Surface] {
             assert!(state.layers_mut().set_enabled(layer, true));
         }
+        state.set_cave_view(CaveView::Slice);
         assert_eq!(state.render_mode(), RenderMode::Surface);
         assert!(
             state
                 .schedulable_layers()
                 .iter()
                 .any(|(layer, _)| *layer == Layer::Surface)
+        );
+        assert!(
+            state
+                .schedulable_layers()
+                .iter()
+                .any(|(layer, _)| *layer == Layer::CaveSlice),
+            "the selected cave layer schedules in Surface mode"
         );
 
         state.set_render_mode(RenderMode::BiomesOnly);
@@ -1274,6 +1491,10 @@ mod tests {
         assert!(
             state.layers().enabled_layers().contains(&Layer::Surface),
             "the ignored checkboxes keep their state"
+        );
+        assert!(
+            state.layers().enabled_layers().contains(&Layer::CaveSlice),
+            "the Caves choice also keeps its state"
         );
 
         // The filter does not force Biomes on: unticking it still blanks
@@ -1307,6 +1528,22 @@ mod tests {
             stack,
             "the stack survives the mode round trip"
         );
+
+        // T28's cave choice rides the same stack: the chosen layer joins in
+        // paint order and disappears again in the biome-only mode.
+        state.set_cave_view(CaveView::Density);
+        assert_eq!(
+            state.schedulable_layers(),
+            vec![
+                (Layer::Biome, 1.0),
+                (Layer::Relief, 1.0),
+                (Layer::CaveDensity, 1.0),
+                (Layer::Zone, 1.0),
+            ],
+            "density sits between the relief and zone layers in stack order"
+        );
+        state.set_render_mode(RenderMode::BiomesOnly);
+        assert_eq!(state.schedulable_layers(), vec![(Layer::Biome, 1.0)]);
     }
 
     #[test]

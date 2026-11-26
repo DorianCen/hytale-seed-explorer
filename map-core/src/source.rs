@@ -18,8 +18,8 @@
 use crate::catalog::{BiomeCatalog, BlockCatalog, FluidCatalog, ZoneCatalog};
 use crate::error::SourceResult;
 use crate::types::{
-    BiomeGrid, BiomeId, Feature, FeatureFilter, GeneratorIdentity, HeightGrid, Rect, Seed,
-    SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
+    BiomeGrid, BiomeId, CaveDensityGrid, Feature, FeatureFilter, GeneratorIdentity, HeightGrid,
+    Rect, Seed, SliceGrid, SpawnPoint, SurfaceGrid, SurfaceSample, ZoneGrid, ZoneId,
 };
 
 /// A source of world data at the map-core boundary.
@@ -113,6 +113,47 @@ pub trait WorldSource: Send + Sync {
 
     /// A horizontal slice at altitude `y` covering `rect`.
     fn slice_region(&self, rect: Rect, step: u32, y: i32) -> SourceResult<SliceGrid>;
+
+    /// `slice_region` with caller-owned cancellation. The default ignores
+    /// the token — cheap sources never need it; `WorldgenSource` checks it
+    /// between the per-chunk generations of the expensive path.
+    fn slice_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        y: i32,
+        cancel: &crate::scheduler::CancelToken,
+    ) -> SourceResult<SliceGrid> {
+        let _ = cancel;
+        self.slice_region(rect, step, y)
+    }
+
+    /// Per-column cave-volume fractions over `rect` at `step` (T28).
+    ///
+    /// The metric is defined on
+    /// [`CaveDensityGrid`](crate::types::CaveDensityGrid): air cells
+    /// strictly below the topmost non-air block divided by that block's
+    /// height. Sources without chunk summaries answer
+    /// [`SourceError::Unsupported`](crate::error::SourceError::Unsupported).
+    fn cave_density_region(&self, rect: Rect, step: u32) -> SourceResult<CaveDensityGrid> {
+        let _ = (rect, step);
+        Err(crate::error::SourceError::Unsupported(
+            "cave density needs chunk summaries, which this source does not expose",
+        ))
+    }
+
+    /// `cave_density_region` with caller-owned cancellation. The default
+    /// ignores the token; the worldgen adapter checks it between chunk
+    /// generations.
+    fn cave_density_region_cancelled(
+        &self,
+        rect: Rect,
+        step: u32,
+        cancel: &crate::scheduler::CancelToken,
+    ) -> SourceResult<CaveDensityGrid> {
+        let _ = cancel;
+        self.cave_density_region(rect, step)
+    }
 
     /// Every spawn point this world offers.
     fn spawn_points(&self) -> SourceResult<Vec<SpawnPoint>>;

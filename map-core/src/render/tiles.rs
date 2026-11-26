@@ -25,6 +25,7 @@ use crate::error::{SourceError, SourceResult};
 use crate::render::Layer;
 use crate::render::RgbaImage;
 use crate::render::biome::BiomeTileRenderer;
+use crate::render::caves::{CaveDensityTileRenderer, CaveSliceTileRenderer};
 use crate::render::fluid::FluidTileRenderer;
 use crate::render::height::HeightTileRenderer;
 use crate::render::relief::ReliefTileRenderer;
@@ -78,7 +79,12 @@ pub fn tile_query(tile: Rect, world: Option<Rect>, step: u32, border: u32) -> Op
     // panic (unreachable for any view the app schedules).
     let border_i = i64::from(border);
     let step_i = i64::from(step);
-    let frame_len = i64::from(TILE_SIZE) + 2 * border_i;
+    // The frame's sample dimensions come from the requested rect, not the
+    // TILE_SIZE constant: T28's cave/surface streaming asks one chunk row at
+    // a time, and clipping that band to the world must not expand it back to
+    // the whole tile (which would regenerate every chunk per band).
+    let frame_w = ceil_div(i64::from(tile.width()), step_i) + 2 * border_i;
+    let frame_h = ceil_div(i64::from(tile.height()), step_i) + 2 * border_i;
     let e_min_x = i64::from(tile.min_x).checked_sub(border_i * step_i)?;
     let e_min_z = i64::from(tile.min_z).checked_sub(border_i * step_i)?;
     let e_max_x = i64::from(tile.max_x).checked_add(border_i * step_i)?;
@@ -97,16 +103,16 @@ pub fn tile_query(tile: Rect, world: Option<Rect>, step: u32, border: u32) -> Op
         return Some(TileQuery { rect, origin });
     };
 
-    // Sample `i` of the frame (i in -border .. frame_len - border)
+    // Sample `i` of the frame (i in -border .. frame_w/h - border)
     // covers blocks `e_min + i * step` .. `+ step - 1`. The first sample
     // whose blocks reach into the world rounds its distance up; one
     // past the last sample that stays inside rounds the span down. The
     // clamps keep both inside the frame, which also restores T16's
-    // `0 ..= TILE_SIZE` bounds at `border == 0`.
-    let first_x = ceil_div(i64::from(world.min_x) - e_min_x, step_i).clamp(-border_i, frame_len);
-    let first_z = ceil_div(i64::from(world.min_z) - e_min_z, step_i).clamp(-border_i, frame_len);
-    let end_x = floor_div(i64::from(world.max_x) - e_min_x + 1, step_i).clamp(-border_i, frame_len);
-    let end_z = floor_div(i64::from(world.max_z) - e_min_z + 1, step_i).clamp(-border_i, frame_len);
+    // `0 ..= TILE_SIZE` bounds at `border == 0` for a full tile.
+    let first_x = ceil_div(i64::from(world.min_x) - e_min_x, step_i).clamp(-border_i, frame_w);
+    let first_z = ceil_div(i64::from(world.min_z) - e_min_z, step_i).clamp(-border_i, frame_h);
+    let end_x = floor_div(i64::from(world.max_x) - e_min_x + 1, step_i).clamp(-border_i, frame_w);
+    let end_z = floor_div(i64::from(world.max_z) - e_min_z + 1, step_i).clamp(-border_i, frame_h);
     let count_x = (end_x - first_x).max(0);
     let count_z = (end_z - first_z).max(0);
     if count_x == 0 || count_z == 0 {
@@ -229,10 +235,8 @@ pub(crate) fn render_layer_tile<G>(
 /// which layer renders — the scheduler and the cache stay layer-agnostic
 /// while the keys stay per-layer.
 ///
-/// The cave layers have no renderer yet (T28) and answer with
-/// [`SourceError::Unsupported`]; the app never schedules them (its radios
-/// map them to "arrives with T28"), so this is the defensive answer, not
-/// a flow.
+/// Every layer has a renderer: the two cave layers read the Y/metric from
+/// the tile key's `mode` and fetch slices/density through the source.
 pub struct LayeredTileRenderer {
     biome: BiomeTileRenderer,
     height: HeightTileRenderer,
@@ -240,6 +244,8 @@ pub struct LayeredTileRenderer {
     fluid: FluidTileRenderer,
     zone: ZoneTileRenderer,
     surface: SurfaceTileRenderer,
+    cave_slice: CaveSliceTileRenderer,
+    cave_density: CaveDensityTileRenderer,
 }
 
 impl LayeredTileRenderer {
@@ -259,7 +265,9 @@ impl LayeredTileRenderer {
             relief: ReliefTileRenderer::new(Arc::clone(&source), world),
             fluid: FluidTileRenderer::new(Arc::clone(&source), world, fluid_opacity),
             zone: ZoneTileRenderer::new(Arc::clone(&source), world),
-            surface: SurfaceTileRenderer::new(source, world, surface),
+            surface: SurfaceTileRenderer::new(Arc::clone(&source), world, surface),
+            cave_slice: CaveSliceTileRenderer::new(Arc::clone(&source), world),
+            cave_density: CaveDensityTileRenderer::new(source, world),
         }
     }
 }
@@ -278,9 +286,8 @@ impl TileRenderer for LayeredTileRenderer {
             Layer::Fluid => TileRenderer::render(&self.fluid, key, cancel, fidelity),
             Layer::Zone => TileRenderer::render(&self.zone, key, cancel, fidelity),
             Layer::Surface => TileRenderer::render(&self.surface, key, cancel, fidelity),
-            Layer::CaveSlice | Layer::CaveDensity => Err(SourceError::Unsupported(
-                "this layer has no renderer yet (caves: T28)",
-            )),
+            Layer::CaveSlice => TileRenderer::render(&self.cave_slice, key, cancel, fidelity),
+            Layer::CaveDensity => TileRenderer::render(&self.cave_density, key, cancel, fidelity),
         }
     }
 
@@ -315,9 +322,12 @@ impl TileRenderer for LayeredTileRenderer {
             Layer::Surface => {
                 TileRenderer::render_streaming(&self.surface, key, cancel, fidelity, progress)
             }
-            Layer::CaveSlice | Layer::CaveDensity => Err(SourceError::Unsupported(
-                "this layer has no renderer yet (caves: T28)",
-            )),
+            Layer::CaveSlice => {
+                TileRenderer::render_streaming(&self.cave_slice, key, cancel, fidelity, progress)
+            }
+            Layer::CaveDensity => {
+                TileRenderer::render_streaming(&self.cave_density, key, cancel, fidelity, progress)
+            }
         }
     }
 }
@@ -347,6 +357,29 @@ mod tests {
         let plan = tile_query(Rect::new(0, 0, 511, 511), None, 2, 1).expect("unbounded plans");
         assert_eq!(plan.rect, Rect::new(-2, -2, 513, 513));
         assert_eq!(plan.origin, (-1, -1));
+    }
+
+    #[test]
+    fn tile_query_band_stays_inside_the_band() {
+        // A streaming band is a sub-rect of a tile. Clipping it to a world
+        // that covers the whole tile must not expand it back to the full
+        // tile: that would make each band regenerate every chunk (T28's
+        // cave rows and the surface stream both depend on this).
+        let band = Rect::new(0, 0, 511, 30); // step 2: 16 sample rows
+        let world = Rect::new(0, 0, 511, 511);
+        let plan = tile_query(band, Some(world), 2, 0).expect("the band overlaps the world");
+        assert_eq!(
+            plan.rect,
+            Rect::new(0, 0, 511, 31),
+            "the query is the band's full sample cells, not the whole tile"
+        );
+        assert_eq!(plan.origin, (0, 0));
+
+        // The surface stream's border ring adds one sample, still only
+        // around the band; the ring outside the world is clipped.
+        let plan = tile_query(band, Some(world), 2, 1).expect("the bordered band overlaps");
+        assert_eq!(plan.rect, Rect::new(0, 0, 511, 33));
+        assert_eq!(plan.origin, (0, 0));
     }
 
     #[test]

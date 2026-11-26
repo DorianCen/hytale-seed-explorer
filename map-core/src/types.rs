@@ -561,6 +561,27 @@ pub enum SliceCell {
     Unknown,
 }
 
+/// Per-column cave-volume fractions on a regular grid, row-major
+/// (`z * width + x`), anchored at (`origin_x`, `origin_z`).
+///
+/// Each sample is `cave_cells / height` for the column's full-fidelity
+/// [`ChunkSummary`](crate::source::chunks::ChunkSummary), clamped to
+/// `0.0..=1.0`; the numerator counts air cells strictly below the topmost
+/// non-air block and the denominator is that block's Y (the number of cells
+/// below it). Fluids are not counted. This is the T28 density metric; a
+/// change to either definition is a metric-version bump in the tile key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaveDensityGrid {
+    pub origin_x: i32,
+    pub origin_z: i32,
+    pub step: u32,
+    pub width: u32,
+    pub height: u32,
+    pub densities: Vec<f32>,
+}
+
+impl_grid!(CaveDensityGrid, densities, f32);
+
 // ---------------------------------------------------------------------------
 // Features
 // ---------------------------------------------------------------------------

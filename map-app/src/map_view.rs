@@ -200,7 +200,20 @@ pub fn frame_tiles(
         let Some((first, _)) = pass.layers.first() else {
             continue;
         };
-        let Some((visible, center)) = visible_and_center(view, first.zoom.step(), world) else {
+        // Cave layers are chunk-generation-bound: a one-tile prefetch ring
+        // on a coarse step would queue several times the visible chunk area,
+        // so their own pass schedules the tight range (T28). Every other
+        // layer keeps the T16 prefetch ring.
+        let tight = pass
+            .layers
+            .iter()
+            .any(|(subject, _)| matches!(subject.layer, Layer::CaveSlice | Layer::CaveDensity));
+        let range = if tight {
+            visible_and_center_tight(view, first.zoom.step(), world)
+        } else {
+            visible_and_center(view, first.zoom.step(), world)
+        };
+        let Some((visible, center)) = range else {
             continue;
         };
         // T29's fidelity policy: a pass at the frame's own effective step
@@ -247,7 +260,25 @@ fn visible_and_center(
     step: u32,
     world: Option<Rect>,
 ) -> Option<(TileRect, TileCoord)> {
-    let mut visible = view.visible_tiles(step)?;
+    visible_and_center_inner(view.visible_tiles(step)?, view, step, world)
+}
+
+/// The cave layers' tight range: the viewport's own tiles, without the T16
+/// prefetch ring.
+fn visible_and_center_tight(
+    view: &MapViewState,
+    step: u32,
+    world: Option<Rect>,
+) -> Option<(TileRect, TileCoord)> {
+    visible_and_center_inner(view.visible_tiles_tight(step)?, view, step, world)
+}
+
+fn visible_and_center_inner(
+    mut visible: TileRect,
+    view: &MapViewState,
+    step: u32,
+    world: Option<Rect>,
+) -> Option<(TileRect, TileCoord)> {
     if let Some(world) = world {
         visible = intersect_tiles(visible, tiles_in(&world, step))?;
     }
@@ -524,7 +555,13 @@ impl MapView {
                     // the request — a disabled layer's tiles can never
                     // be served (or painted).
                     (
-                        TileSubject::new(pipeline.served.0, pipeline.served.1, layer, 0, zoom),
+                        TileSubject::new(
+                            pipeline.served.0,
+                            pipeline.served.1,
+                            layer,
+                            state.cave_mode(layer),
+                            zoom,
+                        ),
                         opacity,
                     )
                 })
@@ -544,7 +581,7 @@ impl MapView {
                 .copied();
             let progressive = surface.is_some() && zoom.step() < SURFACE_COARSE_STEP;
             let mut passes = Vec::new();
-            let fill_layers: Vec<(TileSubject, f32)> = if progressive {
+            let fill_candidates: Vec<(TileSubject, f32)> = if progressive {
                 paint_layers
                     .iter()
                     .filter(|(subject, _)| subject.layer != Layer::Surface)
@@ -553,9 +590,22 @@ impl MapView {
             } else {
                 paint_layers.clone()
             };
+            // T28: the cave layers ride their own fill pass so
+            // `frame_tiles` can give them the tight visible range (no
+            // prefetch ring) without narrowing the cheap layers.
+            let (cave_layers, fill_layers): (Vec<_>, Vec<_>) =
+                fill_candidates.into_iter().partition(|(subject, _)| {
+                    matches!(subject.layer, Layer::CaveSlice | Layer::CaveDensity)
+                });
             if !fill_layers.is_empty() {
                 passes.push(PassLayers {
                     layers: fill_layers,
+                    refine: false,
+                });
+            }
+            if !cave_layers.is_empty() {
+                passes.push(PassLayers {
+                    layers: cave_layers,
                     refine: false,
                 });
             }
@@ -1287,6 +1337,32 @@ mod tests {
         assert_eq!(
             frame_tiles(&view, paint.clone(), fill_pass(&paint), None),
             frame_tiles(&view, paint.clone(), fill_pass(&paint), None)
+        );
+    }
+
+    #[test]
+    fn cave_layer_modes_survive_the_frame_request() {
+        // T28: the subject's mode (slice Y vs density metric) is what keys
+        // the cave tiles. `frame_tiles` must carry it through both the
+        // paint list and the scheduler pass unchanged, so a Y change is a
+        // different request and only the slice's keys move.
+        use map_core::render::caves::{CAVE_DENSITY_MODE, cave_slice_mode};
+
+        let view = view(1.0, 600.0, 400.0);
+        let slice = TileSubject::new(1, 7, Layer::CaveSlice, cave_slice_mode(64), ZoomLevel::MIN);
+        let density = TileSubject::new(1, 7, Layer::CaveDensity, CAVE_DENSITY_MODE, ZoomLevel::MIN);
+        let paint = vec![(slice, 1.0), (density, 1.0)];
+        let request = frame_tiles(&view, paint.clone(), fill_pass(&paint), None)
+            .expect("the test view resolves");
+        assert_eq!(request.paint.layers[0].0.mode, 64);
+        assert_eq!(request.paint.layers[1].0.mode, CAVE_DENSITY_MODE);
+        assert_eq!(request.passes[0].layers[0].0.mode, 64);
+        assert_eq!(request.passes[0].layers[1].0.mode, CAVE_DENSITY_MODE);
+        assert!(
+            request.passes[0].visible.iter().count() < request.paint.visible.iter().count(),
+            "the cave pass drops the T16 prefetch ring: {:?} vs paint {:?}",
+            request.passes[0].visible,
+            request.paint.visible,
         );
     }
 

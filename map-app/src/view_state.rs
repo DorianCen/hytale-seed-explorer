@@ -194,6 +194,13 @@ impl MapViewState {
     pub fn visible_tiles(&self, step: u32) -> Option<TileRect> {
         coords::visible_tiles(&self.viewport(), step)
     }
+
+    /// The visible range without the one-tile prefetch ring (T28's
+    /// expensive cave layers).
+    #[must_use]
+    pub fn visible_tiles_tight(&self, step: u32) -> Option<TileRect> {
+        coords::visible_tiles_tight(&self.viewport(), step)
+    }
 }
 
 impl Default for MapViewState {

@@ -274,12 +274,9 @@ fn dropping_a_source_with_warm_caches_does_not_hang() {
 }
 
 /// Proves the T09 acceptance bullet: slices are cached per `(chunk, y)`, so a
-/// repeated identical slice request does not regenerate the chunk.
-///
-/// The implementation's `slice_for` doc comment claims a slice warms the
-/// summary cache; it does not (`chunks::extract_summary` is never called from
-/// the slice path), so this test asserts the cache behaviour the code actually
-/// has: the slice cache replay, not a summary warm-up.
+/// repeated identical slice request does not regenerate the chunk. A slice
+/// miss also inserts the full-fidelity summary extracted from the same
+/// generation, so a later density/surface request over that chunk is warm.
 #[test]
 fn slice_requests_are_cached_by_chunk_and_y() {
     let Some(_world) = world_dir() else {
